@@ -27,7 +27,6 @@
   --line: var(--hair);
   --text: var(--ink);
   --sub: var(--ink-2);
-  --accent2: var(--accent);
   --red: var(--danger);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }

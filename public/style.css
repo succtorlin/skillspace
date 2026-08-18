@@ -44,7 +44,6 @@
   --line: var(--hair);
   --text: var(--ink);
   --sub: var(--ink-2);
-  --accent2: var(--accent);
   --red: var(--danger);
   --code-bg: var(--ground-0);
   --code-text: var(--accent);
@@ -105,7 +104,7 @@ body {
   border-radius: 9px; padding: 9px 12px; font-size: 13px; cursor: pointer;
   font-family: inherit; margin-bottom: 10px;
 }
-.theme-toggle:hover { border-color: var(--accent2); }
+.theme-toggle:hover { border-color: var(--accent); }
 
 /* 布局：侧边栏 + 主区 */
 .app { display: flex; min-height: 100vh; }
@@ -135,8 +134,7 @@ body {
 .topbar {
   display: flex; align-items: center; gap: 20px;
   padding: 12px 20px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
+  background: var(--ground-1);
   position: sticky; top: 0; z-index: 30;
 }
 .brand { display: flex; align-items: center; gap: 10px; }
@@ -159,9 +157,12 @@ body {
   user-select: none; margin-bottom: 2px;
 }
 .src-item:hover { background: var(--panel2); color: var(--text); }
-.src-item:focus-visible { outline: 2px solid var(--accent2); outline-offset: -2px; }
+
 .src-item.active { background: var(--panel2); color: var(--text); font-weight: 700; }
 .src-item.missing { color: var(--muted); font-style: italic; }
+/* The count must travel with the row's state, or a missing source shows a
+   full-brightness badge next to a muted label. */
+.src-item.missing .src-n { color: var(--muted); border-color: var(--hair); }
 .src-item .src-ico { flex: none; width: 18px; display: grid; place-items: center; }
 .src-item .src-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src-item .src-n {
@@ -180,7 +181,7 @@ body {
   color: var(--sub); border-radius: 9px; padding: 9px 12px; font-size: 13px;
   cursor: pointer; font-family: inherit;
 }
-.add-dir:hover { border-color: var(--accent2); color: var(--text); }
+.add-dir:hover { border-color: var(--accent); color: var(--text); }
 
 /* 顶栏：当前来源 + 二级分段 */
 .src-head { min-width: 0; flex: none; max-width: 300px; }
@@ -214,7 +215,7 @@ body {
   border: 1px solid var(--line); background: var(--panel2); color: var(--text);
   border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; white-space: nowrap;
 }
-.btn:hover { border-color: var(--accent2); }
+.btn:hover { border-color: var(--accent); }
 .btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 700; }
 .btn.primary:hover { filter: brightness(1.05); }
 .btn.ghost { background: transparent; }
@@ -247,13 +248,17 @@ body {
   background: var(--panel2); border: 1px solid var(--line); color: var(--text);
   border-radius: 8px; padding: 9px 14px; font-size: 13px; width: 300px; outline: none;
 }
-.search:focus { border-color: var(--accent2); }
+.search:focus { border-color: var(--accent); }
 .cats { display: flex; gap: 8px; flex-wrap: wrap; }
 .cat {
-  padding: 5px 12px; border-radius: 999px; border: 1px solid var(--line);
-  background: var(--panel2); color: var(--sub); font-size: 12px; cursor: pointer;
+  padding: 5px 12px; border-radius: 999px; border: 1px solid var(--hair);
+  background: color-mix(in oklab, var(--ground-2) 70%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  color: var(--ink-2); font-size: 12px; cursor: pointer;
+  transition: color .14s, border-color .14s;
 }
-.cat:hover { color: var(--text); }
+.cat:hover { color: var(--ink); border-color: var(--hair-lit); }
 .cat.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .count { margin-left: auto; color: var(--sub); font-size: 12px; }
 
@@ -270,9 +275,17 @@ body {
 .card:hover { transform: translateY(-2px); border-color: var(--accent); }
 .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .card-name { font-weight: 700; font-size: 15px; line-height: 1.3; word-break: break-word; }
+/* Frosted chip — translucency over the card ground, not a second opaque fill.
+   Colour stays on an ink token: the blur must never be load-bearing for
+   contrast, since backdrop-filter is unsupported in some engines and the chip
+   then falls back to the flat tint below it. */
 .card-cat {
   flex: none; font-size: 10.5px; color: var(--accent);
-  border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px;
+  font-family: var(--face-mono); letter-spacing: .01em;
+  border: 1px solid var(--hair-lit); border-radius: 999px; padding: 2px 9px;
+  background: color-mix(in oklab, var(--ground-3) 62%, transparent);
+  backdrop-filter: blur(6px) saturate(1.1);
+  -webkit-backdrop-filter: blur(6px) saturate(1.1);
 }
 .card-desc { color: var(--sub); font-size: 12.5px; line-height: 1.6; flex: 1; }
 .card-foot { display: flex; align-items: center; justify-content: space-between; }
@@ -300,7 +313,7 @@ body {
   border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none; font-family: inherit;
 }
 .cm-name { flex: 1; }
-.cm-name:focus, .cm-desc:focus { border-color: var(--accent2); }
+.cm-name:focus, .cm-desc:focus { border-color: var(--accent); }
 .cm-desc { width: 100%; margin-bottom: 8px; }
 .cm-filter { width: 100%; margin: 8px 0; }
 .set-input {
@@ -308,7 +321,7 @@ body {
   border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none;
   font-family: inherit; margin-bottom: 6px;
 }
-.set-input:focus { border-color: var(--accent2); }
+.set-input:focus { border-color: var(--accent); }
 .modal-desc code { background: var(--code-bg); color: var(--code-text); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
 .cm-list {
   max-height: 300px; overflow-y: auto; border: 1px solid var(--line);
@@ -351,7 +364,7 @@ body {
   font-size: 13px; color: var(--text); cursor: pointer;
   border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--panel2);
 }
-.mode-opt:hover { border-color: var(--accent2); }
+.mode-opt:hover { border-color: var(--accent); }
 .mode-opt input { accent-color: var(--accent); }
 .mode-hint { font-size: 11px; color: var(--sub); }
 .cmd-chars { color: var(--sub); font-weight: 400; }
@@ -422,12 +435,22 @@ body {
   font-size: 12px; color: var(--sub);
   border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--panel2);
 }
+/* Bracket step numerals — technical annotation rather than a filled circle.
+   Borrowed from the shared grammar in fantastic-ui's theme references, which
+   marks these devices as structural and reusable outside any one direction.
+   Freeing the filled badge means the mint fill can mean ONE thing: active. */
 .jb-step .jb-num {
-  flex: none; display: grid; place-items: center; width: 18px; height: 18px;
-  border-radius: 50%; background: var(--line); color: var(--sub); font-size: 11px; font-weight: 700;
+  flex: none; display: inline-flex; align-items: center; gap: 3px;
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  background: none; border-radius: 0; width: auto; height: auto;
 }
+.jb-step .jb-num::before { content: "⌐"; opacity: .55; }
+.jb-step .jb-num::after  { content: "¬"; opacity: .55; }
 .jb-step.on { color: var(--ink); border-color: var(--accent); font-weight: 600; }
-.jb-step.on .jb-num { background: var(--accent); color: var(--on-accent); box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 22%, transparent); }
+.jb-step.on .jb-num { color: var(--accent); font-weight: 700; }
+.jb-step.on .jb-num::before,
+.jb-step.on .jb-num::after { opacity: 1; }
 .jb-status {
   display: flex; align-items: center; gap: 9px; margin-top: 14px;
   font-size: 12.5px; color: var(--sub);
@@ -500,7 +523,6 @@ select:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 summary:focus-visible,
-details:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
@@ -587,6 +609,41 @@ details:focus-visible,
 /* Steps read as a sequence, so the connector belongs in the design rather
    than being implied by proximity. */
 .jb-step { position: relative; transition: border-color .15s, color .15s; }
-.jb-step.done .jb-num::after { content: "✓"; }
-.jb-step.done .jb-num { font-size: 0; }
-.jb-step.done .jb-num::after { font-size: 11px; }
+.jb-step.done .jb-num { color: var(--accent); font-size: 0; }
+.jb-step.done .jb-num::before { content: "⌐"; font-size: 11px; opacity: .55; }
+.jb-step.done .jb-num::after  { content: "✓¬"; font-size: 11px; opacity: 1; letter-spacing: 1px; }
+
+
+/* ------------------------------------------------------------
+   Page-in-page panels — sections as nested sheets, one ground
+   step apart, instead of horizontal rules. Depth is encoded by
+   the ground scale; nesting stays within three levels.
+   ------------------------------------------------------------ */
+
+/* The page sheet: everything right of the source rail sits on ground-0. */
+.main-col { background: var(--ground-0); }
+
+/* Level 1 — the command bar, floated off the sheet rather than ruled off it. */
+.topbar {
+  border-radius: 0 0 14px 14px;
+  border: 1px solid var(--hair);
+  border-top: none;
+  margin: 0 10px;
+}
+
+/* Level 2 — the filter surface, one step lighter, nested inside the sheet. */
+.toolbar {
+  background: var(--ground-1);
+  border: 1px solid var(--hair);
+  border-radius: 14px;
+  margin: 12px 10px 0;
+  padding: 12px 16px;
+}
+
+/* The card wall breathes against the sheet; cards are already level 2, so they
+   are not nested a third time. */
+.grid { padding-top: 12px; }
+
+@media (max-width: 560px) {
+  .topbar, .toolbar { margin-left: 6px; margin-right: 6px; }
+}
