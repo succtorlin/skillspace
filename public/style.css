@@ -291,11 +291,14 @@ body {
 .card-foot { display: flex; align-items: center; justify-content: space-between; }
 .card-folder { font-size: 11px; color: var(--muted); font-family: var(--face-mono); font-variant-numeric: tabular-nums; }
 .use-btn {
-  background: linear-gradient(135deg, var(--accent), var(--accent-hi));
-  color: var(--on-accent); font-weight: 700; border: none; border-radius: 8px;
-  padding: 7px 16px; font-size: 13px; cursor: pointer;
+  background: transparent;
+  color: var(--accent); font-weight: 600;
+  border: 1px solid var(--accent); border-radius: 8px;
+  padding: 6px 15px; font-size: 12.5px; cursor: pointer;
+  font-family: var(--face-mono); letter-spacing: .02em;
+  transition: background .14s;
 }
-.use-btn:hover { filter: brightness(1.06); }
+.use-btn:hover { background: color-mix(in oklab, var(--accent) 13%, transparent); }
 
 .empty { padding: 60px 20px; text-align: center; color: var(--sub); font-size: 14px; line-height: 1.7; max-width: 560px; margin: 0 auto; }
 
@@ -351,7 +354,15 @@ body {
   max-height: 120px; overflow-y: auto; padding: 10px 12px;
   background: var(--panel2); border-radius: 10px; border: 1px solid var(--line);
 }
-.modal-label { font-size: 12px; color: var(--sub); display: block; margin-bottom: 6px; }
+.modal-label, .modal-cmd-label {
+  font-family: var(--face-mono); font-size: 10.5px;
+  letter-spacing: .1em; color: var(--accent);
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 8px;
+}
+.modal-label::before, .modal-cmd-label::before {
+  content: ""; width: 14px; height: 1px; background: var(--accent); flex: none; opacity: .8;
+}
 .modal-task {
   width: 100%; min-height: 70px; background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
@@ -368,7 +379,7 @@ body {
 .mode-opt input { accent-color: var(--accent); }
 .mode-hint { font-size: 11px; color: var(--sub); }
 .cmd-chars { color: var(--sub); font-weight: 400; }
-.modal-cmd-label { font-size: 12px; color: var(--sub); margin: 14px 0 6px; }
+.modal-cmd-label { margin: 16px 0 8px; }
 .modal-cmd {
   background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
   padding: 12px; font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 12px;
