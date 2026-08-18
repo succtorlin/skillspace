@@ -1,4 +1,4 @@
-// SkillDeck MCP server —— 把 SkillDeck 渲染成 Codex 原生 widget，
+// SkillSpace MCP server —— 把 SkillSpace 渲染成 Codex 原生 widget，
 // 点「使用」时通过 sendFollowUpMessage 把 Skill 命令送进 Codex 会话执行。
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { inlineWidget, registerWidgetResource, readText } from './lib/widget-resource.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WIDGET_URI = 'ui://widget/skilldeck/deck.html';
+const WIDGET_URI = 'ui://widget/skillspace/deck.html';
 const DEFAULT_SKILLS_DIR = process.env.SKILLS_DIR || path.join(os.homedir(), '.claude', 'skills');
 
 // ---------- Skill 解析（与独立版一致，支持 YAML 块标量） ----------
@@ -90,23 +90,23 @@ function widgetHtml() {
   });
 }
 
-const server = new McpServer({ name: 'skilldeck', version: '0.2.0' });
+const server = new McpServer({ name: 'skillspace', version: '0.2.0' });
 
 registerWidgetResource(server, {
-  name: 'skilldeck-widget',
+  name: 'skillspace-widget',
   uri: WIDGET_URI,
-  title: 'SkillDeck',
+  title: 'SkillSpace',
   description: '可视化 Skill 控制台：卡片浏览本地 Skill，点使用把该 Skill 的命令发送到 Codex 输入框执行。',
   html: async () => widgetHtml(),
 });
 
 registerAppTool(
   server,
-  'open_skilldeck',
+  'open_skillspace',
   {
-    title: '打开 SkillDeck 技控台',
+    title: '打开 SkillSpace 技控台',
     description:
-      '打开 SkillDeck 原生 widget，卡片浏览本地 Skill（默认 ~/.claude/skills）。用户点某个 Skill 的「使用」后，widget 会把该 Skill 的命令通过 sendFollowUpMessage 发送到当前 Codex 会话去执行。',
+      '打开 SkillSpace 原生 widget，卡片浏览本地 Skill（默认 ~/.claude/skills）。用户点某个 Skill 的「使用」后，widget 会把该 Skill 的命令通过 sendFollowUpMessage 发送到当前 Codex 会话去执行。',
     inputSchema: { dir: z.string().trim().optional() },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: {
@@ -114,15 +114,15 @@ registerAppTool(
       'ui/resourceUri': WIDGET_URI,
       'openai/outputTemplate': WIDGET_URI,
       'openai/widgetAccessible': true,
-      'openai/toolInvocation/invoking': '打开 SkillDeck…',
-      'openai/toolInvocation/invoked': 'SkillDeck 已打开',
+      'openai/toolInvocation/invoking': '打开 SkillSpace…',
+      'openai/toolInvocation/invoked': 'SkillSpace 已打开',
     },
   },
   async (input = {}) => {
     const dir = (input.dir || '').trim() || DEFAULT_SKILLS_DIR;
     const { skills, error } = readSkills(dir);
     return {
-      content: [{ type: 'text', text: error ? `SkillDeck: ${error}` : `SkillDeck 已打开，读取到 ${skills.length} 个 Skill。` }],
+      content: [{ type: 'text', text: error ? `SkillSpace: ${error}` : `SkillSpace 已打开，读取到 ${skills.length} 个 Skill。` }],
       structuredContent: { dir, skills, error: error || null },
       _meta: { 'openai/outputTemplate': WIDGET_URI, widgetData: { dir, skills, error: error || null } },
     };
@@ -134,7 +134,7 @@ server.registerTool(
   'list_skills',
   {
     title: 'List Skills',
-    description: '读取指定目录（默认 ~/.claude/skills）的 Skill 列表，供 SkillDeck widget 刷新。',
+    description: '读取指定目录（默认 ~/.claude/skills）的 Skill 列表，供 SkillSpace widget 刷新。',
     inputSchema: { dir: z.string().trim().optional() },
     _meta: { 'openai/widgetAccessible': true },
   },

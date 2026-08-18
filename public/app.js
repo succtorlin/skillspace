@@ -17,12 +17,24 @@ function applyTheme(theme) {
   if (btn) btn.innerHTML = icon(light ? 'sun' : 'moon') + `<span id="theme-label">${light ? '浅色' : '深色'}</span>`;
 }
 function initTheme() {
-  const saved = localStorage.getItem('skilldeck-theme') || 'dark';
+  // One-time migration from the pre-rename keys, so an existing user does not
+  // silently lose their theme and source when the app changes name.
+  try {
+    for (const [oldK, newK] of [['skilldeck-theme','skillspace-theme'],
+                                ['skilldeck-source','skillspace-source']]) {
+      const v = localStorage.getItem(oldK);
+      if (v !== null && localStorage.getItem(newK) === null) {
+        localStorage.setItem(newK, v);
+        localStorage.removeItem(oldK);
+      }
+    }
+  } catch (e) {}
+  const saved = localStorage.getItem('skillspace-theme') || 'dark';
   applyTheme(saved);
   const btn = $('#theme-toggle');
   if (btn) btn.addEventListener('click', () => {
     const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-    localStorage.setItem('skilldeck-theme', next);
+    localStorage.setItem('skillspace-theme', next);
     applyTheme(next);
   });
 }
@@ -147,7 +159,7 @@ async function loadSources(keepId) {
   let data = { sources: [] };
   try { data = await fetch('/api/sources').then((r) => r.json()); } catch (_) {}
   state.sources = data.sources || [];
-  const wanted = keepId || (state.source && state.source.id) || localStorage.getItem('skilldeck-source');
+  const wanted = keepId || (state.source && state.source.id) || localStorage.getItem('skillspace-source');
   const pick =
     state.sources.find((s) => s.id === wanted && s.exists) ||   // 上次用的
     state.sources.find((s) => s.exists && s.count > 0) ||        // 第一个真有 Skill 的
@@ -188,7 +200,7 @@ function renderSources() {
 // 切换来源：技能和专家一起换
 async function selectSource(src, silent) {
   state.source = src || null;
-  if (src) localStorage.setItem('skilldeck-source', src.id);
+  if (src) localStorage.setItem('skillspace-source', src.id);
   $('#src-icon').innerHTML = src ? sourceIcon(src, 17) : '';
   $('#src-name').textContent = src ? src.label : '没有可用的 Skill 来源';
   $('#src-path').textContent = src ? src.dir : '点左侧「添加本地目录」手动选一个';

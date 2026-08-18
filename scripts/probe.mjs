@@ -8,15 +8,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(__dirname, '..', 'mcp', 'server.mjs');
 
 const transport = new StdioClientTransport({ command: 'node', args: [serverPath] });
-const client = new Client({ name: 'skilldeck-probe', version: '0.0.1' }, { capabilities: {} });
+const client = new Client({ name: 'skillspace-probe', version: '0.0.1' }, { capabilities: {} });
 await client.connect(transport);
 
 const tools = await client.listTools();
 console.log('工具:', tools.tools.map((t) => t.name).join(', '));
 
-// 检查 open_skilldeck 的 widget 元数据
-const open = tools.tools.find((t) => t.name === 'open_skilldeck');
-console.log('open_skilldeck outputTemplate:', open?._meta?.['openai/outputTemplate']);
+// 检查 open_skillspace 的 widget 元数据
+const open = tools.tools.find((t) => t.name === 'open_skillspace');
+console.log('open_skillspace outputTemplate:', open?._meta?.['openai/outputTemplate']);
 
 // 调 list_skills，看能否读到本地 Skill
 const res = await client.callTool({ name: 'list_skills', arguments: {} });
@@ -28,7 +28,7 @@ console.log('样例前 3:', (sc.skills || []).slice(0, 3).map((s) => `${s.name}[
 try {
   const resources = await client.listResources();
   console.log('resources:', (resources.resources || []).map((r) => r.uri).join(', '));
-  const uri = 'ui://widget/skilldeck/deck.html';
+  const uri = 'ui://widget/skillspace/deck.html';
   const r = await client.readResource({ uri });
   const html = (r.contents && r.contents[0] && r.contents[0].text) || '';
   console.log('widget HTML 长度:', html.length,

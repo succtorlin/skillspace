@@ -1,9 +1,9 @@
 {
-  "name": "skilldeck",
+  "name": "skillspace",
   "version": "0.1.0",
-  "description": "SkillDeck · 可视化 Skill 控制台——导入本地 Skill 文件夹，卡片展示，一键把命令投送给 codex / qodercli 执行",
+  "description": "SkillSpace · 可视化 Skill 控制台——导入本地 Skill 文件夹，卡片展示，一键把命令投送给 codex / qodercli 执行",
   "bin": {
-    "skilldeck": "server.js"
+    "skillspace": "server.js"
   },
   "scripts": {
     "start": "node server.js"

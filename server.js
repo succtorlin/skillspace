@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// SkillDeck · 可视化 Skill 控制台
+// SkillSpace · 可视化 Skill 控制台
 // 零依赖：读取本地 Skill 文件夹 → 卡片展示 → 一键把命令投送给 codex / qodercli 执行并流式输出。
 'use strict';
 
@@ -32,7 +32,7 @@ const CHILD_PATH = `${path.join(os.homedir(), '.local', 'bin')}:${process.env.PA
 
 // ---------- 专家存储 ----------
 // 不再接任何大模型 API：专家聚类交给你已经在用的 Codex / Claude Code，
-// SkillDeck 只负责出口令、开一个回传口子、显示结果。
+// SkillSpace 只负责出口令、开一个回传口子、显示结果。
 const EXPERTS_FILE = path.join(__dirname, 'experts.json');
 
 function loadExperts() {
@@ -49,7 +49,7 @@ function newExpertId() {
 }
 
 // 目录历史（本机状态，gitignore）
-const STATE_FILE = path.join(__dirname, '.skilldeck.state.json');
+const STATE_FILE = path.join(__dirname, '.skillspace.state.json');
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (_) { return {}; }
 }
@@ -363,7 +363,7 @@ function buildClassifyPrompt(job, skills) {
     `每个专家是一组用途高度相关的 Skill 集合，名字要像职业或角色，例如「内容创作专家」「配图设计专家」「数据分析专家」。\n` +
     `请聚成 6-12 个专家，尽量覆盖多数 Skill，一个 Skill 归到一个最合适的专家即可。\n\n` +
     `Skill 清单（共 ${skills.length} 个，格式：folder | 名称 | 简介）：\n${list}\n\n` +
-    `分好之后，执行下面这条命令把结果回传给 SkillDeck（本机服务，直接跑就行）：\n\n` +
+    `分好之后，执行下面这条命令把结果回传给 SkillSpace（本机服务，直接跑就行）：\n\n` +
     `curl -X POST '${url}' \\\n` +
     `  -H 'Content-Type: application/json' \\\n` +
     `  -d '{"experts":[{"name":"内容创作专家","description":"一句话说明这个专家能干什么","skills":["folder-a","folder-b"]}]}'\n\n` +
@@ -509,7 +509,7 @@ const server = http.createServer(async (req, res) => {
   // 回传口子：Codex / Claude Code 把聚类结果 POST 回来
   if (p === '/api/experts/import' && req.method === 'POST') {
     const job = JOBS.get(u.searchParams.get('token') || '');
-    if (!job) return sendJson(res, 404, { error: '任务不存在或已过期，请回 SkillDeck 重新生成口令' });
+    if (!job) return sendJson(res, 404, { error: '任务不存在或已过期，请回 SkillSpace 重新生成口令' });
     const body = await readBody(req);
     const r = importExperts(job, body);
     if (r.error) {
@@ -618,7 +618,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n  SkillDeck · 技控台  已启动`);
+  console.log(`\n  SkillSpace · 技控台  已启动`);
   console.log(`  → http://localhost:${PORT}`);
   for (const s of listSources()) {
     const tag = s.builtin ? s.label : `自定义 ${s.label}`;
