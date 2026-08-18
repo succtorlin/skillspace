@@ -1,11 +1,37 @@
 :root {
-  --bg: transparent; --panel: rgba(23,26,33,.9); --panel2: #1e222b; --line: #2a2f3a;
-  --text: #e7e9ee; --sub: #9aa1af; --accent: #6ee7b7; --accent2: #3b82f6; --red: #f2555a;
+  /* MIRROR of public/style.css tokens — the canonical source.
+     The widget CSS is inlined at build time so it cannot import;
+     keep these values byte-identical to the console. */
+  --ground-0: #0a0d0c;
+  --ground-1: #111614;
+  --ground-2: #18201d;
+  --ground-3: #1f2a26;
+  --hair: #232e2a;
+  --hair-lit: #35443e;
+  --ink: #e8efec;
+  --ink-2: #a9b8b2;
+  --muted: #7d8f88;
+  --accent: #6ee7b7;
+  --accent-hi: #9df5d2;
+  --on-accent: #08100d;
+  --danger: #f2555a;
+  --face-display: "Iowan Old Style", "Palatino Linotype", Palatino, ui-serif, Georgia, serif;
+  --face-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --face-sans: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  /* legacy aliases — do not redefine */
+  --bg: transparent;
+  --panel: var(--ground-1);
+  --panel2: var(--ground-2);
+  --line: var(--hair);
+  --text: var(--ink);
+  --sub: var(--ink-2);
+  --accent2: var(--accent);
+  --red: var(--danger);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   color: var(--text); background: var(--bg);
-  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-family: var(--face-sans);
   font-size: 13px; padding: 12px 14px 16px;
 }
 
@@ -43,7 +69,7 @@ body {
 }
 .sd-card-desc { color: var(--sub); font-size: 12px; line-height: 1.55; flex: 1; }
 .sd-card-foot { display: flex; align-items: center; justify-content: space-between; }
-.sd-card-folder { font-size: 10.5px; color: #6b7280; font-family: ui-monospace, monospace; }
+.sd-card-folder { font-size: 10.5px; color: #6b7280; font-family: var(--face-mono); font-variant-numeric: tabular-nums; }
 .sd-use {
   background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #0f1115;
   font-weight: 700; border: none; border-radius: 8px; padding: 6px 15px; font-size: 12.5px; cursor: pointer;
@@ -71,7 +97,7 @@ body {
 .sd-cmd-label { font-size: 11.5px; color: var(--sub); margin: 12px 0 6px; }
 .sd-cmd {
   background: #0b0d11; border: 1px solid var(--line); border-radius: 9px; padding: 11px;
-  font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--accent);
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--accent);
   white-space: pre-wrap; word-break: break-word; line-height: 1.6; max-height: 150px; overflow-y: auto;
 }
 .sd-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
@@ -84,5 +110,14 @@ body {
 .sd-toast {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
   background: #171a21; border: 1px solid var(--accent); color: var(--text);
-  padding: 10px 18px; border-radius: 10px; font-size: 13px; z-index: 60; box-shadow: 0 6px 24px rgba(0,0,0,.4);
+  padding: 10px 18px; border-radius: 10px; font-size: 13px; z-index: 60; border-color: var(--hair-lit);
+}
+
+
+/* Designed focus ring — identical to the console. */
+button:focus-visible, a:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: .001ms !important; animation-duration: .001ms !important; }
 }

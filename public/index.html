@@ -38,7 +38,7 @@
           <button class="seg-item" data-view="experts">专家 <span id="seg-experts-n" class="seg-n"></span></button>
         </div>
         <div class="agent-box">
-          <span class="agent-label">本地 Agent</span>
+          <label class="agent-label" for="agent">本地 Agent</label>
           <select id="agent" class="agent-select"></select>
         </div>
         <button id="reload" class="btn icon-btn" title="重新扫描当前目录"></button>
@@ -47,6 +47,7 @@
       <!-- 视图：Skill -->
       <section id="view-skills" class="view">
         <div class="toolbar">
+          <label class="srOnly" for="search">搜索 Skill</label>
           <input id="search" class="search" placeholder="搜索 Skill 名称或功能…" />
           <div id="cats" class="cats"></div>
           <span id="count" class="count"></span>
