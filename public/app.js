@@ -80,7 +80,53 @@ $('#cf-ok').addEventListener('click', async () => {
   try { await fn(); } finally { btn.disabled = false; closeConfirm(); }
 });
 $('#confirm-modal').addEventListener('click', (e) => { if (e.target.id === 'confirm-modal') closeConfirm(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('#confirm-modal').style.display === 'grid') closeConfirm(); });
+// ---------- Dialog keyboard + focus contract ----------
+// Applies to every modal, not just the confirm one: Escape closes the topmost
+// open dialog, focus moves into it on open, and returns to whatever opened it
+// on close. Without the return step, keyboard focus lands back at <body> and
+// the user has to re-traverse the page.
+const DIALOG_IDS = ['#modal', '#exp-modal', '#confirm-modal', '#cmd-modal', '#jb-modal'];
+let lastTrigger = null;
+
+function openDialogs() {
+  return DIALOG_IDS.map($).filter((d) => d && d.style.display !== 'none');
+}
+
+// Capture on 'click', not 'mousedown': keyboard activation (Enter/Space on a
+// button) fires click but never mousedown, so a mousedown-only capture loses
+// the trigger for precisely the users who depend on focus being restored.
+// Controls inside a dialog are skipped — returning focus to a button that is
+// now hidden strands the user just as badly as returning it to <body>.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest && e.target.closest('button, [tabindex], a');
+  if (el && !el.closest('.modal-mask, .run-drawer')) lastTrigger = el;
+}, true);
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const open = openDialogs();
+  if (!open.length) return;
+  const top = open[open.length - 1];
+  if (top.id === 'confirm-modal') closeConfirm();
+  else top.style.display = 'none';
+  if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
+});
+
+// Moving focus into a dialog when it opens is what makes Escape reachable at
+// all — a screen-reader or keyboard user otherwise stays outside it entirely.
+const dialogObserver = new MutationObserver((muts) => {
+  for (const m of muts) {
+    const d = m.target;
+    if (!DIALOG_IDS.includes('#' + d.id)) continue;
+    if (d.style.display === 'none') continue;
+    const target = d.querySelector('textarea, input, button:not([aria-label="关闭"]), [tabindex]');
+    if (target) setTimeout(() => target.focus(), 30);
+  }
+});
+for (const id of DIALOG_IDS) {
+  const el = $(id);
+  if (el) dialogObserver.observe(el, { attributes: true, attributeFilter: ['style'] });
+}
 
 // ---------- 一级：Skill 来源 ----------
 // 启动时后端已自动扫过 ~/.codex/skills 和 ~/.claude/skills，这里只负责渲染和挑一个激活。
@@ -259,7 +305,7 @@ function askDeleteSkill(skill) {
     onOk: async () => {
       const r = await fetch(`/api/skills?dir=${encodeURIComponent(curDir())}&folder=${encodeURIComponent(skill.folder)}`, { method: 'DELETE' })
         .then((x) => x.json()).catch((e) => ({ error: String(e.message || e) }));
-      if (r.error) return toast('删除失败：' + r.error);
+      if (r.error) return toast('删除失败：' + r.error, 'error');
       toast(r.trashed ? `已移到废纸篓：${skill.name}` : `已删除：${skill.name}`);
       await loadSources();  // 重扫，侧栏计数跟着更新
     },
@@ -327,16 +373,16 @@ async function copyText(text) {
   } catch (_) { return false; }
 }
 $('#m-copy').addEventListener('click', async () => {
-  if (!state.prompt) { toast('口令还没生成好，稍等一下'); return; }
+  if (!state.prompt) { toast('口令还没生成好，稍等一下', 'error'); return; }
   const ok = await copyText(state.prompt);
   if (ok) { toast('已复制，去 Codex 对话框粘贴发送即可'); closeModal(); }
-  else { toast('复制失败，请手动全选下方口令复制'); }
+  else { toast('复制失败，请手动全选下方口令复制', 'error'); }
 });
 
 // ---------- 本地运行 ----------
 $('#m-run').addEventListener('click', () => {
   const agent = $('#agent').value;
-  if (!agent) { toast('没有可用的本地 agent，请先装 codex 或 qodercli'); return; }
+  if (!agent) { toast('没有可用的本地 agent，请先装 codex 或 qodercli', 'error'); return; }
   const skill = state.current;
   const task = $('#m-task').value.trim();
   closeModal();
@@ -611,13 +657,25 @@ $('#run-close').addEventListener('click', () => {
 
 // ---------- toast ----------
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, kind) {
   let t = $('#toast');
-  if (!t) { t = document.createElement('div'); t.id = 'toast'; t.className = 'toast'; document.body.appendChild(t); }
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast'; t.className = 'toast';
+    t.setAttribute('role', 'status');
+    document.body.appendChild(t);
+  }
+  // Failure never wears the accent: the accent means "actionable", and it
+  // must stay readable as a signal. Errors also interrupt — polite updates
+  // can be queued behind other announcements and arrive after the toast
+  // has already gone.
+  const isErr = kind === 'error';
+  t.classList.toggle('is-error', isErr);
+  t.setAttribute('aria-live', isErr ? 'assertive' : 'polite');
   t.textContent = msg;
   t.style.display = 'block';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.style.display = 'none'), 2800);
+  toastTimer = setTimeout(() => (t.style.display = 'none'), isErr ? 4200 : 2800);
 }
 
 // ---------- 绑定 ----------

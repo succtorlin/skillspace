@@ -30,6 +30,8 @@
   /* semantic — destructive only, never decorative */
   --danger: #f2555a;
   --danger-ink: #ff8a8e;
+  /* modal scrim — dims the ground without a colour cast */
+  --scrim: rgba(4, 7, 6, .72);
   /* type faces */
   --face-display: "Iowan Old Style", "Palatino Linotype", Palatino, ui-serif, Georgia, serif;
   --face-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -63,6 +65,7 @@
   --on-accent: #ffffff;
   --danger: #c0392f;
   --danger-ink: #a32e26;
+  --scrim: rgba(19, 26, 23, .42);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -139,7 +142,7 @@ body {
 .brand { display: flex; align-items: center; gap: 10px; }
 .logo {
   width: 34px; height: 34px; border-radius: 9px;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: linear-gradient(135deg, var(--accent), var(--accent-hi));
   color: var(--on-accent); display: grid; place-items: center;
 }
 .brand-name { font-weight: 700; letter-spacing: .5px; }
@@ -275,7 +278,7 @@ body {
 .card-foot { display: flex; align-items: center; justify-content: space-between; }
 .card-folder { font-size: 11px; color: var(--muted); font-family: var(--face-mono); font-variant-numeric: tabular-nums; }
 .use-btn {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: linear-gradient(135deg, var(--accent), var(--accent-hi));
   color: var(--on-accent); font-weight: 700; border: none; border-radius: 8px;
   padding: 7px 16px; font-size: 13px; cursor: pointer;
 }
@@ -319,7 +322,7 @@ body {
 
 /* 弹窗 */
 .modal-mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,.55);
+  position: fixed; inset: 0; background: var(--scrim); backdrop-filter: blur(2px);
   display: grid; place-items: center; z-index: 50; padding: 20px;
 }
 .modal {
@@ -327,7 +330,7 @@ body {
   width: 100%; max-width: 560px; padding: 22px; max-height: 90vh; overflow-y: auto;
 }
 .modal-head { display: flex; justify-content: space-between; align-items: flex-start; }
-.modal-skill { font-size: 18px; font-weight: 800; }
+.modal-skill { font-size: 19px; font-weight: 500; }
 .modal-cat { font-size: 12px; color: var(--accent); margin-top: 4px; }
 .modal-x { background: none; border: none; color: var(--sub); font-size: 24px; cursor: pointer; line-height: 1; }
 .modal-desc {
@@ -341,7 +344,7 @@ body {
   border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
   font-size: 13px; outline: none; resize: vertical; font-family: inherit;
 }
-.modal-task:focus { border-color: var(--accent2); }
+.modal-task:focus { border-color: var(--accent); }
 .modal-mode { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
 .mode-opt {
   flex: 1; min-width: 200px; display: flex; align-items: baseline; gap: 6px;
@@ -364,9 +367,23 @@ body {
 /* toast */
 .toast {
   position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%);
-  background: var(--accent); color: var(--on-accent); font-size: 13px; font-weight: 700;
+  background: var(--accent); color: var(--on-accent);
+  font-family: var(--face-mono); font-size: 12.5px; font-weight: 600;
+  letter-spacing: .01em;
   padding: 10px 18px; border-radius: 10px; z-index: 100;
-  border-color: var(--hair-lit);
+  border: 1px solid transparent;
+  max-width: min(92vw, 460px); text-align: center;
+  animation: toast-in .18s cubic-bezier(.16,1,.3,1);
+}
+/* Semantic: failure never wears the accent. The accent means "actionable";
+   an error is not an invitation to act. */
+.toast.is-error {
+  background: var(--ground-2); color: var(--danger-ink);
+  border-color: var(--danger);
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, 6px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
 }
 
 /* 运行抽屉 */
@@ -438,7 +455,7 @@ body {
 
 /* Display face: humanist serif for surface titles. Editorial gravity
    that a default sans headline cannot carry, at zero webfont cost. */
-.brand-name, .src-title, .modal-title, .empty h3 {
+.brand-name, .src-title, .modal-skill, .empty h3 {
   font-family: var(--face-display);
   font-weight: 500;
   letter-spacing: -0.01em;

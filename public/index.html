@@ -70,14 +70,14 @@
   </div>
 
   <!-- Skill 使用弹窗 -->
-  <div id="modal" class="modal-mask" style="display:none">
+  <div id="modal" class="modal-mask" style="display:none" role="dialog" aria-modal="true" aria-labelledby="m-name">
     <div class="modal">
       <div class="modal-head">
         <div>
           <div class="modal-skill" id="m-name"></div>
           <div class="modal-cat" id="m-cat"></div>
         </div>
-        <button class="modal-x" id="m-close">×</button>
+        <button class="modal-x" id="m-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
       <div class="modal-desc" id="m-desc"></div>
       <label class="modal-label">补充说明 / 具体任务（可留空）</label>
@@ -97,14 +97,14 @@
   </div>
 
   <!-- 专家使用弹窗 -->
-  <div id="exp-modal" class="modal-mask" style="display:none">
+  <div id="exp-modal" class="modal-mask" style="display:none" role="dialog" aria-modal="true" aria-labelledby="em-name">
     <div class="modal">
       <div class="modal-head">
         <div>
           <div class="modal-skill" id="em-name"></div>
           <div class="modal-cat" id="em-count"></div>
         </div>
-        <button class="modal-x" id="em-close">×</button>
+        <button class="modal-x" id="em-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
       <div class="modal-desc" id="em-desc"></div>
       <div id="em-skills" class="em-skills"></div>
@@ -123,7 +123,7 @@
     <div class="modal">
       <div class="modal-head">
         <div class="modal-skill">手动创建专家</div>
-        <button class="modal-x" id="cm-close">×</button>
+        <button class="modal-x" id="cm-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
       <div class="cm-row">
         <input id="cm-name" class="cm-name" placeholder="专家名，例如：内容创作专家" />
@@ -147,7 +147,7 @@
           <div class="modal-skill">让 Codex / Claude Code 自动分类</div>
           <div class="modal-cat" id="jb-sub"></div>
         </div>
-        <button class="modal-x" id="jb-close">×</button>
+        <button class="modal-x" id="jb-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
       <div class="modal-desc">SkillDeck 不接任何大模型 API。复制下面这段口令，粘到 Codex 或 Claude Code 里发送，它分好类会自己把结果回传过来，这个窗口会实时显示进度。</div>
 
@@ -177,7 +177,7 @@
   </div>
 
   <!-- 删除二次确认弹窗（Skill 和专家共用） -->
-  <div id="confirm-modal" class="modal-mask" style="display:none">
+  <div id="confirm-modal" class="modal-mask" style="display:none" role="dialog" aria-modal="true" aria-labelledby="cf-title">
     <div class="modal modal-sm">
       <div class="confirm-head">
         <span class="confirm-ico" id="cf-ico"></span>
@@ -198,7 +198,7 @@
     <div class="run-head">
       <div class="run-title"><span id="run-skill"></span> · 运行结果</div>
       <div class="run-status" id="run-status">运行中…</div>
-      <button class="run-x" id="run-close">×</button>
+      <button class="run-x" id="run-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
     </div>
     <div class="run-cmd" id="run-cmd"></div>
     <pre class="run-out" id="run-out"></pre>
@@ -206,5 +206,6 @@
 
   <script src="/icons.js"></script>
   <script src="/app.js"></script>
+  <div id="toast" class="toast" role="status" aria-live="polite" style="display:none"></div>
 </body>
 </html>
