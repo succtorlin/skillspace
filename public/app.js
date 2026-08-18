@@ -499,10 +499,10 @@ async function openExpertModal(expert) {
 $('#em-close').addEventListener('click', () => ($('#exp-modal').style.display = 'none'));
 $('#em-cancel').addEventListener('click', () => ($('#exp-modal').style.display = 'none'));
 $('#em-copy').addEventListener('click', async () => {
-  if (!state.prompt) { toast('口令还没生成好，稍等一下'); return; }
+  if (!state.prompt) { toast('口令还没生成好，稍等一下', 'error'); return; }
   const ok = await copyText(state.prompt);
   if (ok) { toast('已复制，粘贴到 Codex，本轮对话就能按关键词自动调用这些 Skill'); $('#exp-modal').style.display = 'none'; }
-  else { toast('复制失败，请手动全选下方口令复制'); }
+  else { toast('复制失败，请手动全选下方口令复制', 'error'); }
 });
 $('#em-delete').addEventListener('click', () => askDeleteExpert(state.currentExpert));
 
@@ -512,7 +512,7 @@ const job = { token: '', prompt: '', timer: null };
 
 $('#exp-auto').addEventListener('click', openJobModal);
 async function openJobModal() {
-  if (!state.skills.length) return toast('这个来源里还没有 Skill，先切一个有内容的来源');
+  if (!state.skills.length) return toast('这个来源里还没有 Skill，先切一个有内容的来源', 'error');
   job.token = '';
   job.prompt = '';
   $('#jb-cmd').textContent = '生成口令中…';
@@ -524,7 +524,7 @@ async function openJobModal() {
   $('#job-modal').style.display = 'grid';
   try {
     const d = await fetch('/api/experts/job?dir=' + encodeURIComponent(curDir()), { method: 'POST' }).then((r) => r.json());
-    if (d.error) { $('#jb-cmd').textContent = '（生成失败）'; return toast('生成失败：' + d.error); }
+    if (d.error) { $('#jb-cmd').textContent = '（生成失败）'; return toast('生成失败：' + d.error, 'error'); }
     job.token = d.token;
     job.prompt = d.prompt;
     $('#jb-cmd').textContent = d.prompt;
@@ -533,7 +533,7 @@ async function openJobModal() {
     startPolling();
   } catch (e) {
     $('#jb-cmd').textContent = '（生成失败）';
-    toast('生成失败：' + (e && e.message ? e.message : e));
+    toast('生成失败：' + (e && e.message ? e.message : e), 'error');
   }
 }
 function setJobStatus(kind, text) {
@@ -569,9 +569,9 @@ async function onJobDone(d) {
 }
 
 $('#jb-copy').addEventListener('click', async () => {
-  if (!job.prompt) return toast('口令还没生成好，稍等一下');
+  if (!job.prompt) return toast('口令还没生成好，稍等一下', 'error');
   const ok = await copyText(job.prompt);
-  if (!ok) return toast('复制失败，请手动全选上方口令复制');
+  if (!ok) return toast('复制失败，请手动全选上方口令复制', 'error');
   markStep(2);
   setJobStatus('wait', '已复制。粘到 Codex / Claude Code 发送，这里会自动等结果…');
   toast('已复制，粘到 Codex 或 Claude Code 发送');
@@ -579,14 +579,14 @@ $('#jb-copy').addEventListener('click', async () => {
 // 兜底：agent 不方便跑 curl 时，把它输出的 JSON 手动贴回来
 $('#jb-paste-go').addEventListener('click', async () => {
   const raw = $('#jb-paste').value.trim();
-  if (!raw) return toast('先把 JSON 贴进来');
-  if (!job.token) return toast('口令还没生成好');
+  if (!raw) return toast('先把 JSON 贴进来', 'error');
+  if (!job.token) return toast('口令还没生成好', 'error');
   let body;
-  try { body = JSON.parse(raw); } catch (e) { return toast('这段不是合法 JSON：' + e.message); }
+  try { body = JSON.parse(raw); } catch (e) { return toast('这段不是合法 JSON：' + e.message, 'error'); }
   const d = await fetch('/api/experts/import?token=' + encodeURIComponent(job.token), {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   }).then((r) => r.json()).catch((e) => ({ error: String(e.message || e) }));
-  if (d.error) return toast('导入失败：' + d.error);
+  if (d.error) return toast('导入失败：' + d.error, 'error');
   stopPolling();
   const st = await fetch('/api/experts/job?token=' + encodeURIComponent(job.token)).then((r) => r.json());
   onJobDone(st);
@@ -629,8 +629,8 @@ $('#cm-close').addEventListener('click', () => ($('#create-modal').style.display
 $('#cm-cancel').addEventListener('click', () => ($('#create-modal').style.display = 'none'));
 $('#cm-save').addEventListener('click', async () => {
   const name = $('#cm-name').value.trim();
-  if (!name) { toast('给专家起个名字'); return; }
-  if (!state.picked.size) { toast('至少勾一个 Skill'); return; }
+  if (!name) { toast('给专家起个名字', 'error'); return; }
+  if (!state.picked.size) { toast('至少勾一个 Skill', 'error'); return; }
   const body = {
     name,
     description: $('#cm-desc').value.trim(),
@@ -649,6 +649,9 @@ $('#cm-save').addEventListener('click', async () => {
 function runSkill(agent, skill, task) {
   if (state.es) state.es.close();
   $('#run').style.display = 'flex';
+  // The log is the point of the drawer; focus it so a keyboard user lands on
+  // the streamed output rather than having to tab the whole page to reach it.
+  setTimeout(() => { const o = $('#run-out'); if (o) o.focus(); }, 30);
   $('#run-skill').textContent = skill.name;
   $('#run-status').textContent = '运行中…';
   $('#run-status').className = 'run-status';
@@ -678,6 +681,8 @@ function runSkill(agent, skill, task) {
 $('#run-close').addEventListener('click', () => {
   if (state.es) state.es.close();
   $('#run').style.display = 'none';
+  // Same contract as Escape: never leave focus on a control that is now hidden.
+  if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
 });
 
 // ---------- toast ----------
@@ -717,7 +722,7 @@ async function pickDir() {
     await loadSources('custom:' + data.dir);
     toast('已添加：' + data.dir);
   } catch (e) {
-    toast('打开选择框失败：' + (e && e.message ? e.message : e));
+    toast('打开选择框失败：' + (e && e.message ? e.message : e), 'error');
   } finally {
     btn.disabled = false;
   }
