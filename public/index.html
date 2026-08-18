@@ -119,7 +119,7 @@
   </div>
 
   <!-- 手动创建专家弹窗 -->
-  <div id="create-modal" class="modal-mask" style="display:none">
+  <div id="create-modal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
     <div class="modal">
       <div class="modal-head">
         <div class="modal-skill">手动创建专家</div>
@@ -140,7 +140,7 @@
   </div>
 
   <!-- 自动分类：出口令给 Codex / Claude Code 跑，等它回传 -->
-  <div id="job-modal" class="modal-mask" style="display:none">
+  <div id="job-modal" class="modal-mask" style="display:none" role="dialog" aria-modal="true">
     <div class="modal">
       <div class="modal-head">
         <div>
@@ -151,16 +151,16 @@
       </div>
       <div class="modal-desc">SkillDeck 不接任何大模型 API。复制下面这段口令，粘到 Codex 或 Claude Code 里发送，它分好类会自己把结果回传过来，这个窗口会实时显示进度。</div>
 
-      <div class="jb-steps">
-        <div class="jb-step" id="jb-step1"><span class="jb-num">1</span>复制口令</div>
-        <div class="jb-step" id="jb-step2"><span class="jb-num">2</span>粘到 Codex / Claude Code 发送</div>
-        <div class="jb-step" id="jb-step3"><span class="jb-num">3</span>等它回传结果</div>
-      </div>
+      <ol class="jb-steps">
+        <li class="jb-step" id="jb-step1"><span class="jb-num">1</span>复制口令</li>
+        <li class="jb-step" id="jb-step2"><span class="jb-num">2</span>粘到 Codex / Claude Code 发送</li>
+        <li class="jb-step" id="jb-step3"><span class="jb-num">3</span>等它回传结果</li>
+      </ol>
 
       <div class="modal-cmd-label">口令 <span id="jb-chars" class="cmd-chars"></span></div>
       <pre class="modal-cmd" id="jb-cmd">生成中…</pre>
 
-      <div class="jb-status" id="jb-status"><span class="jb-dot"></span><span id="jb-status-text">还没开始，先复制口令</span></div>
+      <div class="jb-status" id="jb-status" role="status" aria-live="polite"><span class="jb-dot"></span><span id="jb-status-text">还没开始，先复制口令</span></div>
       <div class="jb-result" id="jb-result" style="display:none"></div>
 
       <details class="jb-fallback">
@@ -194,14 +194,14 @@
   </div>
 
   <!-- 本地运行输出抽屉 -->
-  <div id="run" class="run-drawer" style="display:none">
+  <div id="run" class="run-drawer" style="display:none" role="complementary" aria-labelledby="run-skill">
     <div class="run-head">
       <div class="run-title"><span id="run-skill"></span> · 运行结果</div>
-      <div class="run-status" id="run-status">运行中…</div>
+      <div class="run-status" id="run-status" role="status" aria-live="polite">运行中…</div>
       <button class="run-x" id="run-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
     </div>
     <div class="run-cmd" id="run-cmd"></div>
-    <pre class="run-out" id="run-out"></pre>
+    <pre class="run-out" id="run-out" tabindex="0" role="log" aria-label="运行输出"></pre>
   </div>
 
   <script src="/icons.js"></script>

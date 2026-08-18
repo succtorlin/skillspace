@@ -389,18 +389,18 @@ body {
 /* 运行抽屉 */
 .run-drawer {
   position: fixed; top: 0; right: 0; width: min(560px, 92vw); height: 100vh;
-  background: var(--panel); border-left: 1px solid var(--line);
-  border-color: var(--hair-lit); z-index: 60;
+  background: var(--ground-1); border-left: 1px solid var(--hair-lit); z-index: 60;
   display: flex; flex-direction: column;
 }
 .run-head {
   display: flex; align-items: center; gap: 12px;
   padding: 14px 18px; border-bottom: 1px solid var(--line);
 }
-.run-title { font-weight: 700; font-size: 14px; flex: 1; }
-.run-status { font-size: 12px; color: var(--accent); }
-.run-status.done { color: var(--sub); }
-.run-status.err { color: var(--red); }
+.run-title { font-family: var(--face-display); font-weight: 500; font-size: 15px; flex: 1; letter-spacing: -.01em; }
+.run-status { font-family: var(--face-mono); font-size: 11.5px; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--accent); }
+.run-status.done { color: var(--muted); }
+.run-status.err { color: var(--danger-ink); }
 .run-x { background: none; border: none; color: var(--sub); font-size: 22px; cursor: pointer; }
 .run-cmd {
   padding: 10px 18px; font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 11.5px;
@@ -415,7 +415,8 @@ body {
 .toolbar[hidden] { display: none; }
 
 /* 自动分类任务弹窗 */
-.jb-steps { display: flex; gap: 8px; margin: 14px 0 4px; flex-wrap: wrap; }
+.jb-steps { display: flex; gap: 8px; margin: 14px 0 4px; flex-wrap: wrap;
+  list-style: none; padding: 0; }
 .jb-step {
   flex: 1; min-width: 120px; display: flex; align-items: center; gap: 7px;
   font-size: 12px; color: var(--sub);
@@ -425,15 +426,15 @@ body {
   flex: none; display: grid; place-items: center; width: 18px; height: 18px;
   border-radius: 50%; background: var(--line); color: var(--sub); font-size: 11px; font-weight: 700;
 }
-.jb-step.on { color: var(--text); border-color: var(--accent); }
-.jb-step.on .jb-num { background: var(--accent); color: var(--on-accent); }
+.jb-step.on { color: var(--ink); border-color: var(--accent); font-weight: 600; }
+.jb-step.on .jb-num { background: var(--accent); color: var(--on-accent); box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 22%, transparent); }
 .jb-status {
   display: flex; align-items: center; gap: 9px; margin-top: 14px;
   font-size: 12.5px; color: var(--sub);
   padding: 10px 12px; border-radius: 10px; background: var(--panel2); border: 1px solid var(--line);
 }
 .jb-status .jb-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--sub); }
-.jb-status.wait .jb-dot { background: var(--accent2); animation: jb-pulse 1.2s ease-in-out infinite; }
+.jb-status.wait .jb-dot { background: var(--accent); animation: jb-pulse 1.2s ease-in-out infinite; }
 .jb-status.wait { color: var(--text); }
 .jb-status.ok { color: var(--text); border-color: var(--accent); }
 .jb-status.ok .jb-dot { background: var(--accent); }
@@ -564,3 +565,25 @@ input:focus-visible,
   .count { margin-left: 0; }
   .src-path, .card-folder { word-break: break-all; }
 }
+
+
+/* ------------------------------------------------------------
+   Run drawer + job steps — state layer
+   ------------------------------------------------------------ */
+
+/* The drawer overlays the console, so it needs its own separation from the
+   ground beneath it; a hairline alone reads as a seam at this width. */
+.run-drawer { box-shadow: -24px 0 48px -24px var(--scrim); }
+
+/* A frozen pulse is worse than no pulse: with animation disabled the dot
+   would stop at whatever opacity the frame happened to hold. Pin it. */
+@media (prefers-reduced-motion: reduce) {
+  .jb-status.wait .jb-dot { animation: none; opacity: 1; }
+}
+
+/* Steps read as a sequence, so the connector belongs in the design rather
+   than being implied by proximity. */
+.jb-step { position: relative; transition: border-color .15s, color .15s; }
+.jb-step.done .jb-num::after { content: "✓"; }
+.jb-step.done .jb-num { font-size: 0; }
+.jb-step.done .jb-num::after { font-size: 11px; }

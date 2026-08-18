@@ -85,7 +85,10 @@ $('#confirm-modal').addEventListener('click', (e) => { if (e.target.id === 'conf
 // open dialog, focus moves into it on open, and returns to whatever opened it
 // on close. Without the return step, keyboard focus lands back at <body> and
 // the user has to re-traverse the page.
-const DIALOG_IDS = ['#modal', '#exp-modal', '#confirm-modal', '#cmd-modal', '#jb-modal'];
+// Derived from the DOM rather than hardcoded: a hand-maintained list silently
+// drifted (it named two dialogs that do not exist and missed two that do), so
+// Escape worked for only three of the five modals.
+const DIALOG_IDS = [...document.querySelectorAll('.modal-mask')].map((d) => '#' + d.id);
 let lastTrigger = null;
 
 function openDialogs() {
@@ -105,11 +108,21 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   const open = openDialogs();
-  if (!open.length) return;
-  const top = open[open.length - 1];
-  if (top.id === 'confirm-modal') closeConfirm();
-  else top.style.display = 'none';
-  if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
+  if (open.length) {
+    const top = open[open.length - 1];
+    if (top.id === 'confirm-modal') closeConfirm();
+    else top.style.display = 'none';
+    if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
+    return;
+  }
+  // The run drawer is not a dialog — it does not trap focus and the page
+  // stays usable behind it — but Escape is still the expected way out of a
+  // panel that covers half the screen.
+  const drawer = $('#run');
+  if (drawer && drawer.style.display !== 'none') {
+    drawer.style.display = 'none';
+    if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
+  }
 });
 
 // Moving focus into a dialog when it opens is what makes Escape reachable at
