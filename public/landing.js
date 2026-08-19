@@ -141,16 +141,28 @@
 
   let raf = 0;
   let t0 = 0;
-  const DURATION = 5200; // one full assembly pass
+  const DURATION = 5200; // notional full pass, start (0) to settled (1)
   const HOLD = 1400;     // settled before it restarts
+  // Arrive part-filled. Starting at 0 means a visitor's first second is an
+  // empty grid, which undersells the one thing the hero is there to show. The
+  // loop also restarts HERE rather than at 0, so it never empties out either.
+  const SEED = 0.35;
+  const RUN = DURATION * (1 - SEED); // wall time for the visible remainder
+
+  const progressAt = (ts) => {
+    if (!t0) t0 = ts;
+    const elapsed = DURATION * SEED + ((ts - t0) % (RUN + HOLD));
+    return Math.min(1.25, elapsed / DURATION);
+  };
 
   const tick = (ts) => {
-    if (!t0) t0 = ts;
-    const elapsed = (ts - t0) % (DURATION + HOLD);
-    const progress = Math.min(1.25, elapsed / DURATION);
-    frame(progress);
+    frame(progressAt(ts));
     raf = requestAnimationFrame(tick);
   };
+
+  // Paint the seeded frame synchronously so there is no blank gap between
+  // parse and the first RAF callback.
+  frame(SEED);
   raf = requestAnimationFrame(tick);
 
   // ---- pause while hidden: a tab left open must not spin a core ----
