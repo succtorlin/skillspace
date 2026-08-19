@@ -141,9 +141,18 @@
   border: 1px solid var(--accent); color: var(--accent); background: transparent;
   border-radius: var(--r-pill); padding: 13px 26px;
   font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
-  text-transform: uppercase; cursor: pointer; transition: background .16s;
+  text-transform: uppercase; cursor: pointer; transition: background .16s, color .16s;
 }
-.btn-hair:hover { background: var(--accent-dim); }
+.page a.btn-hair:hover,
+.btn-hair:hover {
+  /* Invert to a fill, matching the console's card action: at most one control
+     is hovered, so the single fill follows the pointer. */
+  background: var(--accent-fill); color: var(--on-accent);
+}
+.page a.btn-hair:active,
+.btn-hair:active { background: var(--accent); filter: brightness(.92); }
+.page a.btn-hair:focus-visible,
+.btn-hair:focus-visible { background: var(--accent-fill); color: var(--on-accent); }
 
 /* Filled amber is reserved for the SINGLE highest-intent action on the page. */
 .page a.btn-fill,
@@ -151,9 +160,18 @@
   background: var(--accent-fill); color: var(--on-accent); border: 1px solid var(--accent-fill);
   border-radius: var(--r-pill); padding: 13px 26px;
   font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
-  text-transform: uppercase; font-weight: 600; cursor: pointer;
+  text-transform: uppercase; font-weight: 600; cursor: pointer; transition: background .16s, color .16s;
 }
-.btn-fill:hover { filter: brightness(1.08); }
+.page a.btn-fill:hover,
+.btn-fill:hover {
+  /* The fill is already the loudest thing on the page, so its hover inverts
+     the other way — back to the hairline — rather than getting louder. */
+  background: transparent; color: var(--accent);
+}
+.page a.btn-fill:active,
+.btn-fill:active { background: var(--accent); color: var(--on-accent); filter: brightness(.92); }
+.page a.btn-fill:focus-visible,
+.btn-fill:focus-visible { background: transparent; color: var(--accent); }
 
 .hero-meta {
   margin-top: 42px; display: flex; gap: 34px; flex-wrap: wrap;
