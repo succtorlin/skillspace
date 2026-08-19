@@ -98,22 +98,35 @@
 .nav-links a:hover { color: var(--ink); }
 
 /* ---------- hero ---------- */
-.hero { position: relative; padding: 96px 0 72px; z-index: 2; overflow: hidden; }
-.hero .ghost {
-  /* Measured placement, not guessed: the copy column ends at ~645px of a
-     1120px hero, so the ghost lives in the empty right half and bleeds off
-     the right edge. Vertically it sits above the body paragraph (which
-     starts at 377) so it is never behind copy — the preset's hard rule. */
-  left: 62%; right: auto; transform: none;
-  top: 150px; bottom: auto;
-  /* sized so the wordmark fits right of the copy column (which ends at
-     ~645 of 1120) rather than crossing it — measured, then set */
-  font-size: clamp(52px, 8vw, 104px);
+.hero {
+  position: relative; padding: 96px 0 72px; z-index: 2; overflow: hidden;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.92fr);
+  gap: 56px; align-items: center;
+}
+.hero-copy { min-width: 0; }
+
+/* Live proof, not a screenshot. Explicit dimensions on the canvas so the
+   column reserves its height before script runs and nothing shifts. */
+.hero-visual { min-width: 0; position: relative; }
+.hero-visual canvas {
+  display: block; width: 100%; height: auto; aspect-ratio: 640 / 440;
+  border: 1px solid var(--hair); background: var(--ground);
+}
+.hero-cap {
+  margin: 12px 0 0; font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+}
+/* The canvas now owns the hero's right column, so the ghost moved to the
+   install band, whose right side is genuinely empty. Still never behind copy —
+   verified by the geometry gate, not by eye. */
+#install { overflow: hidden; }
+#install .ghost {
+  left: auto; right: -40px; transform: none;
+  top: auto; bottom: -18px;
+  font-size: clamp(52px, 7vw, 96px);
 }
 @media (max-width: 1080px) {
-  /* below this the hero is copy-dense edge to edge; there is no dead space
-     left to put it in, so it goes rather than sitting under the text */
-  .hero .ghost { display: none; }
+  #install .ghost { display: none; }
 }
 .eyebrow {
   font-family: var(--mono); font-size: 11px; letter-spacing: .22em;
@@ -252,6 +265,10 @@
   .page *, .page *::before, .page *::after {
     transition-duration: .001ms !important; animation-duration: .001ms !important;
   }
+}
+@media (max-width: 980px) {
+  .hero { grid-template-columns: 1fr; gap: 40px; }
+  .hero-visual { order: 2; }
 }
 @media (max-width: 860px) {
   .rail { display: none; }              /* the rail needs margin it no longer has */

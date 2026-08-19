@@ -32,7 +32,7 @@
 <main id="main">
 
   <section class="wrap hero">
-    <div class="ghost" aria-hidden="true" data-word="SKILLSPACE"></div>
+    <div class="hero-copy">
     <p class="eyebrow">本地优先 · 不接任何大模型 API</p>
     <h1>你的 Skill<br />不该躺在<br />文件夹里</h1>
     <p>
@@ -48,6 +48,15 @@
       <span><b>零</b> 大模型 API 调用</span>
       <span><b>2</b> 个 agent 目录自动识别</span>
       <span><b>本地</b> 运行，不上传任何文件</span>
+    </div>
+    </div><!-- /hero-copy -->
+
+    <!-- Live proof: the card wall assembling itself, not a screenshot of one.
+         Decorative to assistive tech — the surrounding copy carries the
+         meaning, and a canvas has nothing to announce. -->
+    <div class="hero-visual">
+      <canvas id="hero-canvas" width="640" height="440" aria-hidden="true"></canvas>
+      <p class="hero-cap">读取目录 → 排布卡片墙</p>
     </div>
   </section>
 
@@ -107,6 +116,7 @@
   </section>
 
   <section class="wrap section" id="install">
+    <div class="ghost" aria-hidden="true" data-word="SKILLSPACE"></div>
     <div class="section-head">
       <h2>安装</h2>
       <p>一个 Node 进程，三个依赖，跑在本机。</p>
@@ -126,5 +136,6 @@
   <span>SKILLSPACE · 本地 SKILL 控制台</span>
   <span>不接大模型 API · 不上传文件 · MIT</span>
 </footer>
+<script src="/landing.js" defer></script>
 </body>
 </html>

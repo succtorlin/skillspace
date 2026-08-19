@@ -454,6 +454,7 @@ const server = http.createServer(async (req, res) => {
   // the app is an instrument, this page sells the idea of it.
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
+  if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
