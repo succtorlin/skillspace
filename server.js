@@ -260,8 +260,15 @@ function readSkills(dir) {
 // ---------- agent 探测 ----------
 function detectAgents() {
   const found = [];
+  // Each entry declares how ITS binary takes a headless prompt. Verified:
+  //   claude -p <prompt>          (--print / non-interactive)
+  //   opencode run <message>
+  //   codex exec <prompt>
+  //   qodercli -p <prompt>
   for (const [id, bin, run] of [
+    ['claude', 'claude', (p) => ['-p', p]],
     ['codex', 'codex', (p) => ['exec', p]],
+    ['opencode', 'opencode', (p) => ['run', p]],
     ['qodercli', 'qodercli', (p) => ['-p', p]],
   ]) {
     try {
@@ -402,7 +409,6 @@ function importExperts(job, payload) {
 function buildCommand(agentId, name, task, dir, folder) {
   const agent = AGENTS.find((a) => a.id === agentId) || AGENTS[0];
   if (!agent) return null;
-  const flag = agent.bin === 'codex' ? 'exec' : '-p';
   const body = folder ? getSkillBody(dir || DEFAULT_SKILLS_DIR, folder) : '';
   let prompt;
   if (body) {
@@ -414,11 +420,14 @@ function buildCommand(agentId, name, task, dir, folder) {
   } else {
     prompt = `请使用「${name}」这个 Skill 来完成以下任务：\n${task || '（无补充说明，按默认流程执行）'}`;
   }
-  // 预览命令做精简展示，不把整篇说明书铺出来
+  // 预览命令做精简展示，不把整篇说明书铺出来。
+  // 子命令/开关直接取自真实 args，预览和实际执行不会各说各话。
+  const args = agent.buildArgs(prompt);
+  const flag = args.length > 1 ? args[0] : '';
   const display = body
     ? `${agent.bin} ${flag} "〈注入「${name}」Skill 说明书〉+ 任务：${task || '默认流程'}"`
     : `${agent.bin} ${flag} "请使用「${name}」这个 Skill：${task || '默认流程'}"`;
-  return { bin: agent.bin, args: agent.buildArgs(prompt), prompt, display, injected: !!body };
+  return { bin: agent.bin, args, prompt, display, injected: !!body };
 }
 
 // ---------- HTTP ----------
