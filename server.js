@@ -451,11 +451,11 @@ const MAX_BODY = 1024 * 1024;
 // A Symbol key, not a string like "__oversize": a string sentinel is forgeable.
 // {"__oversize":true} is 22 bytes of perfectly legal JSON, and a caller sending
 // it under the limit got a spurious 413 (verified). A Symbol cannot arrive from
-// JSON.parse at all. It also keeps the resolved value an ordinary object, so
-// the routes that do not check it degrade to their existing defaults instead of
-// throwing - resolving null here crashed the whole process on the first
-// oversize POST to /api/experts, because String(body.name) on null throws out
-// of an async handler and takes the server down.
+// JSON.parse at all.
+//
+// The Symbol only helps because readBody GUARANTEES a plain non-null object
+// below. It did not always: reading body[OVERSIZE] off a null body threw and
+// killed the process, so the sentinel chosen to prevent a crash became one.
 const OVERSIZE = Symbol('oversize');
 
 function readBody(req) {
@@ -469,7 +469,17 @@ function readBody(req) {
     });
     req.on('end', () => {
       if (over) return resolve({ [OVERSIZE]: true });
-      try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); }
+      if (!b) return resolve({});
+      let parsed;
+      try { parsed = JSON.parse(b); } catch (_) { return resolve({}); }
+      // JSON.parse returns null, numbers, strings and arrays too - and "null"
+      // is truthy, so the old ternary handed null straight to the callers,
+      // where body[OVERSIZE] threw and took the process with it. Every caller
+      // treats the body as a record; guarantee one here rather than asking
+      // three call sites to remember. Arrays coerce too: body.name on an array
+      // is silently undefined, which is a defaulted record, not an error.
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resolve({});
+      return resolve(parsed);
     });
   });
 }

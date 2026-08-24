@@ -219,6 +219,31 @@ test('an oversized body is rejected, not persisted', async () => {
   assert.strictEqual(after, before, 'an oversized body created a record');
 });
 
+test('a non-object JSON body cannot crash the server', async () => {
+  // JSON.parse returns null, numbers, strings and arrays too. "null" is
+  // truthy, so the empty-body ternary never fired and body[OVERSIZE]
+  // dereferenced null, killing the process with an unhandled TypeError. Four
+  // bytes, and with Content-Type: text/plain it is a CORS simple request.
+  for (const raw of ['null', '123', '"str"', 'false', '[]', '[1,2]']) {
+    const r = await fetch(base + '/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
+    });
+    assert.strictEqual(r.status, 400, `body ${raw} should be a client error`);
+  }
+  // the server must still be serving
+  assert.strictEqual((await json('GET', '/api/projects')).status, 200);
+});
+
+test('a non-object JSON body cannot crash the experts route either', async () => {
+  for (const raw of ['null', '123', '"str"', 'false', '[]', '[1,2]']) {
+    const r = await fetch(base + '/api/experts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
+    });
+    assert.ok(r.status < 500, `body ${raw} got ${r.status}`);
+  }
+  assert.strictEqual((await json('GET', '/api/projects')).status, 200);
+});
+
 test('the oversize sentinel cannot be forged by a caller', async () => {
   // A string sentinel would make this 22-byte body a spurious 413. The Symbol
   // used instead cannot arrive through JSON.parse.
