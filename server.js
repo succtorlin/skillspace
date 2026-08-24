@@ -306,11 +306,108 @@ function detectAgents() {
 }
 const AGENTS = detectAgents();
 
+// Every agent currently running, so the count can be bounded and the whole set
+// reaped at shutdown. The design's per-project maxConcurrent does not reach
+// this route; this is the crude global equivalent until it does.
+const RUNNING = new Set();
+const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
+// Matches the design's orderTimeoutMs default (spec §8a), which calls it the
+// only thing standing between a stuck agent and an unbounded bill.
+const RUN_TIMEOUT_MS = Number(process.env.SKILLSPACE_RUN_TIMEOUT_MS) || 900000;
+
+// Agents need their own credentials to work at all, so the environment cannot
+// simply be dropped — but process.env on a developer machine also carries AWS,
+// GitHub, Stripe and npm tokens that an agent has no business holding, and a
+// prompt is enough to make it print them. Base vars plus each agent's own auth
+// prefixes; anything else stays behind.
+//
+// Set SKILLSPACE_ENV_PASSTHROUGH=1 to restore the old behaviour if an agent
+// needs a variable this list does not name. If you hit that, the fix is to add
+// the prefix here rather than leave the passthrough on.
+const ENV_BASE = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ'];
+const ENV_PREFIXES = {
+  claude: ['ANTHROPIC_', 'CLAUDE_'],
+  codex: ['OPENAI_', 'CODEX_'],
+  opencode: ['OPENCODE_', 'ANTHROPIC_', 'OPENAI_'],
+  qodercli: ['QODER_'],
+};
+
+function childEnv(agent) {
+  if (process.env.SKILLSPACE_ENV_PASSTHROUGH === '1') {
+    return { ...process.env, PATH: CHILD_PATH };
+  }
+  const prefixes = (agent && ENV_PREFIXES[agent.id]) || [];
+  const out = {};
+  for (const k of ENV_BASE) if (process.env[k] !== undefined) out[k] = process.env[k];
+  for (const k of Object.keys(process.env)) {
+    if (prefixes.some((pre) => k.startsWith(pre))) out[k] = process.env[k];
+  }
+  out.PATH = CHILD_PATH;
+  return out;
+}
+
+// An append-only record of every agent invocation. Without it a drive-by run
+// leaves no evidence of what prompt executed against what directory. The
+// prompt is hashed rather than stored: it can contain the contents of whatever
+// file the request named, and this log is not the place to duplicate that.
+const RUN_LOG = path.join(SKILLSPACE_HOME, 'runs.log');
+function logRun({ bin, dir, folder, task, prompt }) {
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    bin,
+    dir,
+    folder,
+    taskChars: (task || '').length,
+    promptChars: (prompt || '').length,
+    promptSha256: require('crypto').createHash('sha256').update(prompt || '').digest('hex'),
+  });
+  try {
+    fs.mkdirSync(SKILLSPACE_HOME, { recursive: true });
+    fs.appendFileSync(RUN_LOG, line + '\n');
+  } catch (e) {
+    // Never let logging stop a run, but never swallow it silently either.
+    console.warn('[server] could not write run log:', e.message);
+  }
+}
+
+// The only directories a Skill may be read from. `dir` arrives from a query
+// string, and both /api/prompt and /api/run put whatever it names into an AI
+// agent's instructions - so an unconstrained dir was a read primitive against
+// the whole filesystem, not a convenience.
+function isAllowedSkillDir(dir) {
+  if (!dir) return true; // caller omitted it; DEFAULT_SKILLS_DIR is used
+  try {
+    const real = fs.realpathSync(dir);
+    return recentDirs().some((d) => {
+      try { return fs.realpathSync(d) === real; } catch (_) { return false; }
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
 // 定位某个 Skill 的 SKILL.md 绝对路径（兼容大小写）
+//
+// Two guards, because the obvious one is not enough. `folder` traverses with
+// ../ even when dir is omitted, so the resolved file must be proven to sit
+// inside the base. And the SKILL.md basename is a constraint on the LINK, not
+// on what it points at - a symlink named SKILL.md pointing at a private key
+// read that key - so containment is checked on the realpath of the target.
 function getSkillFile(dir, folder) {
-  return ['SKILL.md', 'skill.md', 'Skill.md']
-    .map((f) => path.join(dir || DEFAULT_SKILLS_DIR, folder, f))
-    .find((x) => fs.existsSync(x)) || '';
+  const base = path.resolve(dir || DEFAULT_SKILLS_DIR);
+  if (!isAllowedSkillDir(dir)) return '';
+  let realBase;
+  try { realBase = fs.realpathSync(base); } catch (_) { return ''; }
+
+  for (const f of ['SKILL.md', 'skill.md', 'Skill.md']) {
+    const candidate = path.join(base, folder, f);
+    if (!fs.existsSync(candidate)) continue;
+    let real;
+    try { real = fs.realpathSync(candidate); } catch (_) { continue; }
+    if (real !== realBase && !real.startsWith(realBase + path.sep)) continue;
+    return candidate;
+  }
+  return '';
 }
 
 // 读取某个 Skill 的 SKILL.md 正文（去掉 frontmatter），用于注入到命令
@@ -433,7 +530,12 @@ function importExperts(job, payload) {
 }
 
 function buildCommand(agentId, name, task, dir, folder) {
-  const agent = AGENTS.find((a) => a.id === agentId) || AGENTS[0];
+  // Two stacked fallbacks used to live here and in the route, so a caller who
+  // named a specific agent - deliberately routing risky work to a sandboxed or
+  // cheaper one - silently got AGENTS[0] on a typo or a stale client value, and
+  // could only find out by reading the start line. An id that was supplied and
+  // is not recognised is now an error; an absent id still defaults.
+  const agent = agentId ? AGENTS.find((a) => a.id === agentId) : AGENTS[0];
   if (!agent) return null;
   const body = folder ? getSkillBody(dir || DEFAULT_SKILLS_DIR, folder) : '';
   let prompt;
@@ -453,7 +555,7 @@ function buildCommand(agentId, name, task, dir, folder) {
   const display = body
     ? `${agent.bin} ${flag} "〈注入「${name}」Skill 说明书〉+ 任务：${task || '默认流程'}"`
     : `${agent.bin} ${flag} "请使用「${name}」这个 Skill：${task || '默认流程'}"`;
-  return { bin: agent.bin, args, prompt, display, injected: !!body };
+  return { bin: agent.bin, agent, args, prompt, display, injected: !!body };
 }
 
 // ---------- HTTP ----------
@@ -574,6 +676,24 @@ function hostAllowed(req) {
   if (!h) return true; // HTTP/1.0 and curl send none
   const name = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
   return name === '127.0.0.1' || name === 'localhost' || name === '::1';
+}
+
+// isCrossOrigin allows Sec-Fetch-Site: none, which is correct for the console
+// itself — a browser sends `none` for a navigation with no initiator. But that
+// is also what it sends for a link clicked in Slack, Mail, Notes, a PDF or an
+// IDE markdown preview, all of which hand the URL over as a fresh navigation.
+// For a route that merely renders a page that is fine; for one that spawns a
+// credentialed AI agent, or deletes a record, one click is too low a bar.
+//
+// The console's own calls are unaffected: fetch and EventSource send
+// Sec-Fetch-Mode: cors with Dest: empty, never navigate/document. The cost is
+// that pasting such a URL into the address bar to debug now 403s, which is the
+// point.
+function isTopLevelNavigation(req) {
+  return (
+    req.headers['sec-fetch-mode'] === 'navigate' ||
+    req.headers['sec-fetch-dest'] === 'document'
+  );
 }
 
 function serveStatic(res, file) {
@@ -812,7 +932,28 @@ async function route(req, res, u, p) {
 
   // SSE 流式运行
   if (p === '/api/run') {
-    const agentId = u.searchParams.get('agent') || (AGENTS[0] && AGENTS[0].id);
+    // A GET that spawns a credentialed agent is one clicked link away from
+    // running an attacker's prompt: Slack, Mail, Notes and IDE previews all
+    // hand a URL to the browser as a top-level navigation, which arrives as
+    // Sec-Fetch-Site: none and passes isCrossOrigin. EventSource does not.
+    if (isTopLevelNavigation(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('forbidden: /api/run is not a navigable URL');
+    }
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('method not allowed');
+    }
+    // Bounded because each spawn is a real billed invocation and nothing else
+    // limits them. The design's per-project maxConcurrent (2 git / 1 dir) does
+    // not reach this route, which predates it.
+    if (RUNNING.size >= MAX_CONCURRENT_RUNS) {
+      res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(`too many agents running (${MAX_CONCURRENT_RUNS})`);
+    }
+
+    const rawAgent = u.searchParams.get('agent');
+    const agentId = rawAgent || (AGENTS[0] && AGENTS[0].id);
     const name = u.searchParams.get('skill') || '';
     const task = u.searchParams.get('task') || '';
     const dir = u.searchParams.get('dir') || DEFAULT_SKILLS_DIR;
@@ -825,20 +966,67 @@ async function route(req, res, u, p) {
     });
     const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     if (!cmd) {
-      send('error', '没有检测到可用的 agent（codex 或 qodercli），请先安装其一。');
+      // Distinguish "you named an agent we do not have" from "none installed".
+      // Falling back silently ran a different tool than the caller asked for.
+      const msg = rawAgent && !AGENTS.some((a) => a.id === rawAgent)
+        ? `未知的 agent：${rawAgent}（可用：${AGENTS.map((a) => a.id).join(', ') || '无'}）`
+        : '没有检测到可用的 agent（claude / codex / opencode / qodercli），请先安装其一。';
+      send('error', msg);
       return res.end();
     }
-    send('start', { command: cmd.display });
-    // 参数数组传参，避免命令注入；stdin 设 ignore，否则 codex exec 会一直等 stdin 输入而卡住
+    // The full prompt, not just the elided preview: when a Skill body is
+    // injected, the preview shows 〈注入…〉 and the actual instructions - which
+    // may be file contents - are invisible at the one moment a human watches.
+    send('start', { command: cmd.display, prompt: cmd.prompt, injected: cmd.injected });
+    logRun({ bin: cmd.bin, dir, folder, task, prompt: cmd.prompt });
+
+    // detached so the child leads its own process group: agent CLIs spawn tool
+    // subprocesses, and killing only the direct pid left those orphaned to
+    // PID 1 - still writing files, still billing, invisible to SkillSpace.
+    // cwd is a scratch directory: without it the agent inherited the server's,
+    // i.e. the SkillSpace install tree, where "edit server.js" is a
+    // persistence primitive. Spec §5: never the install directory.
+    const runCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'skillspace-run-'));
     const child = spawn(cmd.bin, cmd.args, {
-      env: { ...process.env, PATH: CHILD_PATH },
+      cwd: runCwd,
+      env: childEnv(cmd.agent),
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
     });
+    RUNNING.add(child);
+
+    let settled = false;
+    const reap = (signal) => {
+      // Negative pid signals the whole group. Falls back to the direct child
+      // if the group is already gone, so a dead pid cannot throw here.
+      try { process.kill(-child.pid, signal); }
+      catch (_) { try { child.kill(signal); } catch (__) {} }
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      RUNNING.delete(child);
+      fs.rm(runCwd, { recursive: true, force: true }, () => {});
+    };
+    // The only thing between a stuck agent and an unbounded bill (spec §8a).
+    const timer = setTimeout(() => {
+      send('error', `agent 超时（${RUN_TIMEOUT_MS / 1000}s），已终止`);
+      reap('SIGTERM');
+      setTimeout(() => reap('SIGKILL'), 5000).unref();
+    }, RUN_TIMEOUT_MS);
+    timer.unref();
+
     child.stdout.on('data', (d) => send('chunk', d.toString()));
     child.stderr.on('data', (d) => send('chunk', d.toString()));
-    child.on('close', (code) => { send('done', { code }); res.end(); });
-    child.on('error', (e) => { send('error', String(e.message || e)); res.end(); });
-    req.on('close', () => { try { child.kill(); } catch (_) {} });
+    child.on('close', (code) => { finish(); send('done', { code }); res.end(); });
+    child.on('error', (e) => { finish(); send('error', String(e.message || e)); res.end(); });
+    req.on('close', () => {
+      if (settled) return;
+      reap('SIGTERM');
+      setTimeout(() => reap('SIGKILL'), 5000).unref();
+      finish();
+    });
     return;
   }
 

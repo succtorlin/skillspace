@@ -587,3 +587,185 @@ test('a connection dropped mid-body persists nothing', async () => {
   // and the server is still healthy
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
+
+// ---------- /api/run ----------
+// These must never invoke a real agent. The first four cannot reach a spawn at
+// all; the fifth runs a shim placed ahead of everything on the child's PATH.
+
+// Raw socket, not fetch: Sec-Fetch-* are forbidden header names. undici
+// overrides Sec-Fetch-Mode with its own value, so an earlier version of this
+// test sent "navigate" and the server never saw it — the same trap the Host
+// test hit. Only Sec-Fetch-Dest survived, which made the test pass for the
+// wrong reason on two of three shapes.
+function rawGetHeaders(pathname, extraHeaders) {
+  return new Promise((resolve, reject) => {
+    const { port } = new URL(base);
+    const sock = net.connect({ host: '127.0.0.1', port: Number(port) });
+    let out = '';
+    sock.on('data', (d) => (out += d));
+    sock.on('error', reject);
+    sock.on('end', () => resolve(out));
+    sock.on('connect', () => {
+      const extra = Object.entries(extraHeaders)
+        .map(([k, v]) => `${k}: ${v}\r\n`)
+        .join('');
+      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\n${extra}Connection: close\r\n\r\n`);
+    });
+  });
+}
+
+test('/api/run refuses a top-level navigation', async () => {
+  // A GET that spawns a credentialed agent was one clicked link away from
+  // running an attacker's prompt: Slack, Mail and IDE previews hand a URL over
+  // as a navigation, which arrives as Sec-Fetch-Site: none and passes the
+  // cross-origin guard. EventSource never sends navigate/document.
+  const shapes = [
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Dest': 'document' },
+  ];
+  for (const h of shapes) {
+    const res = await rawGetHeaders('/api/run?skill=x&task=t', h);
+    assert.match(res, /^HTTP\/1\.1 403 /,
+      `navigation shape ${JSON.stringify(h)} was allowed: ${res.slice(0, 40)}`);
+  }
+  // The shape the console actually uses must still work. agent=__none__ makes
+  // buildCommand return null, so this asserts routing without spawning.
+  const ok = await rawGetHeaders('/api/run?agent=__none__&skill=x', {
+    'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty',
+  });
+  assert.match(ok, /^HTTP\/1\.1 200 /, `EventSource shape must be served: ${ok.slice(0, 40)}`);
+});
+
+test('/api/run rejects a non-GET method', async () => {
+  const r = await fetch(base + '/api/run?skill=x', {
+    method: 'POST', headers: { 'Sec-Fetch-Mode': 'cors' },
+  });
+  assert.strictEqual(r.status, 405);
+});
+
+test('/api/run names an unknown agent instead of silently running another', async () => {
+  const r = await fetch(base + '/api/run?skill=x&task=t&agent=totally-bogus', {
+    headers: { 'Sec-Fetch-Mode': 'cors' },
+  });
+  const text = await r.text();
+  assert.match(text, /event: error/);
+  assert.match(text, /totally-bogus/);
+  // and it must not have started anything
+  assert.ok(!text.includes('event: start'), 'an unknown agent still spawned');
+});
+
+test('a Skill cannot be read from outside the registered source directories', async () => {
+  const outside = tmp('skillspace-outside-');
+  fs.writeFileSync(path.join(outside, 'SKILL.md'), 'TOP-SECRET-BODY');
+
+  // absolute dir the user never registered
+  const a = await (await fetch(
+    `${base}/api/prompt?mode=inject&skill=X&dir=${encodeURIComponent(outside)}&folder=`
+  )).json();
+  assert.ok(!a.prompt.includes('TOP-SECRET-BODY'), 'read a SKILL.md outside registered sources');
+
+  // traversal through folder, with no dir param at all
+  const b = await (await fetch(
+    `${base}/api/prompt?mode=inject&skill=X&folder=${encodeURIComponent('../../../../../../etc')}`
+  )).json();
+  assert.ok(!b.prompt.includes('root:'), 'traversal escaped the base directory');
+});
+
+test('a symlinked SKILL.md cannot be used to read its target', async () => {
+  // The SKILL.md basename constrains the LINK, not what it points at — so
+  // containment has to be checked on the realpath, not the joined path.
+  const src = tmp('skillspace-symsrc-');
+  const secret = path.join(src, 'id_rsa');
+  fs.writeFileSync(secret, 'PRIVATE-KEY-DATA-XYZ');
+  const holder = path.join(src, 'link');
+  fs.mkdirSync(holder);
+  fs.symlinkSync(secret, path.join(holder, 'SKILL.md'));
+
+  const r = await (await fetch(
+    `${base}/api/prompt?mode=inject&skill=X&dir=${encodeURIComponent(src)}&folder=link`
+  )).json();
+  assert.ok(!r.prompt.includes('PRIVATE-KEY-DATA-XYZ'), 'symlink was followed out of the base');
+});
+
+test('a symlink escaping an ALLOWED source directory is still refused', async () => {
+  // The allowlist and the containment check guard different things, and this
+  // pins the second one: here `dir` IS the registered source, so the allowlist
+  // passes and only the realpath comparison can catch the escape. Without this
+  // the containment check could be deleted with every other test still green.
+  const src = tmp('skillspace-allowedsrc-');
+  const outside = tmp('skillspace-outsidetarget-');
+  const secret = path.join(outside, 'id_rsa');
+  fs.writeFileSync(secret, 'PRIVATE-KEY-DATA-XYZ');
+  const holder = path.join(src, 'link');
+  fs.mkdirSync(holder);
+  fs.symlinkSync(secret, path.join(holder, 'SKILL.md'));
+  // A legitimate skill in the same source, to prove the guard is not just
+  // refusing everything.
+  const good = path.join(src, 'good');
+  fs.mkdirSync(good);
+  fs.writeFileSync(path.join(good, 'SKILL.md'), 'LEGIT BODY');
+
+  // SKILLS_DIR makes `src` the DEFAULT_SKILLS_DIR, so it is allowed by
+  // recentDirs() and `dir` can be omitted entirely.
+  const { child: kid, port } = await spawnServer({ SKILLS_DIR: src });
+  try {
+    const b2 = `http://127.0.0.1:${port}`;
+    const bad = await (await fetch(`${b2}/api/prompt?mode=inject&skill=X&folder=link`)).json();
+    assert.ok(!bad.prompt.includes('PRIVATE-KEY-DATA-XYZ'),
+      'a symlink inside an allowed source read its target outside');
+    const ok = await (await fetch(`${b2}/api/prompt?mode=inject&skill=X&folder=good`)).json();
+    assert.ok(ok.prompt.includes('LEGIT BODY'), 'the guard refused a legitimate skill');
+  } finally {
+    kid.kill('SIGKILL');
+  }
+});
+
+test('a spawned agent does not run in the SkillSpace install directory', async () => {
+  // Spec §5: "Agents always run with cwd set to the worktree or project path —
+  // never the SkillSpace install directory." It inherited the server's cwd,
+  // which made "edit server.js" a persistence primitive.
+  const lab = tmp('skillspace-shim-');
+  const bin = path.join(lab, 'bin');
+  const home = path.join(lab, 'home');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true });
+  // CHILD_PATH prepends $HOME/.local/bin, so a shim there wins over any real
+  // agent on the machine. This is what keeps the test from spending money.
+  const shim = path.join(home, '.local', 'bin', 'claude');
+  fs.writeFileSync(shim, '#!/bin/sh\necho "CWD=$(pwd)"\nexit 0\n');
+  fs.chmodSync(shim, 0o755);
+
+  const port = await freePort();
+  const kid = spawn(process.execPath, ['server.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      HOME: home,
+      PORT: String(port),
+      SKILLSPACE_HOME: tmp('skillspace-shimhome-'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let err = '';
+  kid.stderr.on('data', (c) => (err += c));
+  try {
+    const b2 = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      if (kid.exitCode !== null) throw new Error('shim server exited: ' + err);
+      try { if ((await fetch(b2 + '/api/config')).ok) break; } catch (_) {}
+      if (Date.now() > deadline) throw new Error('shim server did not start: ' + err);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const text = await (await fetch(b2 + '/api/run?skill=x&task=t', {
+      headers: { 'Sec-Fetch-Mode': 'cors' },
+    })).text();
+    const m = text.match(/CWD=([^\\"]+)/);
+    assert.ok(m, `shim did not report a cwd; got: ${text.slice(0, 200)}`);
+    assert.notStrictEqual(m[1], path.join(__dirname, '..'), 'agent ran in the install directory');
+    assert.ok(m[1].includes('skillspace-run-'), `unexpected cwd: ${m[1]}`);
+  } finally {
+    kid.kill('SIGKILL');
+  }
+});
