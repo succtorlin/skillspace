@@ -1,6 +1,6 @@
 # SkillSpace — Projects & Agent Orchestration
 
-**Date:** 2026-08-19 · **Status:** draft, awaiting review
+**Date:** 2026-08-19 · **Status:** approved — all questions resolved
 **Method:** superpowers `brainstorming`
 
 ---
@@ -66,6 +66,7 @@ The unit an agent executes and the unit the board monitors.
 ```
 { id, projectId, goalId, seq, title, prompt, acceptance,
   agent, cwd, status, exitCode?, verdict?, error?,
+  supersedes?,            // set when this order replaces a rejected one
   createdAt, startedAt?, finishedAt? }
 ```
 
@@ -158,7 +159,8 @@ GET    /api/goals/:id                 goal + its orders
 GET    /api/orders?project=&status=   board query
 GET    /api/orders/:id/log            SSE while running, file when finished
 POST   /api/orders/:id/cancel         SIGTERM, then SIGKILL after 5s
-POST   /api/orders/:id/retry          new order, same prompt, fresh worktree
+POST   /api/orders/:id/retry          creates a NEW order with supersedes set;
+                                      the original is never re-run or overwritten
 ```
 
 `DELETE /api/projects/:id` removing only the record — never the user's files —
@@ -211,8 +213,21 @@ active project, not the whole application.
 - PM parse failure → goal `failed`, raw output retained, no retry.
 - End-to-end against a real agent (`opencode` works today; `claude` needs re-auth).
 
-## 12. Open
+## 12. Resolved
 
-- Retry semantics for a `rejected` verdict: new order, or re-run the same one?
-  Leaning new order, so the history of what was rejected survives.
-- Whether the PM should see other orders' results when judging one.
+**A rejected verdict spawns a NEW order**, never a re-run of the existing one.
+The rejected order keeps its status, log, and verdict permanently. The new order
+records `supersedes: <rejectedOrderId>`, so the board can show "attempt 2 of
+ORD-7" and the history of what was rejected — and why — survives. Re-running in
+place would overwrite the only evidence of the failure, which is the thing worth
+keeping in a system whose whole purpose is monitoring agent work.
+
+**The PM judges each order against its own `acceptance` in isolation** — it does
+not see sibling results. Default taken rather than asked, with the reasoning
+stated so it is easy to overturn: showing siblings makes a verdict
+order-dependent (the judgement on order 3 changes depending on whether order 2
+ran first), which makes the same work produce different verdicts on different
+runs. Isolation keeps verdicts reproducible. If cross-order context turns out to
+be necessary, the fix is an explicit "review the goal as a whole" pass after all
+orders finish — a separate step with its own record, not a hidden input to each
+individual verdict.
