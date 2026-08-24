@@ -109,8 +109,13 @@ test('a root with a trailing separator still works', () => {
 });
 
 test('readJson refuses to read outside the store root', () => {
-  const root = tmpRoot();
-  fs.writeFileSync(path.join(path.dirname(root), 'secret.json'), '{"apiKey":"SECRET"}');
+  // The decoy lives in a directory the test OWNS, not the shared system temp
+  // dir: writing $TMPDIR/secret.json would escape the suite's own cleanup and
+  // could clobber an unrelated file of the same name.
+  const base = tmpRoot();
+  const root = path.join(base, 'store');
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(base, 'secret.json'), '{"apiKey":"SECRET"}');
   assert.throws(() => store.readJson(root, '../secret.json', null), /escapes store root/);
 });
 
