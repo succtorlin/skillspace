@@ -778,24 +778,74 @@ async function loadProjects() {
     localStorage.removeItem(PROJECT_KEY);
   }
 
+  // The row is a div, not a button, for the reason renderSources() documents:
+  // a <button> may not contain another one, and the delete affordance has to be
+  // focusable to be reachable by keyboard. Same structure as .src-item.
   list.innerHTML = projects
     .map(
       (p, i) =>
-        `<button class="proj-item${p.id === activeId ? ' active' : ''}" data-i="${i}"` +
+        `<div class="proj-item${p.id === activeId ? ' active' : ''}" role="button" tabindex="0" data-i="${i}"` +
         ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
         `<span class="proj-name">${esc(p.name)}</span>` +
         // kind is shown, not hidden: it decides how many agents may run at once
         `<span class="proj-kind">${esc(p.kind)}</span>` +
-        `</button>`
+        // the glyph is aria-hidden, so the control needs a label of its own
+        `<button class="proj-del" data-del="${i}" title="移除这个项目"` +
+        ` aria-label="移除项目 ${escAttr(p.name)}">${icon('close', 13)}</button>` +
+        `</div>`
     )
     .join('');
 
-  list.querySelectorAll('.proj-item').forEach((el) =>
-    el.addEventListener('click', () => {
+  list.querySelectorAll('.proj-item').forEach((el) => {
+    const select = () => {
       localStorage.setItem(PROJECT_KEY, projects[+el.dataset.i].id);
       loadProjects();
+    };
+    el.addEventListener('click', select);
+    // role="button" on a div gets no Enter/Space activation for free. The row
+    // was a real <button> until the delete control had to live inside it, so
+    // without this the conversion would have cost the keyboard its selection.
+    // Guarded on target: a keypress on the nested delete button is its own.
+    el.addEventListener('keydown', (ev) => {
+      if (ev.target !== el) return;
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      select();
+    });
+  });
+
+  list.querySelectorAll('.proj-del').forEach((el) =>
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation(); // never let removing a row also select it
+      askDeleteProject(projects[+el.dataset.del]);
     })
   );
+}
+
+// 删项目：只摘掉记录，磁盘上的目录一个文件都不会动。
+// 接口回的 filesKept: true 就是这件事，所以确认框里必须把它讲明白。
+function askDeleteProject(project) {
+  if (!project) return;
+  askConfirm({
+    title: `删除项目「${project.name}」`,
+    body: '只从列表里移除这条记录，磁盘上的文件不会被删除。',
+    target: project.path,
+    note: '',
+    okText: '移除记录',
+    onOk: async () => {
+      const r = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
+        .then((x) => x.json())
+        .catch((e) => ({ error: String((e && e.message) || e) }));
+      // The route answers 404 for an unknown id on purpose; surface that rather
+      // than reporting a removal that never happened.
+      if (!r || r.error || r.ok !== true) {
+        return toast('删除失败：' + ((r && r.error) || '未知错误'), 'error');
+      }
+      if (localStorage.getItem(PROJECT_KEY) === project.id) localStorage.removeItem(PROJECT_KEY);
+      toast(`已移除项目：${project.name}（磁盘文件没动）`);
+      loadProjects();
+    },
+  });
 }
 
 async function addProject() {
