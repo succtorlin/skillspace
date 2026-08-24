@@ -710,6 +710,15 @@ worktrees, timeout enforcement, board, log streaming.
 
 **Type consistency:** `store.readJson(root, rel, fallback)` / `writeJson(root, rel, value)` / `list(root, sub)` are used with those signatures in `lib/projects.js` and Task 3. `projects.create/list/get/remove(root, ...)` match between Task 2, Task 3 and the tests. `budget` keys `maxOrdersPerGoal`, `orderTimeoutMs`, `maxOrdersPerDay` match §8a of the spec exactly.
 
+**Carried into Plan 2 — route-level id validation.** `lib/store.abs()` guarantees
+a path stays inside the store root, but NOT inside the intended subdirectory:
+`orders/../store-evil.json` resolves within the root, so the store is right to
+allow it. An order id of `../store-evil` could therefore write into a different
+collection's namespace. When `/api/orders/:id/log` and `/api/goals/:id` are
+built, `:id` must be validated at the route boundary against `/^[A-Za-z0-9_-]+$/`.
+Found during Task 1 implementation, recorded here so it is not rediscovered as
+a bug.
+
 **Known gap carried forward:** Task 4 reuses `/api/pick-dir`, the existing macOS
 `osascript` folder picker. On non-macOS it returns null and 添加项目 silently does
 nothing. Plan 2 should add a text-entry fallback; noting it here so it is not
