@@ -204,3 +204,61 @@ test('remove reports whether a record actually matched', () => {
   assert.strictEqual(projects.remove(root, p.id), true);
   assert.strictEqual(projects.list(root).length, 0);
 });
+
+test('kind is detected, never taken from the caller', () => {
+  const root = tmpRoot();
+  // A caller claiming git on a plain directory must not get git — kind decides
+  // whether agents can be isolated, so an attacker-or-typo-supplied value would
+  // put several agents over one working tree.
+  const p = projects.create(root, { path: tmpDir(), kind: 'git', concurrency: 8 });
+  assert.strictEqual(p.kind, 'dir');
+  assert.strictEqual(p.concurrency, 1);
+  // and the reverse direction: claiming dir on a real repo must not downgrade it
+  const g = projects.create(root, { path: tmpGitRepo(), kind: 'dir' });
+  assert.strictEqual(g.kind, 'git');
+});
+
+test('a subdirectory carrying a .git entry is still not a repo root', () => {
+  // The plain-subdirectory test cannot reach the toplevel comparison: with no
+  // .git present, existsSync short-circuits first. This shape does reach it —
+  // rev-parse succeeds from here, and only the toplevel equality check catches
+  // that this is not the root.
+  const repo = tmpGitRepo();
+  const sub = path.join(repo, 'b');
+  fs.mkdirSync(path.join(sub, '.git'), { recursive: true });
+  assert.strictEqual(projects.detectKind(sub), 'dir');
+});
+
+test('creating a second project keeps the first', () => {
+  const root = tmpRoot();
+  const a = projects.create(root, { name: 'First', path: tmpDir() });
+  const b = projects.create(root, { name: 'Second', path: tmpDir() });
+  const all = projects.list(root);
+  assert.strictEqual(all.length, 2);
+  assert.deepStrictEqual(all.map((p) => p.name), ['First', 'Second']);
+  assert.ok(projects.get(root, a.id));
+  assert.ok(projects.get(root, b.id));
+});
+
+test('a project carries the full record shape', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, { name: 'Shape', path: tmpDir() });
+  assert.deepStrictEqual(Object.keys(p).sort(), [
+    'agents', 'branch', 'budget', 'concurrency', 'createdAt',
+    'id', 'kind', 'name', 'path', 'skillSources',
+  ]);
+  assert.strictEqual(p.branch, null);
+  assert.deepStrictEqual(p.skillSources, []);
+  assert.deepStrictEqual(p.agents, []);
+  assert.ok(!Number.isNaN(Date.parse(p.createdAt)), 'createdAt must be a parseable timestamp');
+});
+
+test('a budget override cannot poison the defaults for later projects', () => {
+  const root = tmpRoot();
+  projects.create(root, { path: tmpDir(), budget: { maxOrdersPerGoal: 5 } });
+  // the module's own defaults must be untouched...
+  assert.strictEqual(projects.DEFAULT_BUDGET.maxOrdersPerGoal, 12);
+  // ...and a project created afterwards must still get them
+  const later = projects.create(root, { path: tmpDir() });
+  assert.strictEqual(later.budget.maxOrdersPerGoal, 12);
+});
