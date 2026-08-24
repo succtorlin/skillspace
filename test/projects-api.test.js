@@ -27,6 +27,50 @@ function freePort() {
   });
 }
 
+// The bind is a property of the socket, not of any response body, and the
+// server under test is a child process - so server.address() is unavailable and
+// reachability is the only observable. These helpers spawn extra short-lived
+// servers for that purpose; the suite's main server is left alone.
+function externalIPv4() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list || []) {
+      if (ni.family === 'IPv4' && !ni.internal) return ni.address;
+    }
+  }
+  return null;
+}
+
+// probeHost must name an address the spawned variant actually binds - probing
+// 127.0.0.1 against a HOST=::1 server just times out and reports "did not
+// start" for a server that started perfectly well.
+async function spawnServer(env, probeHost = '127.0.0.1') {
+  const port = await freePort();
+  const proc = spawn(process.execPath, ['server.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, PORT: String(port), SKILLSPACE_HOME: tmp('skillspace-bind-'), ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    if (proc.exitCode !== null) throw new Error('server exited early');
+    try { if ((await fetch(`http://${probeHost}:${port}/api/config`)).ok) break; } catch (_) {}
+    if (Date.now() > deadline) { proc.kill('SIGKILL'); throw new Error('server did not start'); }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return { child: proc, port };
+}
+
+function reachable(host, port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host, port });
+    const done = (v) => { s.destroy(); resolve(v); };
+    s.setTimeout(3000);
+    s.on('connect', () => done(true));
+    s.on('error', () => done(false));
+    s.on('timeout', () => done(false));
+  });
+}
+
 let child, base, storeRoot;
 
 before(async () => {
@@ -213,4 +257,56 @@ test('records are written under SKILLSPACE_HOME, not the real home directory', a
   const dir = tmp('skillspace-apiwork-');
   await json('POST', '/api/projects', { name: 'Located', path: dir });
   assert.ok(fs.existsSync(path.join(storeRoot, 'projects.json')));
+});
+
+test('the server is not reachable from a non-loopback interface by default', async (t) => {
+  const lan = externalIPv4();
+  // Skipped, never silently passed: with no external interface there is nothing
+  // to be exposed ON, so the assertion would be vacuous rather than reassuring.
+  if (!lan) return t.skip('no non-loopback IPv4 on this machine - cannot test reachability');
+
+  const a = await spawnServer({});
+  try {
+    assert.strictEqual(await reachable(lan, a.port), false,
+      `default bind must not answer on ${lan} - an unauthenticated agent dispatcher was exposed`);
+  } finally { a.child.kill('SIGKILL'); }
+
+  // Positive control: the same probe MUST succeed when the bind is opened up,
+  // otherwise the assertion above proves nothing about the bind - a mistyped or
+  // unroutable address is "refused" too.
+  const b = await spawnServer({ HOST: '0.0.0.0' });
+  try {
+    assert.strictEqual(await reachable(lan, b.port), true,
+      `HOST=0.0.0.0 should answer on ${lan}; if not, the negative test above is vacuous`);
+  } finally { b.child.kill('SIGKILL'); }
+});
+
+test('HOST overrides the default bind', async () => {
+  const { child: proc, port } = await spawnServer({ HOST: '::1' }, '[::1]');
+  try {
+    const r = await fetch(`http://[::1]:${port}/api/config`);
+    assert.ok(r.ok, 'HOST=::1 should bind IPv6 loopback');
+    assert.strictEqual(await reachable('127.0.0.1', port), false,
+      'binding ::1 should leave IPv4 loopback unbound');
+  } finally { proc.kill('SIGKILL'); }
+});
+
+test('the body cap is 1 MiB - not tighter, not looser', async () => {
+  const dir = tmp('skillspace-apiwork-');
+  // Bulk rides in `note`, an unknown key: create() reads an allowlist and never
+  // copies it, so the request is a legitimate registration that happens to be
+  // large. Padding `name` instead would prove nothing - it is truncated to 200
+  // chars, so the record looks identical whatever the cap does.
+  const pad = 'x'.repeat(900 * 1024);
+  const under = await fetch(base + '/api/projects', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Under', path: dir, note: pad }),
+  });
+  assert.strictEqual(under.status, 200, 'a 900 KiB body is under the cap and must be accepted');
+
+  const over = await fetch(base + '/api/projects', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Over', path: dir, note: 'x'.repeat(1200 * 1024) }),
+  });
+  assert.strictEqual(over.status, 413, 'a 1.2 MiB body is over the cap and must be rejected');
 });
