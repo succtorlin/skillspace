@@ -557,6 +557,9 @@ const server = http.createServer(async (req, res) => {
   }
   if (p === '/api/experts' && req.method === 'POST') {
     const body = await readBody(req);
+    // Before body.name is read: without this an oversized body fell through to
+    // the defaults below and silently persisted a junk expert.
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     const experts = loadExperts();
     const expert = {
       id: newExpertId(),
@@ -711,6 +714,18 @@ const server = http.createServer(async (req, res) => {
 // assumes "local, single user", and listen(PORT) with no host quietly broke
 // that assumption by binding every interface. Overridable for anyone who
 // deliberately wants otherwise, but never by default.
+//
+// IPv4 specifically. `localhost` resolves to ::1 first on many systems, so a
+// client that does NOT fall back to 127.0.0.1 will be refused - browsers, curl
+// and undici all do fall back, which is the entire client set for this tool.
+// A second listener on ::1 would cover the rest at the cost of a second bind
+// to fail on.
+//
+// HOST=::1 switches to IPv6 loopback (verified: localhost and [::1] answer,
+// 127.0.0.1 is then refused). There is NO single value covering both loopbacks
+// - in particular HOST=:: is not it: that binds *, every interface, which is
+// the exact exposure this default exists to prevent. Covering both needs a
+// second listen() call, deliberately not done.
 const HOST_BIND = process.env.HOST || '127.0.0.1';
 server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);

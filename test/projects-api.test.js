@@ -179,6 +179,21 @@ test('the oversize sentinel cannot be forged by a caller', async () => {
   assert.strictEqual(r.body.project.name, 'Forged');
 });
 
+test('an oversized body does not create a defaulted expert', async () => {
+  // NOTE: /api/experts persists to <repo>/experts.json via __dirname - it does
+  // NOT honour SKILLSPACE_HOME - so before the 413 below existed, every run of
+  // this suite wrote a junk expert into the developer's real (gitignored) file.
+  const before = await json('GET', '/api/experts');
+  const r = await fetch(base + '/api/experts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024) }),
+  });
+  assert.strictEqual(r.status, 413);
+  const after = await json('GET', '/api/experts');
+  assert.strictEqual(after.body.experts.length, before.body.experts.length);
+});
+
 test('an oversized body does not kill the server', async () => {
   // Resolving null for oversize crashed the process here: an un-updated route
   // reads body.name and throws out of the async handler. Every route must
