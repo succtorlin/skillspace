@@ -7,12 +7,22 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
+const projects = require('./lib/projects');
 
 const PORT = process.env.PORT || 4177;
+// Declared here rather than beside listen(), because the Host-header guard
+// needs it too and one default in two places would drift.
+const HOST_BIND = process.env.HOST || '127.0.0.1';
+const BIND_IS_LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST_BIND);
 const PUBLIC = path.join(__dirname, 'public');
 const HOME = os.homedir();
+
+// Durable records live outside both the app directory and the user's repos, so
+// upgrading SkillSpace never touches data and a project directory never gains
+// SkillSpace files. Overridable so tests never write to the real home.
+const SKILLSPACE_HOME = process.env.SKILLSPACE_HOME || path.join(os.homedir(), '.skillspace');
 
 // 内置来源：本机 Codex / Claude Code 的 Skill 根目录，启动即自动扫描。
 // 目录不存在或没有 Skill 时不隐藏，照常显示（前端渲染成空态），让用户知道扫过了。
@@ -108,16 +118,32 @@ function listSources() {
   return [...builtin, ...custom];
 }
 // macOS 原生「选择文件夹」对话框，返回绝对路径
-function pickFolder() {
-  try {
-    const out = execSync(
-      `osascript -e 'POSIX path of (choose folder with prompt "选择本地 Skill 文件夹")'`,
-      { encoding: 'utf8' }
-    ).trim();
-    return out.replace(/\/$/, '');
-  } catch (_) {
-    return null; // 用户取消或非 macOS
-  }
+// One picker, two callers, two different things being chosen. The prompt comes
+// from this table and never from the request: it is interpolated into an
+// AppleScript string literal, so caller-supplied text would be an injection
+// point into osascript.
+const PICK_PROMPTS = {
+  skill: '选择本地 Skill 文件夹',
+  project: '选择项目目录',
+};
+
+// Async, not execSync. The dialog stays open for as long as the user browses,
+// and a synchronous spawn freezes the whole event loop for that entire time —
+// no other request answered, and any live /api/run SSE stream stalled behind a
+// Finder window. execFile with an argv array also keeps the path off a shell.
+function pickFolder(kind) {
+  const prompt = PICK_PROMPTS[kind] || PICK_PROMPTS.skill;
+  return new Promise((resolve) => {
+    execFile(
+      'osascript',
+      ['-e', `POSIX path of (choose folder with prompt "${prompt}")`],
+      { encoding: 'utf8' },
+      (err, stdout) => {
+        if (err) return resolve(null); // 用户取消或非 macOS
+        resolve(String(stdout).trim().replace(/\/$/, ''));
+      }
+    );
+  });
 }
 
 // ---------- 删除：一律走废纸篓，不做硬删 ----------
@@ -280,11 +306,108 @@ function detectAgents() {
 }
 const AGENTS = detectAgents();
 
+// Every agent currently running, so the count can be bounded and the whole set
+// reaped at shutdown. The design's per-project maxConcurrent does not reach
+// this route; this is the crude global equivalent until it does.
+const RUNNING = new Set();
+const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
+// Matches the design's orderTimeoutMs default (spec §8a), which calls it the
+// only thing standing between a stuck agent and an unbounded bill.
+const RUN_TIMEOUT_MS = Number(process.env.SKILLSPACE_RUN_TIMEOUT_MS) || 900000;
+
+// Agents need their own credentials to work at all, so the environment cannot
+// simply be dropped — but process.env on a developer machine also carries AWS,
+// GitHub, Stripe and npm tokens that an agent has no business holding, and a
+// prompt is enough to make it print them. Base vars plus each agent's own auth
+// prefixes; anything else stays behind.
+//
+// Set SKILLSPACE_ENV_PASSTHROUGH=1 to restore the old behaviour if an agent
+// needs a variable this list does not name. If you hit that, the fix is to add
+// the prefix here rather than leave the passthrough on.
+const ENV_BASE = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ'];
+const ENV_PREFIXES = {
+  claude: ['ANTHROPIC_', 'CLAUDE_'],
+  codex: ['OPENAI_', 'CODEX_'],
+  opencode: ['OPENCODE_', 'ANTHROPIC_', 'OPENAI_'],
+  qodercli: ['QODER_'],
+};
+
+function childEnv(agent) {
+  if (process.env.SKILLSPACE_ENV_PASSTHROUGH === '1') {
+    return { ...process.env, PATH: CHILD_PATH };
+  }
+  const prefixes = (agent && ENV_PREFIXES[agent.id]) || [];
+  const out = {};
+  for (const k of ENV_BASE) if (process.env[k] !== undefined) out[k] = process.env[k];
+  for (const k of Object.keys(process.env)) {
+    if (prefixes.some((pre) => k.startsWith(pre))) out[k] = process.env[k];
+  }
+  out.PATH = CHILD_PATH;
+  return out;
+}
+
+// An append-only record of every agent invocation. Without it a drive-by run
+// leaves no evidence of what prompt executed against what directory. The
+// prompt is hashed rather than stored: it can contain the contents of whatever
+// file the request named, and this log is not the place to duplicate that.
+const RUN_LOG = path.join(SKILLSPACE_HOME, 'runs.log');
+function logRun({ bin, dir, folder, task, prompt }) {
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    bin,
+    dir,
+    folder,
+    taskChars: (task || '').length,
+    promptChars: (prompt || '').length,
+    promptSha256: require('crypto').createHash('sha256').update(prompt || '').digest('hex'),
+  });
+  try {
+    fs.mkdirSync(SKILLSPACE_HOME, { recursive: true });
+    fs.appendFileSync(RUN_LOG, line + '\n');
+  } catch (e) {
+    // Never let logging stop a run, but never swallow it silently either.
+    console.warn('[server] could not write run log:', e.message);
+  }
+}
+
+// The only directories a Skill may be read from. `dir` arrives from a query
+// string, and both /api/prompt and /api/run put whatever it names into an AI
+// agent's instructions - so an unconstrained dir was a read primitive against
+// the whole filesystem, not a convenience.
+function isAllowedSkillDir(dir) {
+  if (!dir) return true; // caller omitted it; DEFAULT_SKILLS_DIR is used
+  try {
+    const real = fs.realpathSync(dir);
+    return recentDirs().some((d) => {
+      try { return fs.realpathSync(d) === real; } catch (_) { return false; }
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
 // 定位某个 Skill 的 SKILL.md 绝对路径（兼容大小写）
+//
+// Two guards, because the obvious one is not enough. `folder` traverses with
+// ../ even when dir is omitted, so the resolved file must be proven to sit
+// inside the base. And the SKILL.md basename is a constraint on the LINK, not
+// on what it points at - a symlink named SKILL.md pointing at a private key
+// read that key - so containment is checked on the realpath of the target.
 function getSkillFile(dir, folder) {
-  return ['SKILL.md', 'skill.md', 'Skill.md']
-    .map((f) => path.join(dir || DEFAULT_SKILLS_DIR, folder, f))
-    .find((x) => fs.existsSync(x)) || '';
+  const base = path.resolve(dir || DEFAULT_SKILLS_DIR);
+  if (!isAllowedSkillDir(dir)) return '';
+  let realBase;
+  try { realBase = fs.realpathSync(base); } catch (_) { return ''; }
+
+  for (const f of ['SKILL.md', 'skill.md', 'Skill.md']) {
+    const candidate = path.join(base, folder, f);
+    if (!fs.existsSync(candidate)) continue;
+    let real;
+    try { real = fs.realpathSync(candidate); } catch (_) { continue; }
+    if (real !== realBase && !real.startsWith(realBase + path.sep)) continue;
+    return candidate;
+  }
+  return '';
 }
 
 // 读取某个 Skill 的 SKILL.md 正文（去掉 frontmatter），用于注入到命令
@@ -407,7 +530,12 @@ function importExperts(job, payload) {
 }
 
 function buildCommand(agentId, name, task, dir, folder) {
-  const agent = AGENTS.find((a) => a.id === agentId) || AGENTS[0];
+  // Two stacked fallbacks used to live here and in the route, so a caller who
+  // named a specific agent - deliberately routing risky work to a sandboxed or
+  // cheaper one - silently got AGENTS[0] on a typo or a stale client value, and
+  // could only find out by reading the start line. An id that was supplied and
+  // is not recognised is now an error; an absent id still defaults.
+  const agent = agentId ? AGENTS.find((a) => a.id === agentId) : AGENTS[0];
   if (!agent) return null;
   const body = folder ? getSkillBody(dir || DEFAULT_SKILLS_DIR, folder) : '';
   let prompt;
@@ -427,7 +555,7 @@ function buildCommand(agentId, name, task, dir, folder) {
   const display = body
     ? `${agent.bin} ${flag} "〈注入「${name}」Skill 说明书〉+ 任务：${task || '默认流程'}"`
     : `${agent.bin} ${flag} "请使用「${name}」这个 Skill：${task || '默认流程'}"`;
-  return { bin: agent.bin, args, prompt, display, injected: !!body };
+  return { bin: agent.bin, agent, args, prompt, display, injected: !!body };
 }
 
 // ---------- HTTP ----------
@@ -435,13 +563,139 @@ function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
+// 1 MiB. A project record is a few hundred bytes; anything approaching this is
+// a mistake or an attack. The cap lives here rather than per-route because a
+// body this size is already a problem before anyone decides what to do with it
+// - and since Task 3 these bytes can become durable state that every later
+// list request re-reads.
+const MAX_BODY = 1024 * 1024;
+
+// A Symbol key, not a string like "__oversize": a string sentinel is forgeable.
+// {"__oversize":true} is 22 bytes of perfectly legal JSON, and a caller sending
+// it under the limit got a spurious 413 (verified). A Symbol cannot arrive from
+// JSON.parse at all.
+//
+// The Symbol only helps because readBody GUARANTEES a plain non-null object
+// below. It did not always: reading body[OVERSIZE] off a null body threw and
+// killed the process, so the sentinel chosen to prevent a crash became one.
+const OVERSIZE = Symbol('oversize');
+
+// Distinct from an empty body: resolving {} conflated "the client sent
+// nothing" with "the client gave up", and /api/experts writes on empty input,
+// so navigating away mid-request persisted a defaulted 未命名专家.
+const ABORTED = Symbol('aborted');
+
 function readBody(req) {
   return new Promise((resolve) => {
-    let b = '';
-    req.on('data', (c) => (b += c));
-    req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); } });
+    // Buffers, concatenated and decoded ONCE at the end. `b += chunk` coerced
+    // each chunk independently, so a multibyte character split across two TCP
+    // segments decoded to replacement characters on both sides and was written
+    // to disk that way - in a product whose UI is entirely Chinese.
+    const chunks = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (c) => {
+      if (over) return;
+      // Bytes, not UTF-16 units. One CJK character is 3 bytes but 1 unit, so a
+      // .length cap admitted roughly 3x its stated size.
+      size += c.length;
+      if (size > MAX_BODY) { over = true; chunks.length = 0; return; }
+      chunks.push(c);
+    });
+    // A client that hangs up mid-body never emits 'end', so without these the
+    // promise never settles and the handler is wedged forever. resolve() is
+    // idempotent, so a late 'end' after an abort is harmless.
+    req.on('aborted', () => resolve({ [ABORTED]: true }));
+    req.on('error', () => resolve({ [ABORTED]: true }));
+    req.on('end', () => {
+      if (over) return resolve({ [OVERSIZE]: true });
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolve({});
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch (_) { return resolve({}); }
+      // JSON.parse returns null, numbers and strings too - and "null" is
+      // truthy, so the old ternary handed null straight to the callers, where
+      // body[OVERSIZE] threw and took the process with it. Every caller treats
+      // the body as an object; guarantee one here rather than asking three
+      // call sites to remember.
+      //
+      // Arrays pass through: importExperts explicitly accepts a top-level
+      // array, which is a very plausible shape for the agent classification
+      // results POSTed to that callback. Coercing them to {} made that branch
+      // dead code. They are safe at the other two call sites for the same
+      // reason a plain {} is - reading .name off an array yields undefined and
+      // a defaulted record, never a throw.
+      if (!parsed || typeof parsed !== 'object') return resolve({});
+      return resolve(parsed);
+    });
   });
 }
+// Ids reach the store as path segments. store.abs() guarantees containment
+// within the store root but NOT within the intended collection, so an id of
+// "../projects" would resolve inside the root and reach another namespace.
+const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
+
+// The bind stops the network reaching us; this stops a web page doing it. A
+// cross-origin POST with Content-Type: text/plain is a CORS "simple request" -
+// no preflight - so any site the user visits could write to the registry. And
+// /api/run spawns an agent from a GET, which <img src> triggers with no Origin
+// header at all, so Sec-Fetch-Site is the header that actually covers it.
+// Absent headers mean a non-browser client (curl, the test suite): allowed.
+//
+// The two checks are NOT redundant - they cover disjoint request classes, and
+// removing either silently uncovers a class the other never saw. Origin is
+// absent on cross-site GET subresources; Sec-Fetch-* is absent on Safari
+// < 16.4. A browser in that gap sends neither and gets through, because its
+// Host really is 127.0.0.1, so hostAllowed cannot help. Nothing this file owns
+// rests on the weak side - GET is read-only and unreadable cross-origin
+// without CORS headers, a cross-site form POST always carries Origin, and
+// DELETE is preflighted - so the residual lands on /api/run, which is
+// separately filed for review.
+function isCrossOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return true;
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    const local = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    return !local || u.port !== String(PORT);
+  } catch (_) { return true; }
+}
+
+// Host validation defeats DNS rebinding, which only matters while we are
+// loopback-only. Binding a non-loopback HOST is a deliberate opt-out of that
+// protection: enforcing the loopback allowlist there would bind every
+// interface and then 403 every request that used it, which is not a security
+// posture, just a confusing one. isCrossOrigin stays unconditional - that is
+// CSRF defence and applies whatever we are bound to.
+function hostAllowed(req) {
+  if (!BIND_IS_LOOPBACK) return true;
+  const h = req.headers.host;
+  if (!h) return true; // HTTP/1.0 and curl send none
+  const name = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  return name === '127.0.0.1' || name === 'localhost' || name === '::1';
+}
+
+// isCrossOrigin allows Sec-Fetch-Site: none, which is correct for the console
+// itself — a browser sends `none` for a navigation with no initiator. But that
+// is also what it sends for a link clicked in Slack, Mail, Notes, a PDF or an
+// IDE markdown preview, all of which hand the URL over as a fresh navigation.
+// For a route that merely renders a page that is fine; for one that spawns a
+// credentialed AI agent, or deletes a record, one click is too low a bar.
+//
+// The console's own calls are unaffected: fetch and EventSource send
+// Sec-Fetch-Mode: cors with Dest: empty, never navigate/document. The cost is
+// that pasting such a URL into the address bar to debug now 403s, which is the
+// point.
+function isTopLevelNavigation(req) {
+  return (
+    req.headers['sec-fetch-mode'] === 'navigate' ||
+    req.headers['sec-fetch-dest'] === 'document'
+  );
+}
+
 function serveStatic(res, file) {
   const full = path.join(PUBLIC, file);
   if (!full.startsWith(PUBLIC) || !fs.existsSync(full)) {
@@ -457,13 +711,84 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
   const p = u.pathname;
 
+  // Before routing: every route, including the SSE agent spawn.
+  if (isCrossOrigin(req) || !hostAllowed(req)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('forbidden');
+  }
+
+  // Every route below runs inside this. A throw from a lib call used to take
+  // the whole process down - DELETE called projects.remove() bare, so an
+  // unwritable store (EACCES) or a projects.json that parsed but wasn't an
+  // array killed the dispatcher, and any live SSE stream with it, from one
+  // ordinary click. The POST route already reasoned about that error; DELETE
+  // did not, and goals/orders routes land next. Making it the handler's rule
+  // rather than each route's responsibility is what stops the asymmetry
+  // replicating.
+  try {
+    return await route(req, res, u, p);
+  } catch (e) {
+    console.error('[server] unhandled error in %s %s:', req.method, p, e);
+    // Headers may already be sent by a streaming route; writing again would
+    // throw a second time, inside the catch that exists to prevent exactly
+    // that. Destroying is the only honest close at that point.
+    if (res.headersSent) return res.destroy();
+    return sendJson(res, 500, { error: 'internal error' });
+  }
+});
+
+async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
-  if (p === '/app.js' || p === '/icons.js' || p === '/style.css') return serveStatic(res, p.slice(1));
+  if (p === '/app.js' || p === '/icons.js' || p === '/pure.js' || p === '/style.css') return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
   // the app is an instrument, this page sells the idea of it.
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
+
+  if (p === '/api/projects' && req.method === 'GET') {
+    return sendJson(res, 200, { projects: projects.list(SKILLSPACE_HOME) });
+  }
+
+  if (p === '/api/projects' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body[ABORTED]) return; // no client left to answer, and nothing to store
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
+    try {
+      return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
+    } catch (e) {
+      // create() emits exactly two caller-fault shapes; anything else (EACCES
+      // on an unwritable store, for one) is ours, and reporting it as 400 told
+      // the user their input was bad when the disk was.
+      const msg = String((e && e.message) || e);
+      const clientFault = /^path (does not exist|is not a directory)/.test(msg);
+      return sendJson(res, clientFault ? 400 : 500, { error: msg });
+    }
+  }
+
+  // Single trailing segment only: startsWith would also swallow nested routes
+  // like /api/projects/:id/goals/:goalId, answering "invalid project id" for a
+  // path this handler was never meant to own.
+  const delMatch = req.method === 'DELETE' && p.match(/^\/api\/projects\/([^/]+)$/);
+  if (delMatch) {
+    let id;
+    try {
+      // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
+      // still carrying a separator into the store. A malformed escape like %ZZ
+      // is not a decodable id at all, so it is rejected the same way a bad one is.
+      id = decodeURIComponent(delMatch[1]);
+    } catch (_) {
+      return sendJson(res, 400, { error: 'invalid project id' });
+    }
+    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid project id' });
+    if (!projects.remove(SKILLSPACE_HOME, id)) {
+      // remove() reports whether anything matched, so an unknown id 404s
+      // instead of reporting a success that never happened.
+      return sendJson(res, 404, { error: 'no such project' });
+    }
+    // The record is gone; the working directory is deliberately untouched.
+    return sendJson(res, 200, { ok: true, filesKept: true });
+  }
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
@@ -482,6 +807,10 @@ const server = http.createServer(async (req, res) => {
   }
   if (p === '/api/experts' && req.method === 'POST') {
     const body = await readBody(req);
+    if (body[ABORTED]) return; // else a hung-up upload leaves a defaulted expert
+    // Before body.name is read: without this an oversized body fell through to
+    // the defaults below and silently persisted a junk expert.
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     const experts = loadExperts();
     const expert = {
       id: newExpertId(),
@@ -525,6 +854,10 @@ const server = http.createServer(async (req, res) => {
     const job = JOBS.get(u.searchParams.get('token') || '');
     if (!job) return sendJson(res, 404, { error: '任务不存在或已过期，请回 SkillSpace 重新生成口令' });
     const body = await readBody(req);
+    if (body[ABORTED]) return; // don't fail the job over a dropped connection
+    // Without this an oversized import reports "experts is empty or malformed"
+    // and flips the job to error on false grounds.
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     const r = importExperts(job, body);
     if (r.error) {
       job.status = 'error';
@@ -580,7 +913,8 @@ const server = http.createServer(async (req, res) => {
 
   // 弹出 macOS 原生文件夹选择框，返回绝对路径
   if (p === '/api/pick-dir') {
-    const dir = pickFolder();
+    // 'for' selects a prompt from a fixed table; it is never interpolated.
+    const dir = await pickFolder(u.searchParams.get('for'));
     if (!dir) return sendJson(res, 200, { cancelled: true });
     return sendJson(res, 200, { dir });
   }
@@ -598,7 +932,28 @@ const server = http.createServer(async (req, res) => {
 
   // SSE 流式运行
   if (p === '/api/run') {
-    const agentId = u.searchParams.get('agent') || (AGENTS[0] && AGENTS[0].id);
+    // A GET that spawns a credentialed agent is one clicked link away from
+    // running an attacker's prompt: Slack, Mail, Notes and IDE previews all
+    // hand a URL to the browser as a top-level navigation, which arrives as
+    // Sec-Fetch-Site: none and passes isCrossOrigin. EventSource does not.
+    if (isTopLevelNavigation(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('forbidden: /api/run is not a navigable URL');
+    }
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('method not allowed');
+    }
+    // Bounded because each spawn is a real billed invocation and nothing else
+    // limits them. The design's per-project maxConcurrent (2 git / 1 dir) does
+    // not reach this route, which predates it.
+    if (RUNNING.size >= MAX_CONCURRENT_RUNS) {
+      res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end(`too many agents running (${MAX_CONCURRENT_RUNS})`);
+    }
+
+    const rawAgent = u.searchParams.get('agent');
+    const agentId = rawAgent || (AGENTS[0] && AGENTS[0].id);
     const name = u.searchParams.get('skill') || '';
     const task = u.searchParams.get('task') || '';
     const dir = u.searchParams.get('dir') || DEFAULT_SKILLS_DIR;
@@ -611,27 +966,96 @@ const server = http.createServer(async (req, res) => {
     });
     const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     if (!cmd) {
-      send('error', '没有检测到可用的 agent（codex 或 qodercli），请先安装其一。');
+      // Distinguish "you named an agent we do not have" from "none installed".
+      // Falling back silently ran a different tool than the caller asked for.
+      const msg = rawAgent && !AGENTS.some((a) => a.id === rawAgent)
+        ? `未知的 agent：${rawAgent}（可用：${AGENTS.map((a) => a.id).join(', ') || '无'}）`
+        : '没有检测到可用的 agent（claude / codex / opencode / qodercli），请先安装其一。';
+      send('error', msg);
       return res.end();
     }
-    send('start', { command: cmd.display });
-    // 参数数组传参，避免命令注入；stdin 设 ignore，否则 codex exec 会一直等 stdin 输入而卡住
+    // The full prompt, not just the elided preview: when a Skill body is
+    // injected, the preview shows 〈注入…〉 and the actual instructions - which
+    // may be file contents - are invisible at the one moment a human watches.
+    send('start', { command: cmd.display, prompt: cmd.prompt, injected: cmd.injected });
+    logRun({ bin: cmd.bin, dir, folder, task, prompt: cmd.prompt });
+
+    // detached so the child leads its own process group: agent CLIs spawn tool
+    // subprocesses, and killing only the direct pid left those orphaned to
+    // PID 1 - still writing files, still billing, invisible to SkillSpace.
+    // cwd is a scratch directory: without it the agent inherited the server's,
+    // i.e. the SkillSpace install tree, where "edit server.js" is a
+    // persistence primitive. Spec §5: never the install directory.
+    const runCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'skillspace-run-'));
     const child = spawn(cmd.bin, cmd.args, {
-      env: { ...process.env, PATH: CHILD_PATH },
+      cwd: runCwd,
+      env: childEnv(cmd.agent),
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
     });
+    RUNNING.add(child);
+
+    let settled = false;
+    const reap = (signal) => {
+      // Negative pid signals the whole group. Falls back to the direct child
+      // if the group is already gone, so a dead pid cannot throw here.
+      try { process.kill(-child.pid, signal); }
+      catch (_) { try { child.kill(signal); } catch (__) {} }
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      RUNNING.delete(child);
+      fs.rm(runCwd, { recursive: true, force: true }, () => {});
+    };
+    // The only thing between a stuck agent and an unbounded bill (spec §8a).
+    const timer = setTimeout(() => {
+      send('error', `agent 超时（${RUN_TIMEOUT_MS / 1000}s），已终止`);
+      reap('SIGTERM');
+      setTimeout(() => reap('SIGKILL'), 5000).unref();
+    }, RUN_TIMEOUT_MS);
+    timer.unref();
+
     child.stdout.on('data', (d) => send('chunk', d.toString()));
     child.stderr.on('data', (d) => send('chunk', d.toString()));
-    child.on('close', (code) => { send('done', { code }); res.end(); });
-    child.on('error', (e) => { send('error', String(e.message || e)); res.end(); });
-    req.on('close', () => { try { child.kill(); } catch (_) {} });
+    child.on('close', (code) => { finish(); send('done', { code }); res.end(); });
+    child.on('error', (e) => { finish(); send('error', String(e.message || e)); res.end(); });
+    req.on('close', () => {
+      if (settled) return;
+      reap('SIGTERM');
+      setTimeout(() => reap('SIGKILL'), 5000).unref();
+      finish();
+    });
     return;
   }
 
   res.writeHead(404); res.end('not found');
-});
+}
 
-server.listen(PORT, () => {
+// Loopback only. This process dispatches AI agents with write access to any
+// registered directory and has no authentication whatsoever - the design
+// assumes "local, single user", and listen(PORT) with no host quietly broke
+// that assumption by binding every interface. Overridable for anyone who
+// deliberately wants otherwise, but never by default.
+//
+// IPv4 specifically. `localhost` resolves to ::1 first on many systems, so a
+// client that does NOT fall back to 127.0.0.1 will be refused - browsers, curl
+// and undici all do fall back, which is the entire client set for this tool.
+// A second listener on ::1 would cover the rest at the cost of a second bind
+// to fail on.
+//
+// HOST=::1 switches to IPv6 loopback (verified: localhost and [::1] answer,
+// 127.0.0.1 is then refused). There is NO single value covering both loopbacks
+// - in particular HOST=:: is not it: that binds *, every interface, which is
+// the exact exposure this default exists to prevent. Covering both needs a
+// second listen() call, deliberately not done.
+//
+// Setting any non-loopback HOST also switches OFF the Host-header allowlist
+// (see BIND_IS_LOOPBACK): it is an opt-out of DNS-rebinding protection, which
+// is meaningless once the socket is reachable from the network anyway. The
+// Origin/Sec-Fetch-Site check still applies.
+server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
   console.log(`  → http://localhost:${PORT}`);
   for (const s of listSources()) {

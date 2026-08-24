@@ -63,6 +63,9 @@ async function boot() {
     : '<option value="">未检测到 agent</option>';
   wireNav();
   await loadSources();
+  loadProjects();
+  const addProjBtn = document.getElementById('add-project');
+  if (addProjBtn) addProjBtn.addEventListener('click', addProject);
 }
 
 // ---------- 删除二次确认 ----------
@@ -735,8 +738,212 @@ $('#reload').addEventListener('click', async () => {
 });
 $('#search').addEventListener('input', (e) => { state.q = e.target.value; applyFilter(); });
 
-function esc(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// ---------- 项目 ----------
+const PROJECT_KEY = 'skillspace-project';
+
+// esc / escAttr / railState / deleteOutcome now live in public/pure.js,
+// loaded as a classic script before this one. They remain globals.
+//
+// The ordering is currently only a convention: boot() suspends at its first
+// await before anything calls esc(), so loading pure.js afterwards happens to
+// work. That would stop being true the moment an early render became
+// synchronous, and the failure would then surface as a stray
+// "esc is not a function" somewhere deep in a render rather than at load.
+// Fail at load instead, where the cause is obvious.
+if (typeof esc !== 'function' || typeof escAttr !== 'function') {
+  throw new Error('pure.js must be loaded before app.js');
+}
+
+// focusId: the project that was just acted on, if this render was triggered by
+// an explicit selection. Never passed on the boot render, which must not steal
+// focus from the page.
+async function loadProjects(focusId) {
+  const list = document.getElementById('project-list');
+  if (!list) return;
+  let data = null;
+  let ok = false;
+  try {
+    const res = await fetch('/api/projects');
+    ok = res.ok;
+    data = await res.json();
+  } catch (_) {
+    data = null;
+  }
+
+  const st = railState(ok, data);
+  if (st.kind === 'error') {
+    // Deliberately does not touch the stored selection: a failed load is not
+    // evidence the project is gone, and clearing here would discard a valid
+    // selection every time the server hiccups.
+    list.innerHTML = '<div class="proj-empty">项目列表加载失败</div>';
+    return;
+  }
+  const projects = st.projects;
+
+  // A stored id can outlive the project it names — the record may have been
+  // deleted in another tab or by a direct API call. Reconcile BEFORE the
+  // empty-state return: an empty list is exactly the case where a dangling id
+  // has nothing left to overwrite it, so it would survive every reload.
+  let activeId = localStorage.getItem(PROJECT_KEY) || '';
+  if (activeId && !projects.some((p) => p.id === activeId)) {
+    activeId = '';
+    localStorage.removeItem(PROJECT_KEY);
+  }
+
+  if (st.kind === 'empty') {
+    list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
+    return;
+  }
+
+  // The row is a div, not a button, for the reason renderSources() documents:
+  // a <button> may not contain another one, and the delete affordance has to be
+  // focusable to be reachable by keyboard. Same structure as .src-item.
+  list.innerHTML = projects
+    .map((p, i) => {
+      // A name can be empty: registering "/" makes basename() return '' and the
+      // row renders zero-width, labelled "移除项目 " and confirmed as 「」.
+      // lib/projects now guarantees a non-empty name, but the path standing in
+      // costs nothing and keeps the row readable if that ever regresses.
+      const label = p.name || p.path;
+      return (
+        // data-id as well as data-i: the index is only meaningful against the
+        // array this render closed over, so a path that outlives the render —
+        // deleting a row, then looking for what replaced it — needs the row to
+        // say which project it is.
+        `<div class="proj-item${p.id === activeId ? ' active' : ''}" role="button" tabindex="0" data-i="${i}"` +
+        ` data-id="${escAttr(p.id)}"` +
+        ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
+        `<span class="proj-name">${esc(label)}</span>` +
+        // kind is shown, not hidden: it decides how many agents may run at once
+        `<span class="proj-kind">${esc(p.kind)}</span>` +
+        // the glyph is aria-hidden, so the control needs a label of its own
+        `<button class="proj-del" data-del="${i}" title="移除这个项目"` +
+        ` aria-label="移除项目 ${escAttr(label)}">${icon('close', 13)}</button>` +
+        `</div>`
+      );
+    })
+    .join('');
+
+  list.querySelectorAll('.proj-item').forEach((el) => {
+    const select = () => {
+      const id = projects[+el.dataset.i].id;
+      localStorage.setItem(PROJECT_KEY, id);
+      loadProjects(id);
+    };
+    el.addEventListener('click', select);
+    // role="button" on a div gets no Enter/Space activation for free. The row
+    // was a real <button> until the delete control had to live inside it, so
+    // without this the conversion would have cost the keyboard its selection.
+    // Guarded on target: a keypress on the nested delete button is its own.
+    el.addEventListener('keydown', (ev) => {
+      if (ev.target !== el) return;
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      select();
+    });
+  });
+
+  list.querySelectorAll('.proj-del').forEach((el) =>
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation(); // never let removing a row also select it
+      askDeleteProject(projects[+el.dataset.del]);
+    })
+  );
+
+  // Replacing innerHTML destroys the focused node, so selecting a row dropped
+  // focus to <body> - the keyboard user was returned to the top of the page
+  // after every selection, which defeats the point of making the row operable
+  // by keyboard at all. Same document.contains staleness guard the dialog
+  // machinery uses for lastTrigger.
+  if (focusId) {
+    const idx = projects.findIndex((p) => p.id === focusId);
+    const row = idx >= 0 ? list.querySelectorAll('.proj-item')[idx] : null;
+    if (row && document.contains(row)) row.focus();
+  }
+}
+
+// Deleting a row destroys the node the keyboard user was standing on, so focus
+// falls to <body> and they restart from the top of the document. Selection
+// already restores focus; deletion has to as well or the rail is only half
+// operable by keyboard. Land on whatever took the row's place, the last row if
+// it was the last one, and the add button if nothing is left.
+function focusAfterDelete(rowIndex) {
+  if (rowIndex < 0) return;
+  const rows = document.querySelectorAll('.proj-item');
+  const next = rows.length ? rows[Math.min(rowIndex, rows.length - 1)] : null;
+  const target = next || document.getElementById('add-project');
+  if (target && document.contains(target)) target.focus();
+}
+
+// 删项目：只摘掉记录，磁盘上的目录一个文件都不会动。
+// 接口回的 filesKept: true 就是这件事，所以确认框里必须把它讲明白。
+function askDeleteProject(project) {
+  if (!project) return;
+  // Same empty-name fallback as the row: 删除项目「」 names nothing.
+  const label = project.name || project.path;
+  askConfirm({
+    title: `删除项目「${label}」`,
+    body: '只从列表里移除这条记录，磁盘上的文件不会被删除。',
+    target: project.path,
+    note: '',
+    okText: '移除记录',
+    onOk: async () => {
+      // Captured before the re-render destroys the row. loadProjects' focusId
+      // cannot help here — the project it would name no longer exists.
+      const rowIndex = [...document.querySelectorAll('.proj-item')].findIndex(
+        (el) => el.dataset.id === project.id
+      );
+      // null means no body at all — the network case, which deleteOutcome
+      // reports in Chinese rather than leaking a raw "Failed to fetch".
+      const body = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
+        .then((x) => x.json())
+        .catch(() => null);
+      const outcome = deleteOutcome(body);
+      if (!outcome.ok) {
+        toast(outcome.message, 'error');
+        // A 404 means the record is already gone: the view is stale, not the
+        // request. Reconcile so the phantom row disappears instead of failing
+        // again on every retry.
+        if (outcome.shouldReload) await loadProjects();
+        return;
+      }
+      if (localStorage.getItem(PROJECT_KEY) === project.id) localStorage.removeItem(PROJECT_KEY);
+      toast(`已移除项目：${label}（磁盘文件没动）`);
+      await loadProjects();
+      focusAfterDelete(rowIndex);
+    },
+  });
+}
+
+async function addProject() {
+  // /api/pick-dir shells out to osascript, so it yields nothing on Linux or
+  // Windows and the button would appear broken. Fall back to typing a path.
+  let dir = null;
+  try {
+    const picked = await fetch('/api/pick-dir?for=project').then((r) => r.json());
+    dir = picked && picked.dir ? picked.dir : null;
+  } catch (_) { /* fall through to the prompt */ }
+  if (!dir) {
+    dir = (window.prompt('项目目录的完整路径：') || '').trim();
+    if (!dir) return;
+  }
+  let r;
+  try {
+    r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir }),
+    }).then((x) => x.json());
+  } catch (_) {
+    return toast('添加项目失败：无法连接服务器', 'error');
+  }
+  if (!r || r.error) return toast('添加项目失败：' + ((r && r.error) || '未知错误'), 'error');
+  localStorage.setItem(PROJECT_KEY, r.project.id);
+  // Same fallback the row and the confirm dialog use. This was the one site
+  // that missed it, so a project whose name came out empty produced a toast
+  // that named nothing at all.
+  toast('已添加项目：' + (r.project.name || r.project.path));
+  loadProjects();
 }
 
 boot();
