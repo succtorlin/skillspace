@@ -9,10 +9,16 @@ const path = require('path');
 const os = require('os');
 const { spawn, execSync } = require('child_process');
 const { URL } = require('url');
+const projects = require('./lib/projects');
 
 const PORT = process.env.PORT || 4177;
 const PUBLIC = path.join(__dirname, 'public');
 const HOME = os.homedir();
+
+// Durable records live outside both the app directory and the user's repos, so
+// upgrading SkillSpace never touches data and a project directory never gains
+// SkillSpace files. Overridable so tests never write to the real home.
+const SKILLSPACE_HOME = process.env.SKILLSPACE_HOME || path.join(os.homedir(), '.skillspace');
 
 // 内置来源：本机 Codex / Claude Code 的 Skill 根目录，启动即自动扫描。
 // 目录不存在或没有 Skill 时不隐藏，照常显示（前端渲染成空态），让用户知道扫过了。
@@ -464,6 +470,45 @@ const server = http.createServer(async (req, res) => {
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
+
+  // Ids reach the store as path segments. store.abs() guarantees containment
+  // within the store root but NOT within the intended collection, so an id of
+  // "../projects" would resolve inside the root and reach another namespace.
+  const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
+
+  if (p === '/api/projects' && req.method === 'GET') {
+    return sendJson(res, 200, { projects: projects.list(SKILLSPACE_HOME) });
+  }
+
+  if (p === '/api/projects' && req.method === 'POST') {
+    const body = await readBody(req);
+    try {
+      return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
+    } catch (e) {
+      // A bad path is the caller's mistake, not a server fault.
+      return sendJson(res, 400, { error: String((e && e.message) || e) });
+    }
+  }
+
+  if (p.startsWith('/api/projects/') && req.method === 'DELETE') {
+    let id;
+    try {
+      // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
+      // still carrying a separator into the store. A malformed escape is not a
+      // decodable id at all, so it is rejected the same way a bad one is.
+      id = decodeURIComponent(p.slice('/api/projects/'.length));
+    } catch (_) {
+      return sendJson(res, 400, { error: 'invalid project id' });
+    }
+    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid project id' });
+    if (!projects.remove(SKILLSPACE_HOME, id)) {
+      // remove() reports whether anything matched, so an unknown id 404s
+      // instead of reporting a success that never happened.
+      return sendJson(res, 404, { error: 'no such project' });
+    }
+    // The record is gone; the working directory is deliberately untouched.
+    return sendJson(res, 200, { ok: true, filesKept: true });
+  }
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
