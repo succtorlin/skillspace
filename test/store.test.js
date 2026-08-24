@@ -1,4 +1,4 @@
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -6,9 +6,19 @@ const path = require('path');
 
 const store = require('../lib/store');
 
+const created = [];
+
 function tmpRoot() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'skillspace-test-'));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'skillspace-test-'));
+  created.push(d);
+  return d;
 }
+
+after(() => {
+  for (const d of created) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) {}
+  }
+});
 
 test('writeJson then readJson round-trips', () => {
   const root = tmpRoot();
@@ -50,4 +60,16 @@ test('list returns ids of records in a subdirectory', () => {
 
 test('list returns empty for a missing subdirectory', () => {
   assert.deepStrictEqual(store.list(tmpRoot(), 'orders'), []);
+});
+
+test('abs rejects a sibling directory that merely shares the root prefix', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'skillspace-prefix-'));
+  created.push(base);
+  const root = path.join(base, 'store');
+  fs.mkdirSync(root, { recursive: true });
+  assert.throws(
+    () => store.writeJson(root, '../store-evil/x.json', { pwned: true }),
+    /escapes store root/
+  );
+  assert.ok(!fs.existsSync(path.join(base, 'store-evil')), 'nothing may be written outside the root');
 });
