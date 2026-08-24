@@ -50,11 +50,16 @@ async function spawnServer(env, probeHost = '127.0.0.1') {
     env: { ...process.env, PORT: String(port), SKILLSPACE_HOME: tmp('skillspace-bind-'), ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // Drain both pipes: unread, they fill at 64 KiB and wedge the child. Also
+  // makes a red bind test say why instead of four words.
+  let err = '';
+  proc.stderr.on('data', (c) => (err += c));
+  proc.stdout.on('data', () => {});
   const deadline = Date.now() + 15000;
   for (;;) {
-    if (proc.exitCode !== null) throw new Error('server exited early');
+    if (proc.exitCode !== null) throw new Error('server exited early: ' + err);
     try { if ((await fetch(`http://${probeHost}:${port}/api/config`)).ok) break; } catch (_) {}
-    if (Date.now() > deadline) { proc.kill('SIGKILL'); throw new Error('server did not start'); }
+    if (Date.now() > deadline) { proc.kill('SIGKILL'); throw new Error('server did not start: ' + err); }
     await new Promise((r) => setTimeout(r, 100));
   }
   return { child: proc, port };
@@ -190,8 +195,8 @@ test('DELETE rejects an id that is not a plain identifier', async () => {
     assert.strictEqual(r.status, 404, `id ${JSON.stringify(bad)} got ${r.status}`);
   }
 
-  // and nothing outside the store was touched
-  assert.ok(fs.existsSync(storeRoot));
+  // The real claim: no traversal created a sibling namespace in the store.
+  assert.deepStrictEqual(fs.readdirSync(storeRoot).sort(), ['projects.json']);
 });
 
 test('a nested path is not claimed by the project DELETE route', async () => {
@@ -219,6 +224,61 @@ test('an oversized body is rejected, not persisted', async () => {
   assert.strictEqual(after, before, 'an oversized body created a record');
 });
 
+// fetch() gives no control over TCP segmentation, so a raw socket is the only
+// way to split a body at a chosen byte and exercise the decode boundary.
+function rawPost(pathname, bodyBuf, splitAt) {
+  return new Promise((resolve, reject) => {
+    const { port } = new URL(base);
+    const sock = net.connect({ host: '127.0.0.1', port: Number(port) });
+    let out = '';
+    sock.on('data', (d) => (out += d));
+    sock.on('error', reject);
+    sock.on('end', () => resolve(out));
+    sock.on('connect', () => {
+      sock.write(
+        `POST ${pathname} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+        `Content-Type: application/json\r\nContent-Length: ${bodyBuf.length}\r\n` +
+        `Connection: close\r\n\r\n`
+      );
+      sock.write(bodyBuf.subarray(0, splitAt));
+      // Land the remainder in a separate TCP segment.
+      setTimeout(() => sock.end(bodyBuf.subarray(splitAt)), 50);
+    });
+  });
+}
+
+// Host is a forbidden header for fetch(), so it has to go on the wire by hand.
+function rawGet(pathname, hostHeader) {
+  return new Promise((resolve, reject) => {
+    const { port } = new URL(base);
+    const sock = net.connect({ host: '127.0.0.1', port: Number(port) });
+    let out = '';
+    sock.on('data', (d) => (out += d));
+    sock.on('error', reject);
+    sock.on('end', () => resolve(out));
+    sock.on('connect', () => {
+      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`);
+    });
+  });
+}
+
+test('a body split mid-character round-trips intact', async () => {
+  const dir = tmp('skillspace-apiwork-');
+  const name = '中文项目名';
+  const bodyBuf = Buffer.from(JSON.stringify({ name, path: dir }), 'utf8');
+  // Cut one byte into the first CJK character, so its 3 bytes straddle two
+  // chunks. Decoding each chunk separately yields replacement characters.
+  const splitAt = bodyBuf.indexOf(Buffer.from(name, 'utf8')) + 1;
+  const res = await rawPost('/api/projects', bodyBuf, splitAt);
+  assert.ok(res.includes('200 OK'), `expected 200, got: ${res.slice(0, 80)}`);
+
+  const l = await json('GET', '/api/projects');
+  const rec = l.body.projects.find((p) => p.path === fs.realpathSync(dir));
+  assert.ok(rec, 'record was not created');
+  assert.strictEqual(rec.name, name, 'multibyte name was corrupted in transit');
+  assert.ok(!rec.name.includes('\uFFFD'), 'name contains replacement characters');
+});
+
 test('a non-object JSON body cannot crash the server', async () => {
   // JSON.parse returns null, numbers, strings and arrays too. "null" is
   // truthy, so the empty-body ternary never fired and body[OVERSIZE]
@@ -235,11 +295,22 @@ test('a non-object JSON body cannot crash the server', async () => {
 });
 
 test('a non-object JSON body cannot crash the experts route either', async () => {
+  const litter = [];
   for (const raw of ['null', '123', '"str"', 'false', '[]', '[1,2]']) {
     const r = await fetch(base + '/api/experts', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
     });
     assert.ok(r.status < 500, `body ${raw} got ${r.status}`);
+    const b = await r.json().catch(() => ({}));
+    if (b.expert && b.expert.id) litter.push(b.expert.id);
+  }
+  // These bodies coerce to {}, which is legitimate for this route, so each one
+  // creates a defaulted expert. This route persists to <repo>/experts.json via
+  // __dirname and ignores SKILLSPACE_HOME, so without this cleanup the suite
+  // accumulates junk in the developer's real file - 78 entries before it was
+  // noticed.
+  for (const id of litter) {
+    await fetch(base + '/api/experts?id=' + encodeURIComponent(id), { method: 'DELETE' });
   }
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
@@ -277,7 +348,7 @@ test('an oversized body does not kill the server', async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024) }),
   });
-  assert.ok(r.status < 500, `oversize body to /api/experts got ${r.status}`);
+  assert.strictEqual(r.status, 413, `oversize body to /api/experts got ${r.status}`);
   // still serving afterwards
   const after = await json('GET', '/api/projects');
   assert.strictEqual(after.status, 200);
@@ -343,4 +414,62 @@ test('the body cap is 1 MiB - not tighter, not looser', async () => {
     body: JSON.stringify({ name: 'Over', path: dir, note: 'x'.repeat(1200 * 1024) }),
   });
   assert.strictEqual(over.status, 413, 'a 1.2 MiB body is over the cap and must be rejected');
+
+  // Bytes, not UTF-16 units. 400k CJK characters are 1.2 MB encoded but only
+  // 400k units, so a `.length` cap waves this through at ~3x the stated limit -
+  // which matters because this product's own UI is Chinese.
+  const cjk = '\u4e2d'.repeat(400 * 1000);
+  assert.ok(Buffer.byteLength(cjk, 'utf8') > 1024 * 1024, 'fixture must exceed 1 MiB in bytes');
+  assert.ok(cjk.length < 1024 * 1024, 'fixture must be under 1 MiB in UTF-16 units');
+  const wide = await fetch(base + '/api/projects', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Wide', path: dir, note: cjk }),
+  });
+  assert.strictEqual(wide.status, 413, 'the cap must count bytes, not UTF-16 units');
+});
+
+test('a cross-origin request is refused on every method', async () => {
+  const evil = { Origin: 'https://evil.example' };
+  const g = await fetch(base + '/api/projects', { headers: evil });
+  assert.strictEqual(g.status, 403, 'cross-origin GET must be refused');
+  const p1 = await fetch(base + '/api/projects', {
+    method: 'POST', headers: { ...evil, 'Content-Type': 'text/plain' }, body: '{}',
+  });
+  assert.strictEqual(p1.status, 403, 'a CORS simple-request POST must be refused');
+  const d = await fetch(base + '/api/projects/prj-whatever', { method: 'DELETE', headers: evil });
+  assert.strictEqual(d.status, 403, 'cross-origin DELETE must be refused');
+});
+
+test('Sec-Fetch-Site covers the no-Origin case that <img src> produces', async () => {
+  // A GET from <img src> or <script src> carries no Origin at all, so this
+  // header is the only thing standing in front of /api/run's agent spawn.
+  const r = await fetch(base + '/api/run?agent=claude&skill=x', {
+    headers: { 'Sec-Fetch-Site': 'cross-site' },
+  });
+  assert.strictEqual(r.status, 403, 'cross-site GET to /api/run must be refused');
+});
+
+test('a rebound Host header is refused', async () => {
+  // DNS rebinding: an attacker domain resolving to 127.0.0.1 arrives
+  // same-origin, so Origin alone would admit it. Raw socket because Host is a
+  // forbidden header name - undici silently drops it, which made an earlier
+  // version of this test pass against a server that never saw the override.
+  const res = await rawGet('/api/projects', 'evil.example');
+  assert.ok(res.includes('403'), `an unrecognised Host must be refused, got: ${res.slice(0, 40)}`);
+  const ok = await rawGet('/api/projects', '127.0.0.1');
+  assert.ok(ok.includes('200 OK'), `a recognised Host must be served, got: ${ok.slice(0, 40)}`);
+});
+
+test('same-origin and header-less clients are still served', async () => {
+  const { port } = new URL(base);
+  // What the console itself sends.
+  const same = await fetch(base + '/api/projects', {
+    headers: { Origin: `http://127.0.0.1:${port}`, 'Sec-Fetch-Site': 'same-origin' },
+  });
+  assert.strictEqual(same.status, 200, 'the console must keep working');
+  // What typed navigation sends.
+  const nav = await fetch(base + '/api/config', { headers: { 'Sec-Fetch-Site': 'none' } });
+  assert.strictEqual(nav.status, 200, 'typed navigation must keep working');
+  // What curl and this suite send: nothing.
+  assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });

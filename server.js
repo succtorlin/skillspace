@@ -460,18 +460,31 @@ const OVERSIZE = Symbol('oversize');
 
 function readBody(req) {
   return new Promise((resolve) => {
-    let b = '';
+    // Buffers, concatenated and decoded ONCE at the end. `b += chunk` coerced
+    // each chunk independently, so a multibyte character split across two TCP
+    // segments decoded to replacement characters on both sides and was written
+    // to disk that way - in a product whose UI is entirely Chinese.
+    const chunks = [];
+    let size = 0;
     let over = false;
     req.on('data', (c) => {
       if (over) return;
-      b += c;
-      if (b.length > MAX_BODY) { over = true; b = ''; }
+      // Bytes, not UTF-16 units. One CJK character is 3 bytes but 1 unit, so a
+      // .length cap admitted roughly 3x its stated size.
+      size += c.length;
+      if (size > MAX_BODY) { over = true; chunks.length = 0; return; }
+      chunks.push(c);
     });
+    // A client that hangs up mid-body never emits 'end', so without these the
+    // promise never settles and the handler is wedged forever.
+    req.on('aborted', () => resolve({}));
+    req.on('error', () => resolve({}));
     req.on('end', () => {
       if (over) return resolve({ [OVERSIZE]: true });
-      if (!b) return resolve({});
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolve({});
       let parsed;
-      try { parsed = JSON.parse(b); } catch (_) { return resolve({}); }
+      try { parsed = JSON.parse(raw); } catch (_) { return resolve({}); }
       // JSON.parse returns null, numbers, strings and arrays too - and "null"
       // is truthy, so the old ternary handed null straight to the callers,
       // where body[OVERSIZE] threw and took the process with it. Every caller
@@ -483,6 +496,39 @@ function readBody(req) {
     });
   });
 }
+// Ids reach the store as path segments. store.abs() guarantees containment
+// within the store root but NOT within the intended collection, so an id of
+// "../projects" would resolve inside the root and reach another namespace.
+const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
+
+// The bind stops the network reaching us; this stops a web page doing it. A
+// cross-origin POST with Content-Type: text/plain is a CORS "simple request" -
+// no preflight - so any site the user visits could write to the registry. And
+// /api/run spawns an agent from a GET, which <img src> triggers with no Origin
+// header at all, so Sec-Fetch-Site is the header that actually covers it.
+// Absent headers mean a non-browser client (curl, the test suite): allowed.
+function isCrossOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return true;
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    const local = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    return !local || u.port !== String(PORT);
+  } catch (_) { return true; }
+}
+
+// Host validation defeats DNS rebinding: an attacker domain resolving to
+// 127.0.0.1 arrives same-origin, so Origin alone would let it through.
+function hostAllowed(req) {
+  const h = req.headers.host;
+  if (!h) return true; // HTTP/1.0 and curl send none
+  const name = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  return name === '127.0.0.1' || name === 'localhost' || name === '::1';
+}
+
 function serveStatic(res, file) {
   const full = path.join(PUBLIC, file);
   if (!full.startsWith(PUBLIC) || !fs.existsSync(full)) {
@@ -498,6 +544,12 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
   const p = u.pathname;
 
+  // Before routing: every route, including the SSE agent spawn.
+  if (isCrossOrigin(req) || !hostAllowed(req)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('forbidden');
+  }
+
   if (p === '/' ) return serveStatic(res, 'index.html');
   if (p === '/app.js' || p === '/icons.js' || p === '/style.css') return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
@@ -505,11 +557,6 @@ const server = http.createServer(async (req, res) => {
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
-
-  // Ids reach the store as path segments. store.abs() guarantees containment
-  // within the store root but NOT within the intended collection, so an id of
-  // "../projects" would resolve inside the root and reach another namespace.
-  const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
 
   if (p === '/api/projects' && req.method === 'GET') {
     return sendJson(res, 200, { projects: projects.list(SKILLSPACE_HOME) });
@@ -521,8 +568,12 @@ const server = http.createServer(async (req, res) => {
     try {
       return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
     } catch (e) {
-      // A bad path is the caller's mistake, not a server fault.
-      return sendJson(res, 400, { error: String((e && e.message) || e) });
+      // create() emits exactly two caller-fault shapes; anything else (EACCES
+      // on an unwritable store, for one) is ours, and reporting it as 400 told
+      // the user their input was bad when the disk was.
+      const msg = String((e && e.message) || e);
+      const clientFault = /^path (does not exist|is not a directory)/.test(msg);
+      return sendJson(res, clientFault ? 400 : 500, { error: msg });
     }
   }
 
@@ -613,6 +664,9 @@ const server = http.createServer(async (req, res) => {
     const job = JOBS.get(u.searchParams.get('token') || '');
     if (!job) return sendJson(res, 404, { error: '任务不存在或已过期，请回 SkillSpace 重新生成口令' });
     const body = await readBody(req);
+    // Without this an oversized import reports "experts is empty or malformed"
+    // and flips the job to error on false grounds.
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     const r = importExperts(job, body);
     if (r.error) {
       job.status = 'error';
