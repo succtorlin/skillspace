@@ -335,26 +335,45 @@ test('get returns null for an unknown id, never undefined', () => {
   assert.strictEqual(projects.get(root, 'prj-nope'), null);
 });
 
-test('a directory vanishing between existsSync and statSync is still the callers path error', () => {
+test('a directory vanishing mid-create is still the callers path error', () => {
   const root = tmpRoot();
-  const dir = tmpDir();
-  const resolved = path.resolve(dir);
-  // The TOCTOU window cannot be hit deterministically, so simulate it. This
-  // monkeypatch is process-global and is safe only because create() is fully
-  // synchronous — the same constraint the store suite documents. Do not
-  // introduce an await inside the try.
-  const realStat = fs.statSync;
-  fs.statSync = (p, o) => {
-    if (p === resolved) {
-      const e = new Error('ENOENT: no such file or directory, stat ' + p);
-      e.code = 'ENOENT';
-      throw e;
+  // Both filesystem calls between the existence check and the record must be
+  // covered: wrapping only statSync moved the raw ENOENT down one statement
+  // rather than removing it. The monkeypatch is process-global and is safe
+  // only because create() is fully synchronous - the same constraint the store
+  // suite documents. Do not introduce an await inside the try.
+  for (const fn of ['statSync', 'realpathSync']) {
+    const dir = tmpDir();
+    const real = fs[fn];
+    fs[fn] = (p, ...rest) => {
+      if (path.resolve(p) === path.resolve(dir)) {
+        const e = new Error(`ENOENT: no such file or directory, ${fn} '${p}'`);
+        e.code = 'ENOENT';
+        throw e;
+      }
+      return real(p, ...rest);
+    };
+    try {
+      assert.throws(() => projects.create(root, { path: dir }), /path does not exist/, `via ${fn}`);
+    } finally {
+      fs[fn] = real;
     }
-    return realStat(p, o);
-  };
+  }
+});
+
+test('an ambient GIT_WORK_TREE cannot flip a junk .git into a repo', () => {
+  const d = tmpDir();
+  fs.writeFileSync(path.join(d, '.git'), 'gitdir: /nowhere/that/exists');
+  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  process.env.GIT_DIR = path.join(tmpGitRepo(), '.git');
+  process.env.GIT_WORK_TREE = d;
   try {
-    assert.throws(() => projects.create(root, { path: dir }), /path does not exist/);
+    // the probe must not inherit the ambient override — launching the server
+    // from inside a git hook or `git rebase --exec` is enough to set these
+    assert.strictEqual(projects.detectKind(d), 'dir');
   } finally {
-    fs.statSync = realStat;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
   }
 });
