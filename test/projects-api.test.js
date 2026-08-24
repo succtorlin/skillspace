@@ -488,10 +488,32 @@ test('a top-level array reaches importExperts instead of being coerced away', as
   // is a very plausible shape for the classification results an agent POSTs
   // back. Coercing arrays to {} in readBody made that branch dead code and
   // turned this into a permanent job error.
-  const tok = await json('POST', '/api/experts/job', { dir: os.homedir() });
-  const token = tok.body.token || (tok.body.job && tok.body.job.token);
-  assert.ok(token, `expected a job token, got ${JSON.stringify(tok.body).slice(0, 120)}`);
 
+  // The route reads `dir` from the QUERY STRING, not the body. Sending it in
+  // the body silently fell through to DEFAULT_SKILLS_DIR — the developer's own
+  // ~/.codex/skills — so this test read real machine state and failed on any
+  // fresh checkout or CI runner. A fixture directory keeps it hermetic like
+  // the rest of the suite.
+  const skillsDir = tmp('skillspace-skills-');
+  const oneSkill = path.join(skillsDir, 'demo-skill');
+  fs.mkdirSync(oneSkill);
+  fs.writeFileSync(
+    path.join(oneSkill, 'SKILL.md'),
+    '---\nname: demo-skill\ndescription: A fixture skill.\n---\n\nBody.\n'
+  );
+
+  const tok = await fetch(`${base}/api/experts/job?dir=${encodeURIComponent(skillsDir)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  }).then((x) => x.json());
+  const token = tok.token || (tok.job && tok.job.token);
+  assert.ok(token, `expected a job token, got ${JSON.stringify(tok).slice(0, 160)}`);
+
+  // `skills: []` is load-bearing, not laziness: importExperts rejects the entry
+  // before it reaches saveExperts, so nothing lands in the developer's real
+  // experts.json. Anyone "improving" this to a populated skills array would
+  // silently start writing to that file on every run.
   const r = await fetch(`${base}/api/experts/import?token=${encodeURIComponent(token)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

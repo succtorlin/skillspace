@@ -551,7 +551,13 @@ body {
 }
 
 /* Designed focus ring — one ring, everywhere, from the accent.
-   Replaces the browser default rather than removing it. */
+   Replaces the browser default rather than removing it.
+
+   No border-radius here. It used to force 6px, which outranked each element's
+   own radius and made the corners jump on focus — .src-item 9px→6px,
+   #theme-toggle 9px→6px, .proj-item 8px→6px. `outline` already follows the
+   element's own radius, so the override bought nothing and cost a visible
+   jitter on every focusable control in the app. */
 a:focus-visible,
 button:focus-visible,
 select:focus-visible,
@@ -561,7 +567,6 @@ summary:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
-  border-radius: 6px;
 }
 
 /* Panel anatomy: hairline separation, ground-scale depth.
