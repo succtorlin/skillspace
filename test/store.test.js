@@ -73,3 +73,33 @@ test('abs rejects a sibling directory that merely shares the root prefix', () =>
   );
   assert.ok(!fs.existsSync(path.join(base, 'store-evil')), 'nothing may be written outside the root');
 });
+
+test('writeJson writes via a temp file and renames — never straight to the target', () => {
+  const root = tmpRoot();
+  const target = path.join(root, 'atomic.json');
+  const renames = [];
+  const realRename = fs.renameSync;
+  const realWrite = fs.writeFileSync;
+  const writes = [];
+  fs.renameSync = (from, to) => { renames.push([from, to]); return realRename(from, to); };
+  fs.writeFileSync = (p, d, o) => { writes.push(p); return realWrite(p, d, o); };
+  try {
+    store.writeJson(root, 'atomic.json', { v: 1 });
+  } finally {
+    fs.renameSync = realRename;
+    fs.writeFileSync = realWrite;
+  }
+  // the payload must never be written directly to its final path
+  assert.ok(!writes.includes(target), 'wrote straight to the target — not atomic');
+  assert.strictEqual(writes.length, 1, 'expected exactly one write, to a temp path');
+  assert.ok(writes[0].endsWith('.tmp'), 'the write target should be a .tmp path');
+  // and it must land at the target via rename
+  assert.deepStrictEqual(renames, [[writes[0], target]]);
+  assert.deepStrictEqual(store.readJson(root, 'atomic.json', null), { v: 1 });
+});
+
+test('a root with a trailing separator still works', () => {
+  const root = tmpRoot();
+  store.writeJson(root + path.sep, 'trailing.json', { ok: true });
+  assert.deepStrictEqual(store.readJson(root, 'trailing.json', null), { ok: true });
+});
