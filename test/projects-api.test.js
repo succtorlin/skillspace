@@ -295,8 +295,12 @@ test('the body cap is 1 MiB - not tighter, not looser', async () => {
   const dir = tmp('skillspace-apiwork-');
   // Bulk rides in `note`, an unknown key: create() reads an allowlist and never
   // copies it, so the request is a legitimate registration that happens to be
-  // large. Padding `name` instead would prove nothing - it is truncated to 200
-  // chars, so the record looks identical whatever the cap does.
+  // large. Padding `name` carries the same status codes today - measured, 900
+  // KiB gives 200 and 1.2 MiB gives 413 - so it would pass as written. The
+  // reason to prefer `note` is that safeString truncates name at 200 chars, so
+  // a name-padded body stores identically whatever the cap does: the signal is
+  // gone the moment this test is strengthened to assert on the persisted
+  // record, the way "an oversized body is rejected, not persisted" already is.
   const pad = 'x'.repeat(900 * 1024);
   const under = await fetch(base + '/api/projects', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
