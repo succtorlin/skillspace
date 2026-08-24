@@ -7,7 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
 const projects = require('./lib/projects');
 
@@ -118,16 +118,32 @@ function listSources() {
   return [...builtin, ...custom];
 }
 // macOS 原生「选择文件夹」对话框，返回绝对路径
-function pickFolder() {
-  try {
-    const out = execSync(
-      `osascript -e 'POSIX path of (choose folder with prompt "选择本地 Skill 文件夹")'`,
-      { encoding: 'utf8' }
-    ).trim();
-    return out.replace(/\/$/, '');
-  } catch (_) {
-    return null; // 用户取消或非 macOS
-  }
+// One picker, two callers, two different things being chosen. The prompt comes
+// from this table and never from the request: it is interpolated into an
+// AppleScript string literal, so caller-supplied text would be an injection
+// point into osascript.
+const PICK_PROMPTS = {
+  skill: '选择本地 Skill 文件夹',
+  project: '选择项目目录',
+};
+
+// Async, not execSync. The dialog stays open for as long as the user browses,
+// and a synchronous spawn freezes the whole event loop for that entire time —
+// no other request answered, and any live /api/run SSE stream stalled behind a
+// Finder window. execFile with an argv array also keeps the path off a shell.
+function pickFolder(kind) {
+  const prompt = PICK_PROMPTS[kind] || PICK_PROMPTS.skill;
+  return new Promise((resolve) => {
+    execFile(
+      'osascript',
+      ['-e', `POSIX path of (choose folder with prompt "${prompt}")`],
+      { encoding: 'utf8' },
+      (err, stdout) => {
+        if (err) return resolve(null); // 用户取消或非 macOS
+        resolve(String(stdout).trim().replace(/\/$/, ''));
+      }
+    );
+  });
 }
 
 // ---------- 删除：一律走废纸篓，不做硬删 ----------
@@ -523,6 +539,16 @@ const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
 // /api/run spawns an agent from a GET, which <img src> triggers with no Origin
 // header at all, so Sec-Fetch-Site is the header that actually covers it.
 // Absent headers mean a non-browser client (curl, the test suite): allowed.
+//
+// The two checks are NOT redundant - they cover disjoint request classes, and
+// removing either silently uncovers a class the other never saw. Origin is
+// absent on cross-site GET subresources; Sec-Fetch-* is absent on Safari
+// < 16.4. A browser in that gap sends neither and gets through, because its
+// Host really is 127.0.0.1, so hostAllowed cannot help. Nothing this file owns
+// rests on the weak side - GET is read-only and unreadable cross-origin
+// without CORS headers, a cross-site form POST always carries Origin, and
+// DELETE is preflighted - so the residual lands on /api/run, which is
+// separately filed for review.
 function isCrossOrigin(req) {
   const site = req.headers['sec-fetch-site'];
   if (site && site !== 'same-origin' && site !== 'none') return true;
@@ -767,7 +793,8 @@ async function route(req, res, u, p) {
 
   // 弹出 macOS 原生文件夹选择框，返回绝对路径
   if (p === '/api/pick-dir') {
-    const dir = pickFolder();
+    // 'for' selects a prompt from a fixed table; it is never interpolated.
+    const dir = await pickFolder(u.searchParams.get('for'));
     if (!dir) return sendJson(res, 200, { cancelled: true });
     return sendJson(res, 200, { dir });
   }

@@ -426,3 +426,15 @@ test('an ambient GIT_WORK_TREE cannot flip a junk .git into a repo', () => {
     }
   }
 });
+
+test('a project at the filesystem root still gets a name', () => {
+  // path.basename('/') is '', and safeString only guards the value it is
+  // given, not the fallback — so name: "" reached disk and every UI site had
+  // to compensate by convention. Reachable through the console's own typed
+  // path fallback.
+  const root = tmpRoot();
+  const p = projects.create(root, { path: '/' });
+  assert.notStrictEqual(p.name, '', 'an empty name forces every caller to paper over it');
+  assert.strictEqual(typeof p.name, 'string');
+  assert.ok(p.name.length > 0);
+});

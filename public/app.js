@@ -802,11 +802,16 @@ async function loadProjects(focusId) {
     .map((p, i) => {
       // A name can be empty: registering "/" makes basename() return '' and the
       // row renders zero-width, labelled "移除项目 " and confirmed as 「」.
-      // The path is always present, so it stands in. The empty name itself
-      // originates in lib/ and is out of scope for this file.
+      // lib/projects now guarantees a non-empty name, but the path standing in
+      // costs nothing and keeps the row readable if that ever regresses.
       const label = p.name || p.path;
       return (
+        // data-id as well as data-i: the index is only meaningful against the
+        // array this render closed over, so a path that outlives the render —
+        // deleting a row, then looking for what replaced it — needs the row to
+        // say which project it is.
         `<div class="proj-item${p.id === activeId ? ' active' : ''}" role="button" tabindex="0" data-i="${i}"` +
+        ` data-id="${escAttr(p.id)}"` +
         ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
         `<span class="proj-name">${esc(label)}</span>` +
         // kind is shown, not hidden: it decides how many agents may run at once
@@ -857,6 +862,19 @@ async function loadProjects(focusId) {
   }
 }
 
+// Deleting a row destroys the node the keyboard user was standing on, so focus
+// falls to <body> and they restart from the top of the document. Selection
+// already restores focus; deletion has to as well or the rail is only half
+// operable by keyboard. Land on whatever took the row's place, the last row if
+// it was the last one, and the add button if nothing is left.
+function focusAfterDelete(rowIndex) {
+  if (rowIndex < 0) return;
+  const rows = document.querySelectorAll('.proj-item');
+  const next = rows.length ? rows[Math.min(rowIndex, rows.length - 1)] : null;
+  const target = next || document.getElementById('add-project');
+  if (target && document.contains(target)) target.focus();
+}
+
 // 删项目：只摘掉记录，磁盘上的目录一个文件都不会动。
 // 接口回的 filesKept: true 就是这件事，所以确认框里必须把它讲明白。
 function askDeleteProject(project) {
@@ -870,6 +888,11 @@ function askDeleteProject(project) {
     note: '',
     okText: '移除记录',
     onOk: async () => {
+      // Captured before the re-render destroys the row. loadProjects' focusId
+      // cannot help here — the project it would name no longer exists.
+      const rowIndex = [...document.querySelectorAll('.proj-item')].findIndex(
+        (el) => el.dataset.id === project.id
+      );
       // null means no body at all — the network case, which deleteOutcome
       // reports in Chinese rather than leaking a raw "Failed to fetch".
       const body = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
@@ -881,12 +904,13 @@ function askDeleteProject(project) {
         // A 404 means the record is already gone: the view is stale, not the
         // request. Reconcile so the phantom row disappears instead of failing
         // again on every retry.
-        if (outcome.shouldReload) loadProjects();
+        if (outcome.shouldReload) await loadProjects();
         return;
       }
       if (localStorage.getItem(PROJECT_KEY) === project.id) localStorage.removeItem(PROJECT_KEY);
       toast(`已移除项目：${label}（磁盘文件没动）`);
-      loadProjects();
+      await loadProjects();
+      focusAfterDelete(rowIndex);
     },
   });
 }
@@ -896,7 +920,7 @@ async function addProject() {
   // Windows and the button would appear broken. Fall back to typing a path.
   let dir = null;
   try {
-    const picked = await fetch('/api/pick-dir').then((r) => r.json());
+    const picked = await fetch('/api/pick-dir?for=project').then((r) => r.json());
     dir = picked && picked.dir ? picked.dir : null;
   } catch (_) { /* fall through to the prompt */ }
   if (!dir) {
@@ -915,7 +939,10 @@ async function addProject() {
   }
   if (!r || r.error) return toast('添加项目失败：' + ((r && r.error) || '未知错误'), 'error');
   localStorage.setItem(PROJECT_KEY, r.project.id);
-  toast('已添加项目：' + r.project.name);
+  // Same fallback the row and the confirm dialog use. This was the one site
+  // that missed it, so a project whose name came out empty produced a toast
+  // that named nothing at all.
+  toast('已添加项目：' + (r.project.name || r.project.path));
   loadProjects();
 }
 
