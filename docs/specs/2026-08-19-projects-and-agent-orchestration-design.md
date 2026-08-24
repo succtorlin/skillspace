@@ -44,7 +44,8 @@ Three objects. Everything else is derived.
 
 ```
 { id, name, kind: "git" | "dir", path, branch?, skillSources: [dir],
-  agents: [agentId], concurrency: number, createdAt }
+  agents: [agentId], concurrency: number, createdAt,
+  budget: { maxOrdersPerGoal, orderTimeoutMs, maxOrdersPerDay } }   // §8a
 ```
 
 `kind` is detected, not declared: a `.git` directory present → `git`, else `dir`.
@@ -181,10 +182,47 @@ Three, all on the existing console's token system and grammar:
 The card wall stays. It becomes the way to compose a one-off order against the
 active project, not the whole application.
 
+## 8a. Budget controls — structural, not monetary
+
+SkillSpace **cannot see dollars.** Neither `claude -p` nor `opencode run`
+reports cost in a stable, parseable form, and a cap that claimed to limit money
+would be a lie the first time an agent's output format changed. So the limits
+are structural — things the dispatcher genuinely controls — and they are
+described to the user in exactly those terms.
+
+Per project, with defaults:
+
+| Control | Default | Enforced where |
+|---|---|---|
+| `maxOrdersPerGoal` | 12 | PM decomposition — a plan exceeding it is rejected, not truncated |
+| `orderTimeoutMs` | 900000 (15 min) | SIGTERM at the limit, SIGKILL 5s later |
+| `maxConcurrent` | 2 (git) / 1 (dir) | scheduler |
+| `maxOrdersPerDay` | 100 | dispatch, counted from persisted orders |
+
+Two of these deserve their reasoning stated:
+
+**A PM plan over `maxOrdersPerGoal` is rejected whole, never truncated.** Running
+the first 12 of a 30-order plan produces a half-executed goal that looks complete
+— worse than refusing, because nothing signals the missing 18. The goal fails
+with the full plan retained so the human can narrow the goal and retry.
+
+**`orderTimeoutMs` is the only thing standing between a stuck agent and an
+unbounded bill.** An agent that hangs holds a worktree and a slot forever. The
+timeout is a correctness control, not a convenience.
+
+A killed-by-timeout order is `failed` with `error: "timeout"`, distinct from an
+agent that exited non-zero on its own. The two mean different things and are not
+collapsed.
+
+**Still not covered, and the user should know:** these bound the *number and
+duration* of agent runs, not their token usage. A single order within the timeout
+can still be expensive. Real cost control needs per-agent accounting that no
+agent CLI currently exposes uniformly.
+
 ## 9. What v1 does not do, stated plainly
 
-- **No spend cap.** N agents on long tasks cost real money and nothing stops it.
-  Concurrency is the only limit, and it is a weak one.
+- **No monetary spend cap.** Structural limits only — see §8a. A single
+  long-running order inside the timeout can still cost a lot.
 - **No approval gate.** A dispatched worker modifies its worktree immediately.
 - **No `node_modules` reuse** across worktrees (§5).
 - **No multi-user, no auth.** Anything reachable on `localhost:4177` can dispatch
@@ -211,6 +249,11 @@ active project, not the whole application.
   `dir` project refuses concurrency > 1.
 - Lifecycle: exit 0 → `succeeded`; non-zero → `failed`; cancel → SIGTERM path.
 - PM parse failure → goal `failed`, raw output retained, no retry.
+- Budget (§8a): a PM plan over `maxOrdersPerGoal` fails the goal whole and
+  retains the plan — assert nothing was dispatched; an order exceeding
+  `orderTimeoutMs` lands as `failed` with `error: "timeout"`, distinct from a
+  non-zero exit; `maxOrdersPerDay` counts from persisted orders and survives
+  restart.
 - End-to-end against a real agent (`opencode` works today; `claude` needs re-auth).
 
 ## 12. Resolved
