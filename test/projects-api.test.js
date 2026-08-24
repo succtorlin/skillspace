@@ -204,14 +204,19 @@ test('a nested path is not claimed by the project DELETE route', async () => {
 
 test('an oversized body is rejected, not persisted', async () => {
   const dir = tmp('skillspace-apiwork-');
+  const before = (await json('GET', '/api/projects')).body.projects.length;
   const r = await fetch(base + '/api/projects', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024), path: dir }),
   });
   assert.strictEqual(r.status, 413);
-  const l = await json('GET', '/api/projects');
-  assert.ok(!l.body.projects.some((p) => p.name.length > 1024), 'oversized record was persisted');
+  // Count, not name length: safeString truncates at MAX_NAME (200), so a
+  // length threshold here is unfalsifiable - no persisted record can exceed
+  // it whether the cap works or not. This assertion is the one that fails if
+  // an oversized body ever reaches the store.
+  const after = (await json('GET', '/api/projects')).body.projects.length;
+  assert.strictEqual(after, before, 'an oversized body created a record');
 });
 
 test('the oversize sentinel cannot be forged by a caller', async () => {
