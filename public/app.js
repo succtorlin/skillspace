@@ -752,17 +752,70 @@ function escAttr(s) {
   return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-async function loadProjects() {
+// ---------- 纯判断函数 ----------
+// No DOM, no storage, no fetch: these decide *what* to show, the renderer
+// decides how. Kept together and dependency-free so they can be lifted into a
+// shared dual-mode module and table-tested without a DOM harness.
+
+// What the rail should show for a given /api/projects response. `ok` is
+// response.ok; `data` is the parsed body, or null if there was none.
+// A structured error from a well-behaved server must NOT read as "empty":
+// checking only Array.isArray(data.projects) sent a 500 {"error":…} into the
+// empty state, which told the user to add projects they already have. The API
+// accepts the same path twice, so following that advice duplicates records.
+function railState(ok, data) {
+  if (!ok || !data || data.error || !Array.isArray(data.projects)) {
+    return { kind: 'error', projects: [] };
+  }
+  if (!data.projects.length) return { kind: 'empty', projects: [] };
+  return { kind: 'list', projects: data.projects };
+}
+
+// What a DELETE response means. `body` is the parsed body, or null when the
+// request produced none at all (unreachable server / unparseable response).
+// shouldReload distinguishes the two failure kinds: a 404 says the record is
+// already gone, so the view is stale and must reconcile or the phantom row
+// keeps 404ing on every retry. An unreachable server says nothing about the
+// record, so re-rendering would only trade a good list for an error box.
+function deleteOutcome(body) {
+  if (body === null) {
+    return { ok: false, message: '删除失败：无法连接服务器', shouldReload: false };
+  }
+  if (!body || body.error || body.ok !== true) {
+    return {
+      ok: false,
+      message: '删除失败：' + ((body && body.error) || '未知错误'),
+      shouldReload: true,
+    };
+  }
+  return { ok: true, message: null, shouldReload: true };
+}
+
+// focusId: the project that was just acted on, if this render was triggered by
+// an explicit selection. Never passed on the boot render, which must not steal
+// focus from the page.
+async function loadProjects(focusId) {
   const list = document.getElementById('project-list');
   if (!list) return;
-  let data = { projects: [] };
+  let data = null;
+  let ok = false;
   try {
-    data = await fetch('/api/projects').then((r) => r.json());
+    const res = await fetch('/api/projects');
+    ok = res.ok;
+    data = await res.json();
   } catch (_) {
+    data = null;
+  }
+
+  const st = railState(ok, data);
+  if (st.kind === 'error') {
+    // Deliberately does not touch the stored selection: a failed load is not
+    // evidence the project is gone, and clearing here would discard a valid
+    // selection every time the server hiccups.
     list.innerHTML = '<div class="proj-empty">项目列表加载失败</div>';
     return;
   }
-  const projects = Array.isArray(data.projects) ? data.projects : [];
+  const projects = st.projects;
 
   // A stored id can outlive the project it names — the record may have been
   // deleted in another tab or by a direct API call. Reconcile BEFORE the
@@ -774,7 +827,7 @@ async function loadProjects() {
     localStorage.removeItem(PROJECT_KEY);
   }
 
-  if (!projects.length) {
+  if (st.kind === 'empty') {
     list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
     return;
   }
@@ -783,24 +836,31 @@ async function loadProjects() {
   // a <button> may not contain another one, and the delete affordance has to be
   // focusable to be reachable by keyboard. Same structure as .src-item.
   list.innerHTML = projects
-    .map(
-      (p, i) =>
+    .map((p, i) => {
+      // A name can be empty: registering "/" makes basename() return '' and the
+      // row renders zero-width, labelled "移除项目 " and confirmed as 「」.
+      // The path is always present, so it stands in. The empty name itself
+      // originates in lib/ and is out of scope for this file.
+      const label = p.name || p.path;
+      return (
         `<div class="proj-item${p.id === activeId ? ' active' : ''}" role="button" tabindex="0" data-i="${i}"` +
         ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
-        `<span class="proj-name">${esc(p.name)}</span>` +
+        `<span class="proj-name">${esc(label)}</span>` +
         // kind is shown, not hidden: it decides how many agents may run at once
         `<span class="proj-kind">${esc(p.kind)}</span>` +
         // the glyph is aria-hidden, so the control needs a label of its own
         `<button class="proj-del" data-del="${i}" title="移除这个项目"` +
-        ` aria-label="移除项目 ${escAttr(p.name)}">${icon('close', 13)}</button>` +
+        ` aria-label="移除项目 ${escAttr(label)}">${icon('close', 13)}</button>` +
         `</div>`
-    )
+      );
+    })
     .join('');
 
   list.querySelectorAll('.proj-item').forEach((el) => {
     const select = () => {
-      localStorage.setItem(PROJECT_KEY, projects[+el.dataset.i].id);
-      loadProjects();
+      const id = projects[+el.dataset.i].id;
+      localStorage.setItem(PROJECT_KEY, id);
+      loadProjects(id);
     };
     el.addEventListener('click', select);
     // role="button" on a div gets no Enter/Space activation for free. The row
@@ -821,29 +881,48 @@ async function loadProjects() {
       askDeleteProject(projects[+el.dataset.del]);
     })
   );
+
+  // Replacing innerHTML destroys the focused node, so selecting a row dropped
+  // focus to <body> - the keyboard user was returned to the top of the page
+  // after every selection, which defeats the point of making the row operable
+  // by keyboard at all. Same document.contains staleness guard the dialog
+  // machinery uses for lastTrigger.
+  if (focusId) {
+    const idx = projects.findIndex((p) => p.id === focusId);
+    const row = idx >= 0 ? list.querySelectorAll('.proj-item')[idx] : null;
+    if (row && document.contains(row)) row.focus();
+  }
 }
 
 // 删项目：只摘掉记录，磁盘上的目录一个文件都不会动。
 // 接口回的 filesKept: true 就是这件事，所以确认框里必须把它讲明白。
 function askDeleteProject(project) {
   if (!project) return;
+  // Same empty-name fallback as the row: 删除项目「」 names nothing.
+  const label = project.name || project.path;
   askConfirm({
-    title: `删除项目「${project.name}」`,
+    title: `删除项目「${label}」`,
     body: '只从列表里移除这条记录，磁盘上的文件不会被删除。',
     target: project.path,
     note: '',
     okText: '移除记录',
     onOk: async () => {
-      const r = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
+      // null means no body at all — the network case, which deleteOutcome
+      // reports in Chinese rather than leaking a raw "Failed to fetch".
+      const body = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
         .then((x) => x.json())
-        .catch((e) => ({ error: String((e && e.message) || e) }));
-      // The route answers 404 for an unknown id on purpose; surface that rather
-      // than reporting a removal that never happened.
-      if (!r || r.error || r.ok !== true) {
-        return toast('删除失败：' + ((r && r.error) || '未知错误'), 'error');
+        .catch(() => null);
+      const outcome = deleteOutcome(body);
+      if (!outcome.ok) {
+        toast(outcome.message, 'error');
+        // A 404 means the record is already gone: the view is stale, not the
+        // request. Reconcile so the phantom row disappears instead of failing
+        // again on every retry.
+        if (outcome.shouldReload) loadProjects();
+        return;
       }
       if (localStorage.getItem(PROJECT_KEY) === project.id) localStorage.removeItem(PROJECT_KEY);
-      toast(`已移除项目：${project.name}（磁盘文件没动）`);
+      toast(`已移除项目：${label}（磁盘文件没动）`);
       loadProjects();
     },
   });

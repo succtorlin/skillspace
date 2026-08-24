@@ -695,7 +695,6 @@ summary:focus-visible,
 .proj-item.active {
   background: var(--ground-2); color: var(--ink); border-color: var(--hair-lit);
 }
-.proj-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .proj-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proj-kind {
   margin-left: auto; font-family: var(--face-mono); font-size: 10px;
@@ -714,9 +713,9 @@ summary:focus-visible,
    leaves the control unreachable for anyone arriving by keyboard. */
 .proj-item:hover .proj-del { opacity: .7; }
 .proj-del:hover { color: var(--red); opacity: 1; }
-.proj-del:focus-visible {
-  opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px;
-}
+/* Only the reveal: the ring itself comes from the global focus-visible block,
+   so this must not redeclare outline or the two would drift apart. */
+.proj-del:focus-visible { opacity: 1; }
 
 /* The sidebar holds two unbounded lists (sources and projects) above controls
    that must stay reachable. Without this, overflow pushes 添加本地目录 and the
