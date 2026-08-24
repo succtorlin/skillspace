@@ -111,3 +111,96 @@ test('projects survive a reload from disk', () => {
   const reloaded = projects.list(root);
   assert.strictEqual(reloaded[0].name, 'Persisted');
 });
+
+test('a relative path is resolved to absolute, so kind cannot drift with the cwd', () => {
+  const root = tmpRoot();
+  const repo = tmpGitRepo();
+  const cwd = process.cwd();
+  let p;
+  try {
+    process.chdir(repo);
+    p = projects.create(root, { path: '.' });
+  } finally {
+    process.chdir(cwd);
+  }
+  assert.strictEqual(p.path, fs.realpathSync(repo));
+  assert.ok(path.isAbsolute(p.path));
+  assert.notStrictEqual(p.name, '.');
+  // the stored path must still be the git repo from any cwd
+  assert.strictEqual(projects.detectKind(projects.get(root, p.id).path), 'git');
+});
+
+test('ids do not collide', () => {
+  const ids = new Set();
+  for (let i = 0; i < 50000; i++) ids.add(projects.newId());
+  assert.strictEqual(ids.size, 50000);
+});
+
+test('concurrency is coerced to a sane positive integer', () => {
+  const root = tmpRoot();
+  const mk = (c) => projects.create(root, { path: tmpGitRepo(), concurrency: c }).concurrency;
+  assert.strictEqual(mk(0), 2);
+  assert.strictEqual(mk(-5), 2);
+  assert.strictEqual(mk('8'), 8);
+  assert.strictEqual(mk(1.5), 1);
+  assert.strictEqual(mk(9999), 8);
+  assert.strictEqual(mk({}), 2);
+  assert.strictEqual(mk(undefined), 2);
+});
+
+test('a dir project stays at 1 whatever is passed', () => {
+  const root = tmpRoot();
+  for (const c of [8, '99', -1, {}]) {
+    assert.strictEqual(projects.create(root, { path: tmpDir(), concurrency: c }).concurrency, 1);
+  }
+});
+
+test('budget rejects unknown keys and out-of-range values', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, {
+    path: tmpDir(),
+    budget: { orderTimeoutMs: 0, maxOrdersPerDay: -1, maxOrdersPerGoal: 'lots', injected: 'extra' },
+  });
+  assert.strictEqual(p.budget.orderTimeoutMs, 900000);
+  assert.strictEqual(p.budget.maxOrdersPerDay, 100);
+  assert.strictEqual(p.budget.maxOrdersPerGoal, 12);
+  assert.strictEqual(p.budget.injected, undefined);
+  assert.deepStrictEqual(Object.keys(p.budget).sort(), Object.keys(projects.DEFAULT_BUDGET).sort());
+});
+
+test('a valid budget override is honoured', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, { path: tmpDir(), budget: { maxOrdersPerGoal: 5 } });
+  assert.strictEqual(p.budget.maxOrdersPerGoal, 5);
+  assert.strictEqual(p.budget.maxOrdersPerDay, 100);
+});
+
+test('a directory with a junk .git file is not treated as a repository', () => {
+  const d = tmpDir();
+  fs.writeFileSync(path.join(d, '.git'), 'gitdir: /nowhere/that/exists');
+  assert.strictEqual(projects.detectKind(d), 'dir');
+});
+
+test('a subdirectory of a repo is not a repo root', () => {
+  const repo = tmpGitRepo();
+  const sub = path.join(repo, 'src');
+  fs.mkdirSync(sub);
+  assert.strictEqual(projects.detectKind(sub), 'dir');
+});
+
+test('a linked git worktree is still git', () => {
+  const repo = tmpGitRepo();
+  execSync('git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init', { cwd: repo });
+  const wt = path.join(tmpDir(), 'wt');
+  execSync(`git worktree add -q -b probe "${wt}"`, { cwd: repo });
+  assert.strictEqual(projects.detectKind(wt), 'git');
+});
+
+test('remove reports whether a record actually matched', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, { path: tmpDir() });
+  assert.strictEqual(projects.remove(root, 'prj-nope'), false);
+  assert.strictEqual(projects.list(root).length, 1);
+  assert.strictEqual(projects.remove(root, p.id), true);
+  assert.strictEqual(projects.list(root).length, 0);
+});
