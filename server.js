@@ -441,11 +441,36 @@ function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
+// 1 MiB. A project record is a few hundred bytes; anything approaching this is
+// a mistake or an attack. The cap lives here rather than per-route because a
+// body this size is already a problem before anyone decides what to do with it
+// - and since Task 3 these bytes can become durable state that every later
+// list request re-reads.
+const MAX_BODY = 1024 * 1024;
+
+// A Symbol key, not a string like "__oversize": a string sentinel is forgeable.
+// {"__oversize":true} is 22 bytes of perfectly legal JSON, and a caller sending
+// it under the limit got a spurious 413 (verified). A Symbol cannot arrive from
+// JSON.parse at all. It also keeps the resolved value an ordinary object, so
+// the routes that do not check it degrade to their existing defaults instead of
+// throwing - resolving null here crashed the whole process on the first
+// oversize POST to /api/experts, because String(body.name) on null throws out
+// of an async handler and takes the server down.
+const OVERSIZE = Symbol('oversize');
+
 function readBody(req) {
   return new Promise((resolve) => {
     let b = '';
-    req.on('data', (c) => (b += c));
-    req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); } });
+    let over = false;
+    req.on('data', (c) => {
+      if (over) return;
+      b += c;
+      if (b.length > MAX_BODY) { over = true; b = ''; }
+    });
+    req.on('end', () => {
+      if (over) return resolve({ [OVERSIZE]: true });
+      try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); }
+    });
   });
 }
 function serveStatic(res, file) {
@@ -482,6 +507,7 @@ const server = http.createServer(async (req, res) => {
 
   if (p === '/api/projects' && req.method === 'POST') {
     const body = await readBody(req);
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     try {
       return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
     } catch (e) {
@@ -490,13 +516,17 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (p.startsWith('/api/projects/') && req.method === 'DELETE') {
+  // Single trailing segment only: startsWith would also swallow nested routes
+  // like /api/projects/:id/goals/:goalId, answering "invalid project id" for a
+  // path this handler was never meant to own.
+  const delMatch = req.method === 'DELETE' && p.match(/^\/api\/projects\/([^/]+)$/);
+  if (delMatch) {
     let id;
     try {
       // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
-      // still carrying a separator into the store. A malformed escape is not a
-      // decodable id at all, so it is rejected the same way a bad one is.
-      id = decodeURIComponent(p.slice('/api/projects/'.length));
+      // still carrying a separator into the store. A malformed escape like %ZZ
+      // is not a decodable id at all, so it is rejected the same way a bad one is.
+      id = decodeURIComponent(delMatch[1]);
     } catch (_) {
       return sendJson(res, 400, { error: 'invalid project id' });
     }
@@ -676,7 +706,13 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
-server.listen(PORT, () => {
+// Loopback only. This process dispatches AI agents with write access to any
+// registered directory and has no authentication whatsoever - the design
+// assumes "local, single user", and listen(PORT) with no host quietly broke
+// that assumption by binding every interface. Overridable for anyone who
+// deliberately wants otherwise, but never by default.
+const HOST_BIND = process.env.HOST || '127.0.0.1';
+server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
   console.log(`  → http://localhost:${PORT}`);
   for (const s of listSources()) {

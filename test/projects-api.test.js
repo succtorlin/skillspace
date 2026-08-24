@@ -126,12 +126,72 @@ test('DELETE of an unknown id is a 404, not a false success', async () => {
 });
 
 test('DELETE rejects an id that is not a plain identifier', async () => {
-  for (const bad of ['..', '../projects', 'a/b', 'a%2Fb', '']) {
+  // These reach the handler intact - new URL() leaves percent-escapes encoded -
+  // so the route itself is what rejects them. Asserting 400 exactly, because
+  // "400 or 404" also passes against a route that does not exist at all, which
+  // is how this test passed vacuously before the handler was written.
+  for (const bad of ['a%2Fb', '%ZZ']) {
     const r = await fetch(base + '/api/projects/' + bad, { method: 'DELETE' });
-    assert.ok(r.status === 400 || r.status === 404, `id ${JSON.stringify(bad)} got ${r.status}`);
+    assert.strictEqual(r.status, 400, `id ${JSON.stringify(bad)} got ${r.status}`);
   }
+
+  // Dot-segments never get that far: new URL() resolves them before the handler
+  // sees a pathname, so "/api/projects/.." arrives as "/api/" and
+  // "/api/projects/../projects" as "/api/projects", neither of which this route
+  // matches. They 404 from the catch-all rather than 400. The property worth
+  // pinning is that they are never ACCEPTED, so assert what must never happen.
+  for (const bad of ['..', '../projects', '']) {
+    const r = await fetch(base + '/api/projects/' + bad, { method: 'DELETE' });
+    assert.notStrictEqual(r.status, 200, `id ${JSON.stringify(bad)} was accepted`);
+    assert.strictEqual(r.status, 404, `id ${JSON.stringify(bad)} got ${r.status}`);
+  }
+
   // and nothing outside the store was touched
   assert.ok(fs.existsSync(storeRoot));
+});
+
+test('a nested path is not claimed by the project DELETE route', async () => {
+  const r = await fetch(base + '/api/projects/prj-abc/goals/g-1', { method: 'DELETE' });
+  // not this route's business - it must fall through, not answer "invalid id"
+  assert.strictEqual(r.status, 404);
+  const txt = await r.text();
+  assert.ok(!txt.includes('invalid project id'), 'nested route was swallowed');
+});
+
+test('an oversized body is rejected, not persisted', async () => {
+  const dir = tmp('skillspace-apiwork-');
+  const r = await fetch(base + '/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024), path: dir }),
+  });
+  assert.strictEqual(r.status, 413);
+  const l = await json('GET', '/api/projects');
+  assert.ok(!l.body.projects.some((p) => p.name.length > 1024), 'oversized record was persisted');
+});
+
+test('the oversize sentinel cannot be forged by a caller', async () => {
+  // A string sentinel would make this 22-byte body a spurious 413. The Symbol
+  // used instead cannot arrive through JSON.parse.
+  const dir = tmp('skillspace-apiwork-');
+  const r = await json('POST', '/api/projects', { name: 'Forged', path: dir, __oversize: true });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.project.name, 'Forged');
+});
+
+test('an oversized body does not kill the server', async () => {
+  // Resolving null for oversize crashed the process here: an un-updated route
+  // reads body.name and throws out of the async handler. Every route must
+  // survive an oversize body, whether or not it checks for one.
+  const r = await fetch(base + '/api/experts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'x'.repeat(2 * 1024 * 1024) }),
+  });
+  assert.ok(r.status < 500, `oversize body to /api/experts got ${r.status}`);
+  // still serving afterwards
+  const after = await json('GET', '/api/projects');
+  assert.strictEqual(after.status, 200);
 });
 
 test('records are written under SKILLSPACE_HOME, not the real home directory', async () => {
