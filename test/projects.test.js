@@ -262,3 +262,99 @@ test('a budget override cannot poison the defaults for later projects', () => {
   const later = projects.create(root, { path: tmpDir() });
   assert.strictEqual(later.budget.maxOrdersPerGoal, 12);
 });
+
+test('caller-supplied fields with impossible types do not reach disk', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, {
+    path: tmpDir(),
+    name: { evil: 1 },
+    branch: 42,
+    skillSources: 7,
+    agents: 'not-an-array',
+  });
+  assert.strictEqual(typeof p.name, 'string');
+  assert.notDeepStrictEqual(p.name, { evil: 1 });
+  assert.strictEqual(p.branch, null);
+  assert.deepStrictEqual(p.skillSources, []);
+  assert.deepStrictEqual(p.agents, []);
+  // and it survives the round-trip that way
+  assert.deepStrictEqual(projects.get(root, p.id).agents, []);
+});
+
+test('a mixed array keeps only the usable strings', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, { path: tmpDir(), agents: ['claude', 42, null, 'opencode', ''] });
+  assert.deepStrictEqual(p.agents, ['claude', 'opencode']);
+});
+
+test('an overlong name is truncated rather than stored whole', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, { path: tmpDir(), name: 'x'.repeat(100000) });
+  assert.strictEqual(p.name.length, 200);
+});
+
+test('budget values are bounded above as well as below', () => {
+  const root = tmpRoot();
+  const p = projects.create(root, {
+    path: tmpDir(),
+    budget: { orderTimeoutMs: 1e15, maxOrdersPerGoal: 1e300, maxOrdersPerDay: 9e15 },
+  });
+  assert.strictEqual(p.budget.orderTimeoutMs, 24 * 60 * 60 * 1000);
+  assert.strictEqual(p.budget.maxOrdersPerGoal, 500);
+  assert.strictEqual(p.budget.maxOrdersPerDay, 10000);
+});
+
+test('a non-string path is the callers error, not a TypeError', () => {
+  const root = tmpRoot();
+  for (const bad of [123, [], {}, true]) {
+    assert.throws(() => projects.create(root, { path: bad }), /path does not exist/);
+  }
+  assert.throws(() => projects.create(root, null), /path does not exist/);
+  assert.throws(() => projects.create(root, undefined), /path does not exist/);
+});
+
+test('a symlink and its target resolve to the same stored path', () => {
+  const root = tmpRoot();
+  const repo = tmpGitRepo();
+  const link = path.join(tmpDir(), 'link');
+  fs.symlinkSync(repo, link);
+  const a = projects.create(root, { path: repo });
+  const b = projects.create(root, { path: link });
+  assert.strictEqual(a.path, b.path);
+});
+
+test('the default name is the directory basename', () => {
+  const root = tmpRoot();
+  const dir = tmpDir();
+  assert.strictEqual(projects.create(root, { path: dir }).name, path.basename(dir));
+});
+
+test('get returns null for an unknown id, never undefined', () => {
+  const root = tmpRoot();
+  projects.create(root, { path: tmpDir() });
+  assert.strictEqual(projects.get(root, 'prj-nope'), null);
+});
+
+test('a directory vanishing between existsSync and statSync is still the callers path error', () => {
+  const root = tmpRoot();
+  const dir = tmpDir();
+  const resolved = path.resolve(dir);
+  // The TOCTOU window cannot be hit deterministically, so simulate it. This
+  // monkeypatch is process-global and is safe only because create() is fully
+  // synchronous — the same constraint the store suite documents. Do not
+  // introduce an await inside the try.
+  const realStat = fs.statSync;
+  fs.statSync = (p, o) => {
+    if (p === resolved) {
+      const e = new Error('ENOENT: no such file or directory, stat ' + p);
+      e.code = 'ENOENT';
+      throw e;
+    }
+    return realStat(p, o);
+  };
+  try {
+    assert.throws(() => projects.create(root, { path: dir }), /path does not exist/);
+  } finally {
+    fs.statSync = realStat;
+  }
+});
