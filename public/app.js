@@ -63,6 +63,9 @@ async function boot() {
     : '<option value="">未检测到 agent</option>';
   wireNav();
   await loadSources();
+  loadProjects();
+  const addProjBtn = document.getElementById('add-project');
+  if (addProjBtn) addProjBtn.addEventListener('click', addProject);
 }
 
 // ---------- 删除二次确认 ----------
@@ -737,6 +740,90 @@ $('#search').addEventListener('input', (e) => { state.q = e.target.value; applyF
 
 function esc(s) {
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ---------- 项目 ----------
+const PROJECT_KEY = 'skillspace-project';
+
+// esc() escapes & < > but NOT quotes, so it is unsafe inside an attribute:
+// a path containing a double quote would close the attribute and let anything
+// after it be parsed as markup. Attribute values go through this instead.
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function loadProjects() {
+  const list = document.getElementById('project-list');
+  if (!list) return;
+  let data = { projects: [] };
+  try {
+    data = await fetch('/api/projects').then((r) => r.json());
+  } catch (_) {
+    list.innerHTML = '<div class="proj-empty">项目列表加载失败</div>';
+    return;
+  }
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+
+  if (!projects.length) {
+    list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
+    return;
+  }
+
+  // A stored id can outlive the project it names — the record may have been
+  // deleted in another tab or by a direct API call. Fall back rather than
+  // leaving a selection that points at nothing.
+  let activeId = localStorage.getItem(PROJECT_KEY) || '';
+  if (!projects.some((p) => p.id === activeId)) {
+    activeId = '';
+    localStorage.removeItem(PROJECT_KEY);
+  }
+
+  list.innerHTML = projects
+    .map(
+      (p, i) =>
+        `<button class="proj-item${p.id === activeId ? ' active' : ''}" data-i="${i}"` +
+        ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
+        `<span class="proj-name">${esc(p.name)}</span>` +
+        // kind is shown, not hidden: it decides how many agents may run at once
+        `<span class="proj-kind">${esc(p.kind)}</span>` +
+        `</button>`
+    )
+    .join('');
+
+  list.querySelectorAll('.proj-item').forEach((el) =>
+    el.addEventListener('click', () => {
+      localStorage.setItem(PROJECT_KEY, projects[+el.dataset.i].id);
+      loadProjects();
+    })
+  );
+}
+
+async function addProject() {
+  // /api/pick-dir shells out to osascript, so it yields nothing on Linux or
+  // Windows and the button would appear broken. Fall back to typing a path.
+  let dir = null;
+  try {
+    const picked = await fetch('/api/pick-dir').then((r) => r.json());
+    dir = picked && picked.dir ? picked.dir : null;
+  } catch (_) { /* fall through to the prompt */ }
+  if (!dir) {
+    dir = (window.prompt('项目目录的完整路径：') || '').trim();
+    if (!dir) return;
+  }
+  let r;
+  try {
+    r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir }),
+    }).then((x) => x.json());
+  } catch (_) {
+    return toast('添加项目失败：无法连接服务器', 'error');
+  }
+  if (!r || r.error) return toast('添加项目失败：' + ((r && r.error) || '未知错误'), 'error');
+  localStorage.setItem(PROJECT_KEY, r.project.id);
+  toast('已添加项目：' + r.project.name);
+  loadProjects();
 }
 
 boot();

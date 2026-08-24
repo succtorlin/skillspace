@@ -682,3 +682,26 @@ summary:focus-visible,
 @media (max-width: 560px) {
   .topbar, .toolbar { margin-left: 6px; margin-right: 6px; }
 }
+
+/* Project rail — same grammar as the source list, one ground step apart so the
+   two rails read as siblings rather than as one undifferentiated column. */
+.proj-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 9px; border-radius: 8px; cursor: pointer;
+  background: transparent; border: 1px solid transparent;
+  color: var(--ink-2); font-size: 13px; text-align: left;
+}
+.proj-item:hover { background: var(--ground-2); color: var(--ink); }
+.proj-item.active {
+  background: var(--ground-2); color: var(--ink); border-color: var(--hair-lit);
+}
+.proj-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.proj-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-kind {
+  margin-left: auto; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2);
+}
+.proj-item.active .proj-kind { color: var(--accent); }
+.proj-empty {
+  padding: 7px 9px; font-size: 12px; color: var(--muted); line-height: 1.5;
+}
