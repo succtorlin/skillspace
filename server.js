@@ -12,6 +12,10 @@ const { URL } = require('url');
 const projects = require('./lib/projects');
 
 const PORT = process.env.PORT || 4177;
+// Declared here rather than beside listen(), because the Host-header guard
+// needs it too and one default in two places would drift.
+const HOST_BIND = process.env.HOST || '127.0.0.1';
+const BIND_IS_LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST_BIND);
 const PUBLIC = path.join(__dirname, 'public');
 const HOME = os.homedir();
 
@@ -458,6 +462,11 @@ const MAX_BODY = 1024 * 1024;
 // killed the process, so the sentinel chosen to prevent a crash became one.
 const OVERSIZE = Symbol('oversize');
 
+// Distinct from an empty body: resolving {} conflated "the client sent
+// nothing" with "the client gave up", and /api/experts writes on empty input,
+// so navigating away mid-request persisted a defaulted 未命名专家.
+const ABORTED = Symbol('aborted');
+
 function readBody(req) {
   return new Promise((resolve) => {
     // Buffers, concatenated and decoded ONCE at the end. `b += chunk` coerced
@@ -476,22 +485,29 @@ function readBody(req) {
       chunks.push(c);
     });
     // A client that hangs up mid-body never emits 'end', so without these the
-    // promise never settles and the handler is wedged forever.
-    req.on('aborted', () => resolve({}));
-    req.on('error', () => resolve({}));
+    // promise never settles and the handler is wedged forever. resolve() is
+    // idempotent, so a late 'end' after an abort is harmless.
+    req.on('aborted', () => resolve({ [ABORTED]: true }));
+    req.on('error', () => resolve({ [ABORTED]: true }));
     req.on('end', () => {
       if (over) return resolve({ [OVERSIZE]: true });
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
       let parsed;
       try { parsed = JSON.parse(raw); } catch (_) { return resolve({}); }
-      // JSON.parse returns null, numbers, strings and arrays too - and "null"
-      // is truthy, so the old ternary handed null straight to the callers,
-      // where body[OVERSIZE] threw and took the process with it. Every caller
-      // treats the body as a record; guarantee one here rather than asking
-      // three call sites to remember. Arrays coerce too: body.name on an array
-      // is silently undefined, which is a defaulted record, not an error.
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return resolve({});
+      // JSON.parse returns null, numbers and strings too - and "null" is
+      // truthy, so the old ternary handed null straight to the callers, where
+      // body[OVERSIZE] threw and took the process with it. Every caller treats
+      // the body as an object; guarantee one here rather than asking three
+      // call sites to remember.
+      //
+      // Arrays pass through: importExperts explicitly accepts a top-level
+      // array, which is a very plausible shape for the agent classification
+      // results POSTed to that callback. Coercing them to {} made that branch
+      // dead code. They are safe at the other two call sites for the same
+      // reason a plain {} is - reading .name off an array yields undefined and
+      // a defaulted record, never a throw.
+      if (!parsed || typeof parsed !== 'object') return resolve({});
       return resolve(parsed);
     });
   });
@@ -520,9 +536,14 @@ function isCrossOrigin(req) {
   } catch (_) { return true; }
 }
 
-// Host validation defeats DNS rebinding: an attacker domain resolving to
-// 127.0.0.1 arrives same-origin, so Origin alone would let it through.
+// Host validation defeats DNS rebinding, which only matters while we are
+// loopback-only. Binding a non-loopback HOST is a deliberate opt-out of that
+// protection: enforcing the loopback allowlist there would bind every
+// interface and then 403 every request that used it, which is not a security
+// posture, just a confusing one. isCrossOrigin stays unconditional - that is
+// CSRF defence and applies whatever we are bound to.
 function hostAllowed(req) {
+  if (!BIND_IS_LOOPBACK) return true;
   const h = req.headers.host;
   if (!h) return true; // HTTP/1.0 and curl send none
   const name = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
@@ -564,6 +585,7 @@ const server = http.createServer(async (req, res) => {
 
   if (p === '/api/projects' && req.method === 'POST') {
     const body = await readBody(req);
+    if (body[ABORTED]) return; // no client left to answer, and nothing to store
     if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
     try {
       return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
@@ -618,6 +640,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (p === '/api/experts' && req.method === 'POST') {
     const body = await readBody(req);
+    if (body[ABORTED]) return; // else a hung-up upload leaves a defaulted expert
     // Before body.name is read: without this an oversized body fell through to
     // the defaults below and silently persisted a junk expert.
     if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
@@ -664,6 +687,7 @@ const server = http.createServer(async (req, res) => {
     const job = JOBS.get(u.searchParams.get('token') || '');
     if (!job) return sendJson(res, 404, { error: '任务不存在或已过期，请回 SkillSpace 重新生成口令' });
     const body = await readBody(req);
+    if (body[ABORTED]) return; // don't fail the job over a dropped connection
     // Without this an oversized import reports "experts is empty or malformed"
     // and flips the job to error on false grounds.
     if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
@@ -790,7 +814,11 @@ const server = http.createServer(async (req, res) => {
 // - in particular HOST=:: is not it: that binds *, every interface, which is
 // the exact exposure this default exists to prevent. Covering both needs a
 // second listen() call, deliberately not done.
-const HOST_BIND = process.env.HOST || '127.0.0.1';
+//
+// Setting any non-loopback HOST also switches OFF the Host-header allowlist
+// (see BIND_IS_LOOPBACK): it is an opt-out of DNS-rebinding protection, which
+// is meaningless once the socket is reachable from the network anyway. The
+// Origin/Sec-Fetch-Site check still applies.
 server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
   console.log(`  → http://localhost:${PORT}`);

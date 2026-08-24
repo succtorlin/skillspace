@@ -296,21 +296,27 @@ test('a non-object JSON body cannot crash the server', async () => {
 
 test('a non-object JSON body cannot crash the experts route either', async () => {
   const litter = [];
-  for (const raw of ['null', '123', '"str"', 'false', '[]', '[1,2]']) {
-    const r = await fetch(base + '/api/experts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
-    });
-    assert.ok(r.status < 500, `body ${raw} got ${r.status}`);
-    const b = await r.json().catch(() => ({}));
-    if (b.expert && b.expert.id) litter.push(b.expert.id);
-  }
+  try {
+    for (const raw of ['null', '123', '"str"', 'false', '{"a":1}', '[1,2]']) {
+      const r = await fetch(base + '/api/experts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
+      });
+      // Record BEFORE asserting: a failing iteration used to abandon the
+      // expert it had just created, and red is exactly when the suite gets
+      // re-run repeatedly - which is how 78 entries piled up.
+      const b = await r.json().catch(() => ({}));
+      if (b.expert && b.expert.id) litter.push(b.expert.id);
+      assert.ok(r.status < 500, `body ${raw} got ${r.status}`);
+    }
+  } finally {
   // These bodies coerce to {}, which is legitimate for this route, so each one
   // creates a defaulted expert. This route persists to <repo>/experts.json via
   // __dirname and ignores SKILLSPACE_HOME, so without this cleanup the suite
   // accumulates junk in the developer's real file - 78 entries before it was
   // noticed.
-  for (const id of litter) {
-    await fetch(base + '/api/experts?id=' + encodeURIComponent(id), { method: 'DELETE' });
+    for (const id of litter) {
+      await fetch(base + '/api/experts?id=' + encodeURIComponent(id), { method: 'DELETE' });
+    }
   }
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
@@ -454,10 +460,13 @@ test('a rebound Host header is refused', async () => {
   // same-origin, so Origin alone would admit it. Raw socket because Host is a
   // forbidden header name - undici silently drops it, which made an earlier
   // version of this test pass against a server that never saw the override.
+  // Anchored to the status line, not a substring scan: "403" occurs inside
+  // random project UUIDs in about 7% of 200-responses, so includes('403')
+  // passed 3 runs in 25 with the Host check removed entirely.
   const res = await rawGet('/api/projects', 'evil.example');
-  assert.ok(res.includes('403'), `an unrecognised Host must be refused, got: ${res.slice(0, 40)}`);
+  assert.match(res, /^HTTP\/1\.1 403 /, `an unrecognised Host must be refused, got: ${res.slice(0, 40)}`);
   const ok = await rawGet('/api/projects', '127.0.0.1');
-  assert.ok(ok.includes('200 OK'), `a recognised Host must be served, got: ${ok.slice(0, 40)}`);
+  assert.match(ok, /^HTTP\/1\.1 200 /, `a recognised Host must be served, got: ${ok.slice(0, 40)}`);
 });
 
 test('same-origin and header-less clients are still served', async () => {
@@ -471,5 +480,65 @@ test('same-origin and header-less clients are still served', async () => {
   const nav = await fetch(base + '/api/config', { headers: { 'Sec-Fetch-Site': 'none' } });
   assert.strictEqual(nav.status, 200, 'typed navigation must keep working');
   // What curl and this suite send: nothing.
+  assert.strictEqual((await json('GET', '/api/projects')).status, 200);
+});
+
+test('a top-level array reaches importExperts instead of being coerced away', async () => {
+  // importExperts accepts `[...]` as well as {experts:[...]}, and a bare array
+  // is a very plausible shape for the classification results an agent POSTs
+  // back. Coercing arrays to {} in readBody made that branch dead code and
+  // turned this into a permanent job error.
+  const tok = await json('POST', '/api/experts/job', { dir: os.homedir() });
+  const token = tok.body.token || (tok.body.job && tok.body.job.token);
+  assert.ok(token, `expected a job token, got ${JSON.stringify(tok.body).slice(0, 120)}`);
+
+  const r = await fetch(`${base}/api/experts/import?token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify([{ name: '数组专家', skills: [] }]),
+  });
+  const body = await r.json();
+  // The array must at least be RECOGNISED as a payload: the "empty or
+  // malformed" rejection is the symptom of it having been coerced to {}.
+  assert.ok(
+    !(body.error && body.error.includes('格式不对')),
+    `a top-level array was coerced away: ${JSON.stringify(body)}`
+  );
+});
+
+test('HOST=0.0.0.0 actually serves on the LAN address', async (t) => {
+  const lan = externalIPv4();
+  if (!lan) return t.skip('no non-loopback IPv4 on this machine - cannot test reachability');
+  // Binding every interface and then 403ing every request that used one is not
+  // a security posture, just a confusing one.
+  const { child: proc, port } = await spawnServer({ HOST: '0.0.0.0' });
+  try {
+    const r = await fetch(`http://${lan}:${port}/api/config`);
+    assert.strictEqual(r.status, 200, `HOST=0.0.0.0 must serve on ${lan}, not 403 it`);
+  } finally { proc.kill('SIGKILL'); }
+});
+
+test('a connection dropped mid-body persists nothing', async () => {
+  const before = (await json('GET', '/api/experts')).body.experts.length;
+  const { port } = new URL(base);
+  // Promise Content-Length we never deliver, then destroy: the route sees an
+  // abort, and /api/experts writes on empty input, so resolving {} here left a
+  // defaulted record behind.
+  for (let i = 0; i < 5; i++) {
+    await new Promise((resolve) => {
+      const sock = net.connect({ host: '127.0.0.1', port: Number(port) }, () => {
+        sock.write(
+          `POST /api/experts HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+          `Content-Type: application/json\r\nContent-Length: 200\r\n\r\n{"name":"partial"`
+        );
+        setTimeout(() => { sock.destroy(); resolve(); }, 60);
+      });
+      sock.on('error', () => resolve());
+    });
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  const after = (await json('GET', '/api/experts')).body.experts.length;
+  assert.strictEqual(after, before, 'an aborted upload persisted a record');
+  // and the server is still healthy
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
