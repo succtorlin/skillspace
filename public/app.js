@@ -764,18 +764,19 @@ async function loadProjects() {
   }
   const projects = Array.isArray(data.projects) ? data.projects : [];
 
+  // A stored id can outlive the project it names — the record may have been
+  // deleted in another tab or by a direct API call. Reconcile BEFORE the
+  // empty-state return: an empty list is exactly the case where a dangling id
+  // has nothing left to overwrite it, so it would survive every reload.
+  let activeId = localStorage.getItem(PROJECT_KEY) || '';
+  if (activeId && !projects.some((p) => p.id === activeId)) {
+    activeId = '';
+    localStorage.removeItem(PROJECT_KEY);
+  }
+
   if (!projects.length) {
     list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
     return;
-  }
-
-  // A stored id can outlive the project it names — the record may have been
-  // deleted in another tab or by a direct API call. Fall back rather than
-  // leaving a selection that points at nothing.
-  let activeId = localStorage.getItem(PROJECT_KEY) || '';
-  if (!projects.some((p) => p.id === activeId)) {
-    activeId = '';
-    localStorage.removeItem(PROJECT_KEY);
   }
 
   // The row is a div, not a button, for the reason renderSources() documents:
