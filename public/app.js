@@ -738,57 +738,20 @@ $('#reload').addEventListener('click', async () => {
 });
 $('#search').addEventListener('input', (e) => { state.q = e.target.value; applyFilter(); });
 
-function esc(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 // ---------- 项目 ----------
 const PROJECT_KEY = 'skillspace-project';
 
-// esc() escapes & < > but NOT quotes, so it is unsafe inside an attribute:
-// a path containing a double quote would close the attribute and let anything
-// after it be parsed as markup. Attribute values go through this instead.
-function escAttr(s) {
-  return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// ---------- 纯判断函数 ----------
-// No DOM, no storage, no fetch: these decide *what* to show, the renderer
-// decides how. Kept together and dependency-free so they can be lifted into a
-// shared dual-mode module and table-tested without a DOM harness.
-
-// What the rail should show for a given /api/projects response. `ok` is
-// response.ok; `data` is the parsed body, or null if there was none.
-// A structured error from a well-behaved server must NOT read as "empty":
-// checking only Array.isArray(data.projects) sent a 500 {"error":…} into the
-// empty state, which told the user to add projects they already have. The API
-// accepts the same path twice, so following that advice duplicates records.
-function railState(ok, data) {
-  if (!ok || !data || data.error || !Array.isArray(data.projects)) {
-    return { kind: 'error', projects: [] };
-  }
-  if (!data.projects.length) return { kind: 'empty', projects: [] };
-  return { kind: 'list', projects: data.projects };
-}
-
-// What a DELETE response means. `body` is the parsed body, or null when the
-// request produced none at all (unreachable server / unparseable response).
-// shouldReload distinguishes the two failure kinds: a 404 says the record is
-// already gone, so the view is stale and must reconcile or the phantom row
-// keeps 404ing on every retry. An unreachable server says nothing about the
-// record, so re-rendering would only trade a good list for an error box.
-function deleteOutcome(body) {
-  if (body === null) {
-    return { ok: false, message: '删除失败：无法连接服务器', shouldReload: false };
-  }
-  if (!body || body.error || body.ok !== true) {
-    return {
-      ok: false,
-      message: '删除失败：' + ((body && body.error) || '未知错误'),
-      shouldReload: true,
-    };
-  }
-  return { ok: true, message: null, shouldReload: true };
+// esc / escAttr / railState / deleteOutcome now live in public/pure.js,
+// loaded as a classic script before this one. They remain globals.
+//
+// The ordering is currently only a convention: boot() suspends at its first
+// await before anything calls esc(), so loading pure.js afterwards happens to
+// work. That would stop being true the moment an early render became
+// synchronous, and the failure would then surface as a stray
+// "esc is not a function" somewhere deep in a render rather than at load.
+// Fail at load instead, where the cause is obvious.
+if (typeof esc !== 'function' || typeof escAttr !== 'function') {
+  throw new Error('pure.js must be loaded before app.js');
 }
 
 // focusId: the project that was just acted on, if this render was triggered by

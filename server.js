@@ -572,7 +572,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === '/' ) return serveStatic(res, 'index.html');
-  if (p === '/app.js' || p === '/icons.js' || p === '/style.css') return serveStatic(res, p.slice(1));
+  if (p === '/app.js' || p === '/icons.js' || p === '/pure.js' || p === '/style.css') return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
   // the app is an instrument, this page sells the idea of it.
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');
