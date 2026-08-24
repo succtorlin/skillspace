@@ -169,6 +169,29 @@ test('DELETE removes the record, keeps the files, and says so', async () => {
   assert.ok(fs.existsSync(dir));
 });
 
+test('a store write failure during DELETE does not kill the server', async () => {
+  // DELETE called projects.remove() bare while the sibling POST wrapped
+  // create() in a try/catch, so an unwritable store threw out of the async
+  // handler and Node exited - the agent dispatcher and any live SSE stream
+  // gone from one ordinary click. The guard is now on the handler rather than
+  // the route, so the goals/orders routes cannot reintroduce the asymmetry.
+  const dir = tmp('skillspace-apiwork-');
+  const c = await json('POST', '/api/projects', { name: 'Doomed', path: dir });
+
+  fs.chmodSync(storeRoot, 0o500); // read + execute, no write
+  let d;
+  try {
+    d = await json('DELETE', '/api/projects/' + c.body.project.id);
+  } finally {
+    fs.chmodSync(storeRoot, 0o700);
+  }
+
+  assert.strictEqual(d.status, 500, 'an unwritable store is a server fault, not a 200');
+  // The assertion that actually matters: the process is still answering.
+  assert.strictEqual((await json('GET', '/api/projects')).status, 200,
+    'server died on a store write failure');
+});
+
 test('DELETE of an unknown id is a 404, not a false success', async () => {
   const r = await json('DELETE', '/api/projects/prj-does-not-exist');
   assert.strictEqual(r.status, 404);

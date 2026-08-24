@@ -571,6 +571,27 @@ const server = http.createServer(async (req, res) => {
     return res.end('forbidden');
   }
 
+  // Every route below runs inside this. A throw from a lib call used to take
+  // the whole process down - DELETE called projects.remove() bare, so an
+  // unwritable store (EACCES) or a projects.json that parsed but wasn't an
+  // array killed the dispatcher, and any live SSE stream with it, from one
+  // ordinary click. The POST route already reasoned about that error; DELETE
+  // did not, and goals/orders routes land next. Making it the handler's rule
+  // rather than each route's responsibility is what stops the asymmetry
+  // replicating.
+  try {
+    return await route(req, res, u, p);
+  } catch (e) {
+    console.error('[server] unhandled error in %s %s:', req.method, p, e);
+    // Headers may already be sent by a streaming route; writing again would
+    // throw a second time, inside the catch that exists to prevent exactly
+    // that. Destroying is the only honest close at that point.
+    if (res.headersSent) return res.destroy();
+    return sendJson(res, 500, { error: 'internal error' });
+  }
+});
+
+async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
   if (p === '/app.js' || p === '/icons.js' || p === '/pure.js' || p === '/style.css') return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
@@ -795,7 +816,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404); res.end('not found');
-});
+}
 
 // Loopback only. This process dispatches AI agents with write access to any
 // registered directory and has no authentication whatsoever - the design
