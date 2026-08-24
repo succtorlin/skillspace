@@ -35,7 +35,8 @@ test('readJson returns the fallback when the file is corrupt, and keeps the bad 
   const root = tmpRoot();
   fs.writeFileSync(path.join(root, 'bad.json'), '{ not json');
   assert.deepStrictEqual(store.readJson(root, 'bad.json', []), []);
-  assert.ok(fs.existsSync(path.join(root, 'bad.json.corrupt')));
+  const kept = fs.readdirSync(root).filter((f) => f.startsWith('bad.json.') && f.endsWith('.corrupt'));
+  assert.strictEqual(kept.length, 1, 'the unparseable bytes must be kept for diagnosis');
 });
 
 test('writeJson leaves no temp file behind', () => {
@@ -77,6 +78,9 @@ test('abs rejects a sibling directory that merely shares the root prefix', () =>
 test('writeJson writes via a temp file and renames — never straight to the target', () => {
   const root = tmpRoot();
   const target = path.join(root, 'atomic.json');
+  // This monkeypatch is process-global and is safe only because everything
+  // between the patch and the restore is synchronous. Do not introduce an
+  // await here: the patch would leak into whatever test runs next.
   const renames = [];
   const realRename = fs.renameSync;
   const realWrite = fs.writeFileSync;
@@ -102,4 +106,23 @@ test('a root with a trailing separator still works', () => {
   const root = tmpRoot();
   store.writeJson(root + path.sep, 'trailing.json', { ok: true });
   assert.deepStrictEqual(store.readJson(root, 'trailing.json', null), { ok: true });
+});
+
+test('readJson refuses to read outside the store root', () => {
+  const root = tmpRoot();
+  fs.writeFileSync(path.join(path.dirname(root), 'secret.json'), '{"apiKey":"SECRET"}');
+  assert.throws(() => store.readJson(root, '../secret.json', null), /escapes store root/);
+});
+
+test('list refuses to enumerate outside the store root', () => {
+  const root = tmpRoot();
+  assert.throws(() => store.list(root, '../'), /escapes store root/);
+});
+
+test('list returns only .json records, never temp or corrupt files', () => {
+  const root = tmpRoot();
+  store.writeJson(root, 'orders/ord-1.json', { v: 1 });
+  fs.writeFileSync(path.join(root, 'orders', 'ord-9.json.4242.tmp'), 'partial');
+  fs.writeFileSync(path.join(root, 'orders', 'ord-8.json.171.corrupt'), 'garbage');
+  assert.deepStrictEqual(store.list(root, 'orders'), ['ord-1']);
 });
