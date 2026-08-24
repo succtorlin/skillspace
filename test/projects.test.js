@@ -335,6 +335,55 @@ test('get returns null for an unknown id, never undefined', () => {
   assert.strictEqual(projects.get(root, 'prj-nope'), null);
 });
 
+test('get re-detects kind, so a repo that stopped being one loses its concurrency', () => {
+  // kind is detected once at create() and stored. If the tree stops being a
+  // repository afterwards - deleted and re-cloned in place, absorbed as a
+  // subdirectory of a parent repo, `git worktree remove` - the record still
+  // says git and still carries concurrency 2. That is several agents over a
+  // tree with no isolation mechanism, which is the exact corruption kind
+  // exists to prevent.
+  const root = tmpRoot();
+  const repo = tmpGitRepo();
+  const p = projects.create(root, { path: repo });
+  assert.strictEqual(p.kind, 'git');
+  assert.strictEqual(p.concurrency, 2);
+
+  fs.rmSync(path.join(repo, '.git'), { recursive: true, force: true });
+
+  const fresh = projects.get(root, p.id);
+  assert.strictEqual(fresh.kind, 'dir', 'get must not report a stale git');
+  assert.strictEqual(fresh.concurrency, 1, 'a dir has no isolation and cannot run 2 agents');
+  // list() is the cheap UI path and stays as-stored; get() is what a scheduler
+  // reads before granting concurrency, so that is where truth has to be fresh.
+  assert.strictEqual(projects.list(root)[0].kind, 'git');
+});
+
+test('get leaves an unchanged project exactly as stored', () => {
+  const root = tmpRoot();
+  const repo = tmpGitRepo();
+  const p = projects.create(root, { path: repo });
+  assert.deepStrictEqual(projects.get(root, p.id), p);
+
+  const d = projects.create(root, { path: tmpDir() });
+  assert.deepStrictEqual(projects.get(root, d.id), d);
+});
+
+test('get does not raise concurrency when a plain dir becomes a repo', () => {
+  // The safe direction: gaining a .git does not retroactively grant the record
+  // an explicit concurrency it was never given. It gets the git default, not
+  // some remembered higher number.
+  const root = tmpRoot();
+  const dir = tmpDir();
+  const p = projects.create(root, { path: dir, concurrency: 8 });
+  assert.strictEqual(p.concurrency, 1);
+
+  execSync('git init -q', { cwd: dir });
+
+  const fresh = projects.get(root, p.id);
+  assert.strictEqual(fresh.kind, 'git');
+  assert.strictEqual(fresh.concurrency, 2);
+});
+
 test('a directory vanishing mid-create is still the callers path error', () => {
   const root = tmpRoot();
   // Both filesystem calls between the existence check and the record must be
