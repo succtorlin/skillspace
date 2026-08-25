@@ -67,7 +67,12 @@ test('a dir project runs in the project itself and says it is not isolated', asy
   assert.strictEqual(wt.isolated, false);
 
   // cleanup must be a no-op here - removing it would delete the user's project
-  await worktrees.cleanup(wt);
+  const r = await worktrees.cleanup(wt);
+  assert.deepStrictEqual(
+    r,
+    { removed: false, committed: false, branchKept: false, ignoredOutput: 0 },
+    'a dir project must report that nothing was removed, committed or kept'
+  );
   assert.ok(fs.existsSync(dir), 'cleanup must never remove a dir project');
 });
 
@@ -106,7 +111,10 @@ test('cleanup keeps the order branch so the result stays inspectable', async () 
   const repo = tmpGitRepo();
   const root = tmpDir('skillspace-wthome-');
   const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord-branch');
-  await worktrees.cleanup(wt);
+  const r = await worktrees.cleanup(wt);
+  assert.strictEqual(r.removed, true, 'the worktree was removed');
+  assert.strictEqual(r.committed, false, 'an agent that changed nothing must not produce a commit');
+  assert.strictEqual(r.branchKept, true, 'the git path always keeps its branch');
   const branches = execSync('git branch --list', { cwd: repo, encoding: 'utf8' });
   assert.match(branches, /skillspace\/ord-branch/, 'the branch must survive as the record');
 });
@@ -141,11 +149,22 @@ test('a branch name that could be read as a flag is refused', async () => {
 });
 
 test('a legitimate branch is used as the base', async () => {
+  // file.txt is on every branch, so asserting it exists proves nothing about
+  // which branch was checked out. Give each branch a file only it has.
   const repo = tmpGitRepo();
-  execSync('git branch feature-x', { cwd: repo });
+  const c = { cwd: repo };
+  const commit = (m) => execSync(`git -c user.email=t@t -c user.name=t commit -q -m ${m}`, c);
+  execSync('git checkout -q -b feature-x', c);
+  fs.writeFileSync(path.join(repo, 'branch-only.txt'), 'on feature-x\n');
+  execSync('git add -A', c); commit('feature');
+  execSync('git checkout -q -', c);
+  fs.writeFileSync(path.join(repo, 'main-only.txt'), 'on the default branch\n');
+  execSync('git add -A', c); commit('main');
+
   const root = tmpDir('skillspace-wthome-');
   const wt = await worktrees.prepare(root, { kind: 'git', path: repo, branch: 'feature-x' }, 'ord-eee');
-  assert.ok(fs.existsSync(path.join(wt.cwd, 'file.txt')));
+  assert.ok(fs.existsSync(path.join(wt.cwd, 'branch-only.txt')), 'the worktree was not based on feature-x');
+  assert.ok(!fs.existsSync(path.join(wt.cwd, 'main-only.txt')), 'the worktree was based on HEAD, not the requested branch');
   await worktrees.cleanup(wt);
 });
 
@@ -232,6 +251,87 @@ test('gitignored output is reported, not silently discarded', async () => {
   // and it is genuinely not committed - we are reporting, not smuggling it in
   const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
   assert.ok(!files.includes('dist/build.js'), 'ignored output must not be committed');
+});
+
+test('a failed prepare does not delete a branch it did not create', async () => {
+  // The failure path deletes the branch it made, but a prepare that fails
+  // *because* the branch already exists must leave that one alone: it is the
+  // previous order's preserved record, which is what retention is for.
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  const first = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_reuse');
+  fs.writeFileSync(path.join(first.cwd, 'precious.txt'), 'a previous order\n');
+  await worktrees.cleanup(first);
+
+  await assert.rejects(() => worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_reuse'));
+
+  // Assert the branch first: without it this fails as a raw "Not a valid object
+  // name" from ls-tree, which does not say what actually went wrong.
+  const branches = execSync('git branch --list', { cwd: repo, encoding: 'utf8' });
+  assert.ok(
+    branches.includes('skillspace/ord_reuse'),
+    "a previous order's preserved record was deleted by a later failed prepare"
+  );
+  const files = execSync('git ls-tree -r --name-only skillspace/ord_reuse', { cwd: repo, encoding: 'utf8' });
+  assert.match(files, /precious\.txt/, "a previous order's preserved record was emptied");
+});
+
+test('a cleanup that commits real work still excludes ignored output', async () => {
+  // The earlier test's agent wrote ONLY ignored files, so the commit block was
+  // never entered and "not committed" was true for the wrong reason.
+  const repo = tmpGitRepo();
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'dist/\n.env\nnode_modules/\n');
+  execSync('git add -A', { cwd: repo });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m ignore', { cwd: repo });
+
+  const root = tmpDir('skillspace-wthome-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_mixed');
+  fs.writeFileSync(path.join(wt.cwd, 'src.js'), 'real work\n');          // tracked
+  fs.mkdirSync(path.join(wt.cwd, 'dist'));
+  fs.writeFileSync(path.join(wt.cwd, 'dist', 'build.js'), 'output\n');   // ignored
+  fs.writeFileSync(path.join(wt.cwd, '.env'), 'SECRET=1\n');             // ignored
+  fs.mkdirSync(path.join(wt.cwd, 'node_modules'));
+  fs.writeFileSync(path.join(wt.cwd, 'node_modules', 'dep.js'), 'x\n');  // ignored
+
+  const r = await worktrees.cleanup(wt);
+  assert.strictEqual(r.committed, true, 'the tracked change must be committed');
+  assert.ok(r.ignoredOutput >= 3, `expected the ignored files to be counted, got ${r.ignoredOutput}`);
+
+  const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
+  assert.match(files, /src\.js/, 'the real work was not preserved');
+  for (const bad of ['dist/build.js', '.env', 'node_modules/dep.js']) {
+    assert.ok(!files.includes(bad), `${bad} was committed into the user's repo`);
+  }
+});
+
+test('an ambient GIT_DIR cannot retarget the worktree', async () => {
+  // A GIT_DIR inherited from a hook or a parent process would otherwise make
+  // git operate on a different repository than the project entirely.
+  const repo = tmpGitRepo();
+  fs.writeFileSync(path.join(repo, 'real-only.txt'), 'the real project\n');
+  execSync('git add -A', { cwd: repo });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m real', { cwd: repo });
+
+  const decoy = tmpGitRepo();
+  fs.writeFileSync(path.join(decoy, 'decoy-only.txt'), 'the wrong project\n');
+  execSync('git add -A', { cwd: decoy });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m decoy', { cwd: decoy });
+
+  const root = tmpDir('skillspace-wthome-');
+  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  let wt;
+  try {
+    process.env.GIT_DIR = path.join(decoy, '.git');
+    process.env.GIT_WORK_TREE = decoy;
+    wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_env');
+  } finally {
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+  assert.ok(fs.existsSync(path.join(wt.cwd, 'real-only.txt')), 'the worktree was not built from the project');
+  assert.ok(!fs.existsSync(path.join(wt.cwd, 'decoy-only.txt')), 'an ambient GIT_DIR retargeted the worktree at another repo');
+  await worktrees.cleanup(wt);
 });
 
 test('cleanup is safe to call twice', async () => {
