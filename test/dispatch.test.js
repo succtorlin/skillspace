@@ -442,7 +442,15 @@ test('a store failure while marking the order running leaks nothing', async () =
   // Readable so get()/countToday() still work; unwritable so writeJson throws.
   fs.chmodSync(path.join(root, 'orders'), 0o555);
   try {
-    await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) }).catch(() => {});
+    // Not `.catch(() => {})`: that pinned the two leak properties below but let
+    // the documented rejection go unchecked. EACCES here via chmod, EPERM if
+    // the same state is reached through chflags - match both rather than
+    // pinning one errno.
+    await assert.rejects(
+      () => dispatch.runOrder(root, { order, project, agent: shimAgent(OK) }),
+      /EACCES|EPERM/,
+      'a store that cannot record the run must reject, not resolve'
+    );
   } finally {
     fs.chmodSync(path.join(root, 'orders'), 0o755);
   }
@@ -451,4 +459,32 @@ test('a store failure while marking the order running leaks nothing', async () =
   const wtRoot = path.join(root, 'worktrees');
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
     'the worktree leaked');
+});
+
+test('a refusal returns null rather than a record with no id', async () => {
+  // { ...null, refused } produced an object with no id and no status: not an
+  // order, and worse than null for a caller trusting the shape. The scheduler
+  // reads the header contract, so the shape it names has to be the shape it
+  // returns.
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');        // dir: prepare is a microtask
+  const project = projects.create(root, { path: work });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+  const agent = shimAgent(SLOW);
+
+  const first = dispatch.runOrder(root, { order, project, agent });
+  await new Promise((r) => setTimeout(r, 250));
+
+  // Assert the layout rather than assuming it: a wrong path here would delete
+  // nothing, the record would still load, and the test would pass for the
+  // wrong reason.
+  const recordPath = path.join(root, 'orders', `${order.id}.json`);
+  assert.ok(fs.existsSync(recordPath), `order record not at ${recordPath}`);
+  fs.unlinkSync(recordPath);
+
+  const second = await dispatch.runOrder(root, { order, project, agent });
+
+  assert.strictEqual(second, null, 'a refusal with no record must be null, not a partial object');
+  dispatch.cancel(order.id);
+  await first;
 });
