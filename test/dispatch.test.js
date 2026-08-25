@@ -188,6 +188,9 @@ test('a dir project runs in place and the directory survives', async () => {
   // Watch what dispatch hands cleanup. A dir project marked isolated:true would
   // take cleanup's destructive path over the user's own directory; today that
   // is caught only by cleanup's own guard, nothing in dispatch.
+  // Assumes no other dispatch is in flight: `seen` is asserted exactly, against
+  // a module-global stub, so a concurrent runOrder would append and fail this
+  // spuriously. True today because top-level tests run sequentially.
   const realCleanup = worktrees.cleanup;
   const seen = [];
   worktrees.cleanup = (wt) => { seen.push(wt && wt.isolated); return realCleanup(wt); };
@@ -317,6 +320,10 @@ test('cancelling during worktree preparation does not spawn an agent', async () 
 
   assert.ok(!fs.existsSync(marker), 'an agent was spawned for an order already cancelled');
   assert.strictEqual(orders.get(root, order.id).status, 'cancelled');
+  // This path returns before the try/finally that normally releases the claim,
+  // so it has to release its own. server.js gates graceful shutdown on
+  // inFlightCount() === 0; a leak here makes every shutdown wait out the hatch.
+  assert.strictEqual(dispatch.inFlightCount(), 0, 'the intent-check path leaked its slot');
 
   // and the abandoned worktree is not left holding the branch
   const wtRoot = path.join(root, 'worktrees');
@@ -352,4 +359,54 @@ test('a worktree failure releases the slot', async () => {
   assert.strictEqual(first.status, 'failed');
   const second = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
   assert.ok(!second.refused, 'the slot was never released');
+});
+
+test('the slot is claimed before any await, so a running order stays cancellable', async () => {
+  // Claiming after the first await lets a second dispatch overwrite the first's
+  // handle: the running agent then has no reachable handle and cancel() returns
+  // false. The intent check prevents the second SPAWN, so an agent-count
+  // assertion no longer catches this - the cancellability is the property.
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');        // dir: no worktree interlock
+  const project = projects.create(root, { path: work });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+  const agent = shimAgent(SLOW);
+
+  // The second dispatch is issued SYNCHRONOUSLY, with no tick in between. That
+  // is the whole point: runOrder runs synchronously only as far as its first
+  // await, so a claim staked before that await is already visible here, while
+  // one staked after prepare resolves is not. Sleeping first would let a late
+  // claim settle and the mutant would sail through.
+  const first = dispatch.runOrder(root, { order, project, agent });
+  const second = await dispatch.runOrder(root, { order, project, agent });
+
+  assert.strictEqual(second.refused, 'already dispatched');
+
+  // Only now let the first reach `running`, and check its handle is the one
+  // cancel() finds - a second dispatch that got through would have overwritten it.
+  await new Promise((r) => setTimeout(r, 250));
+  assert.strictEqual(dispatch.cancel(order.id), true, 'the running agent became unreachable');
+  assert.strictEqual((await first).status, 'cancelled');
+});
+
+test('an order that settles as failed during preparation does not spawn either', async () => {
+  // The intent check must test for "still queued", not for "cancelled". A
+  // record can settle mid-prepare as failed or interrupted too - reconcile()
+  // writes `interrupted` on boot, and the route can fail an order outright -
+  // and every one of those means nobody is waiting for an agent any more.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  const marker = path.join(tmpDir('skillspace-mark-'), 'spawned.txt');
+  const agent = shimAgent(`#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`);
+
+  const running = dispatch.runOrder(root, { order, project, agent });
+  orders.markFailed(root, order.id, 'settled by something else mid-prepare');
+  await running;
+
+  assert.ok(!fs.existsSync(marker), 'an agent was spawned for an order already settled as failed');
+  assert.strictEqual(orders.get(root, order.id).status, 'failed');
+  assert.strictEqual(dispatch.inFlightCount(), 0, 'the intent-check path leaked its slot');
 });
