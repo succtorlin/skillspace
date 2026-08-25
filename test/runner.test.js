@@ -60,6 +60,33 @@ async function waitForGrandchild(token, before, deadlineMs) {
   return false;
 }
 
+// A grandchild that ignores SIGTERM, to prove the +5s SIGKILL escalation still
+// happens. `trap '' TERM` sets SIG_IGN, which the sleep child inherits, so the
+// whole subtree survives SIGTERM and only SIGKILL removes it. The marker file
+// proves the trap is armed BEFORE anything signals it - otherwise the signal
+// races the trap and the test passes for the wrong reason.
+function trapperShim() {
+  const token = `skillspace-trapper-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const dir = tmpDir('skillspace-trapper-');
+  const bin = path.join(dir, token);
+  const armed = path.join(dir, 'armed');
+  fs.writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\ntouch ${armed}\nsleep 60\n`);
+  fs.chmodSync(bin, 0o755);
+  return { token, bin, armed };
+}
+
+async function waitForFile(file, deadlineMs) {
+  const until = Date.now() + deadlineMs;
+  while (Date.now() < until) {
+    if (fs.existsSync(file)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
+// KILL_GRACE_MS in lib/runner.js is 5s; this is that plus room to observe.
+const AFTER_ESCALATION_MS = 6500;
+
 function countByToken(token) {
   try {
     return execSync(`pgrep -f ${token} | wc -l`, { encoding: 'utf8' }).trim();
@@ -68,9 +95,18 @@ function countByToken(token) {
   }
 }
 
-// Note for mutation testing: CHATTY never exits on its own, so a mutant that
-// disables the timeout wedges this whole file instead of failing it. Scope such
-// a run with `node --test --test-name-pattern '<test name>'`.
+// Known limits:
+//  - Mutation testing: CHATTY never exits on its own, so a mutant that disables
+//    the timeout wedges this whole file instead of failing it. Scope such a run
+//    with `node --test --test-name-pattern '<test name>'`.
+//  - The bounded drain wait (DRAIN_GRACE_MS) is NOT pinned here. The natural
+//    pin - a logFile on a FIFO with no reader - wedges this file even against
+//    correct code, because the open() blocks before any of our timers exist. To
+//    pin it, run that case in a SPAWNED CHILD and assert on the child's exit
+//    code, so the wedge is contained by a hard timeout while the parent asserts
+//    cleanly.
+//  - The +5s SIGKILL escalation is pinned (below), but a group-kill FAILURE at
+//    that point leaves no trace: `settled` is true and the log is closed.
 const ECHO = '#!/bin/sh\necho "stdout: $2"\necho "stderr line" >&2\nexit 0\n';
 const FAIL = '#!/bin/sh\necho "going wrong"\nexit 7\n';
 const SLOW = '#!/bin/sh\nsleep 60\n';
@@ -297,7 +333,10 @@ test('cancelling a failed spawn does not signal our own process group', async ()
   });
   handle.cancel();                      // synchronous: the dangerous window
   const r = await handle.done;
-  assert.ok(r.error, 'should still report the missing binary');
+  // The cancel legitimately wins the race with the nextTick ENOENT, so this
+  // records `cancelled`, not the missing binary. Either is a correct outcome;
+  // asserting the one that actually happens keeps the test honest.
+  assert.match(r.error, /cancelled/, 'the run must still report how it ended');
   assert.ok(true, 'the test process survived its own cancel');
 });
 
@@ -333,4 +372,41 @@ test('an unusable timeoutMs falls back to the default bound, never to no bound',
   // accepting it here would also accept '0'.
   assert.strictEqual(runner.resolveTimeout('500'), runner.resolveTimeout(-1));
   assert.strictEqual(runner.resolveTimeout(700), 700, 'a usable value must be honoured exactly');
+});
+
+test('a grandchild that ignores SIGTERM is escalated to SIGKILL on cancel', async () => {
+  // `exited` tracks the DIRECT child, which does die from our own group
+  // SIGTERM - so guarding escalation on it skipped the escalation in exactly
+  // the case it exists for. Any tool subprocess with a signal handler, a dev
+  // server shutting down gracefully, or docker run lands here, and without the
+  // escalation it runs on indefinitely, still billing.
+  const trapper = trapperShim();
+  const before = countByToken(trapper.token);
+  const handle = runner.start({
+    agent: shimAgent(`#!/bin/sh\n"${trapper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
+  });
+  assert.ok(await waitForFile(trapper.armed, 3000),
+    'the trap never armed, so this test proves nothing');
+  handle.cancel();
+  await handle.done;
+  await new Promise((r) => setTimeout(r, AFTER_ESCALATION_MS));
+  assert.strictEqual(countByToken(trapper.token), before,
+    'a grandchild that ignored SIGTERM was never escalated to SIGKILL');
+});
+
+test('a grandchild that ignores SIGTERM is escalated to SIGKILL on timeout', async () => {
+  // Both paths reap, so both paths are pinned: the guard broke them together.
+  const trapper = trapperShim();
+  const before = countByToken(trapper.token);
+  const handle = runner.start({
+    agent: shimAgent(`#!/bin/sh\n"${trapper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 1200,
+  });
+  assert.ok(await waitForFile(trapper.armed, 3000),
+    'the trap never armed, so this test proves nothing');
+  await handle.done;
+  await new Promise((r) => setTimeout(r, AFTER_ESCALATION_MS));
+  assert.strictEqual(countByToken(trapper.token), before,
+    'a grandchild that ignored SIGTERM was never escalated to SIGKILL');
 });
