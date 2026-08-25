@@ -48,6 +48,18 @@ function sleeperShim() {
   return { token, bin };
 }
 
+// Waits for the grandchild to actually appear. A fixed sleep flakes: the chain
+// is two shells deep, and under load it can take longer than any delay short
+// enough to land before the timeout fires.
+async function waitForGrandchild(token, before, deadlineMs) {
+  const until = Date.now() + deadlineMs;
+  while (Date.now() < until) {
+    if (Number(countByToken(token)) > Number(before)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
+
 function countByToken(token) {
   try {
     return execSync(`pgrep -f ${token} | wc -l`, { encoding: 'utf8' }).trim();
@@ -109,10 +121,15 @@ test('a timeout reaps the whole process group, not just the direct child', async
   // those orphaned to PID 1 - still writing files, still billing, invisible.
   const sleeper = sleeperShim();
   const before = countByToken(sleeper.token);
-  await runner.run({
+  const handle = runner.start({
     agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
-    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 700,
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 2000,
   });
+  // Without this, "after === before" is also satisfied by a grandchild that
+  // never started, and the test would pass while proving nothing.
+  assert.ok(await waitForGrandchild(sleeper.token, before, 1500),
+    'the grandchild never started, so this test proves nothing');
+  await handle.done;
   await new Promise((r) => setTimeout(r, 1500));
   assert.strictEqual(countByToken(sleeper.token), before, 'a grandchild survived the timeout');
 });
@@ -128,7 +145,8 @@ test('cancel reaps the whole process group, not just the direct child', async ()
     agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
     logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
   });
-  await new Promise((r) => setTimeout(r, 400));
+  assert.ok(await waitForGrandchild(sleeper.token, before, 3000),
+    'the grandchild never started, so this test proves nothing');
   handle.cancel();
   await handle.done;
   await new Promise((r) => setTimeout(r, 1200));
@@ -259,8 +277,60 @@ test('a throwing onChunk cannot kill the run, and leaves a trace', async () => {
   const logFile = path.join(tmpDir(), 'run.log');
   const r = await runner.run({
     agent: shimAgent(ECHO), prompt: 'x', cwd: tmpDir(), logFile, timeoutMs: 10000,
-    onChunk: () => { throw new Error('consumer exploded'); },
+    // Deliberately a non-Error: consumers throw strings, and `${e.message}`
+    // would record "onChunk threw: undefined", losing the only evidence there
+    // was. Throwing a string pins the swallow, the trace, AND the detail.
+    onChunk: () => { throw 'consumer exploded'; },
   });
   assert.strictEqual(r.exitCode, 0, 'a broken consumer must not kill an agent mid-edit');
-  assert.match(fs.readFileSync(logFile, 'utf8'), /onChunk threw/, 'the failure vanished silently');
+  assert.match(fs.readFileSync(logFile, 'utf8'), /onChunk threw: consumer exploded/,
+    'the failure vanished silently, or lost its detail');
+});
+
+test('cancelling a failed spawn does not signal our own process group', async () => {
+  // -undefined is NaN and child.kill() on a dead handle signals pid 0, i.e.
+  // every process in OUR group. Reachable synchronously after start(), because
+  // the ENOENT arrives on process.nextTick and `settled` is still false.
+  const handle = runner.start({
+    agent: { id: 'ghost', bin: '/definitely/not/here/ghost', buildArgs: (p) => ['-p', p] },
+    prompt: 'x', cwd: tmpDir(), logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 5000,
+  });
+  handle.cancel();                      // synchronous: the dangerous window
+  const r = await handle.done;
+  assert.ok(r.error, 'should still report the missing binary');
+  assert.ok(true, 'the test process survived its own cancel');
+});
+
+test('an agent that backgrounds a subprocess reports its real exit code, not a timeout', async () => {
+  // 'close' waits for the stdio to close, not for the agent to exit. An agent
+  // told to "start the dev server and check it" exits 0 in milliseconds while a
+  // backgrounded child holds the inherited stdout - and the run used to sit
+  // open until the timeout, then record `timeout / exitCode: null` and group-
+  // kill the very process it had been asked to leave running.
+  const logFile = path.join(tmpDir(), 'run.log');
+  const started = Date.now();
+  const r = await runner.run({
+    agent: shimAgent('#!/bin/sh\nsleep 8 &\necho "done"\nexit 0\n'), prompt: 'x',
+    cwd: tmpDir(), logFile, timeoutMs: 5000,
+  });
+  const elapsed = Date.now() - started;
+  assert.strictEqual(r.exitCode, 0, 'the real exit code was lost');
+  assert.strictEqual(r.error, null, 'a finished agent was recorded as a failure');
+  // Settles on the stdio grace (~2s), not the 5s timeout; the gap is the
+  // discrimination, and it is wide enough not to flake under load.
+  assert.ok(elapsed < 4000, `settled in ${elapsed}ms - it waited for the timeout, not the exit`);
+});
+
+test('an unusable timeoutMs falls back to the default bound, never to no bound', () => {
+  // A truthiness test made 0, -1, NaN and undefined all mean "unbounded" - on
+  // the one property standing between a stuck agent and an unbounded bill.
+  for (const bad of [0, -1, NaN, undefined, null, Infinity, '500']) {
+    const bound = runner.resolveTimeout(bad);
+    assert.ok(Number.isFinite(bound) && bound > 0,
+      `timeoutMs ${String(bad)} produced ${bound} - an unusable value must never disable the bound`);
+  }
+  // Strings are not coerced: '500' is a boundary bug to fix at the caller, and
+  // accepting it here would also accept '0'.
+  assert.strictEqual(runner.resolveTimeout('500'), runner.resolveTimeout(-1));
+  assert.strictEqual(runner.resolveTimeout(700), 700, 'a usable value must be honoured exactly');
 });
