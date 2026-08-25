@@ -106,9 +106,24 @@ test('a worktree that cannot be created fails the order before any agent starts'
   const project = { ...projects.create(root, { path: notARepo }), kind: 'git' };
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
-  const result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  // The prepare-failure path must not enter the cleanup scope at all: there is
+  // no worktree to clean, and entering it would hand cleanup an undefined wt.
+  // Harmless today only because cleanup guards its own argument - this asserts
+  // the nesting rather than leaning on that guard. (Assumes no concurrent
+  // dispatch; top-level tests run sequentially.)
+  const realCleanup = worktrees.cleanup;
+  const cleanupCalls = [];
+  worktrees.cleanup = (wt) => { cleanupCalls.push(wt); return realCleanup(wt); };
+  let result;
+  try {
+    result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  } finally {
+    worktrees.cleanup = realCleanup;
+  }
 
   assert.strictEqual(result.status, 'failed');
+  assert.deepStrictEqual(cleanupCalls, [],
+    'the prepare-failure path entered the cleanup scope with no worktree');
   const stored = orders.get(root, order.id);
   assert.match(stored.error, /worktree/);
   assert.strictEqual(stored.startedAt, null, 'no agent should have started');
@@ -299,10 +314,13 @@ test('cancelling during worktree preparation does not spawn an agent', async () 
   // settled guard, and an agent starts that the API then refuses to cancel
   // (409, already settled): unlisted, unsupervised, and surviving a server kill.
   //
-  // A git project is the case with a real window: `git worktree add` takes
-  // hundreds of milliseconds even on this two-file fixture. runOrder runs
-  // synchronously up to `await worktrees.prepare`, so marking the record on the
-  // next line lands squarely inside that window with no tick needed.
+  // A git project is the case with a real window: `git worktree add` takes tens
+  // of milliseconds even on this two-file fixture (33-40ms measured), and
+  // seconds on a real repository. The test does not depend on that margin
+  // though - runOrder runs synchronously up to `await worktrees.prepare`, so
+  // marking the record on the next line is inside the window by construction,
+  // with no tick needed. Do not add an await above it and start relying on the
+  // duration instead.
   const root = tmpDir('skillspace-home-');
   const repo = tmpGitRepo();
   const project = projects.create(root, { path: repo });
@@ -409,4 +427,28 @@ test('an order that settles as failed during preparation does not spawn either',
   assert.ok(!fs.existsSync(marker), 'an agent was spawned for an order already settled as failed');
   assert.strictEqual(orders.get(root, order.id).status, 'failed');
   assert.strictEqual(dispatch.inFlightCount(), 0, 'the intent-check path leaked its slot');
+});
+
+test('a store failure while marking the order running leaks nothing', async () => {
+  // markRunning sat between the inFlight claim and the try/finally that
+  // released it - the only statement in that gap. A store write failing there
+  // leaked the slot permanently (that order id undispatchable forever), leaked
+  // the worktree and its branch, and left the record queued.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  // Readable so get()/countToday() still work; unwritable so writeJson throws.
+  fs.chmodSync(path.join(root, 'orders'), 0o555);
+  try {
+    await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) }).catch(() => {});
+  } finally {
+    fs.chmodSync(path.join(root, 'orders'), 0o755);
+  }
+
+  assert.strictEqual(dispatch.inFlightCount(), 0, 'the slot leaked permanently');
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
+    'the worktree leaked');
 });
