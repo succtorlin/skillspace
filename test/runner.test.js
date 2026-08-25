@@ -28,6 +28,10 @@ function shimAgent(script) {
   return { id: 'fake', bin, buildArgs: (p) => ['-p', p] };
 }
 
+// Counts machine-wide, and `pgrep -f` matches ANY command line containing this
+// string - including the shell you drive these tests from. A driving command that
+// mentions the literal pattern will be counted as a sleeper and skew this. Use a
+// non-self-matching pattern like "slee[p] 60" when poking at it by hand.
 function countSleepers() {
   try {
     return execSync('pgrep -f "sleep 60" | wc -l', { encoding: 'utf8' }).trim();
@@ -40,6 +44,7 @@ const ECHO = '#!/bin/sh\necho "stdout: $2"\necho "stderr line" >&2\nexit 0\n';
 const FAIL = '#!/bin/sh\necho "going wrong"\nexit 7\n';
 const SLOW = '#!/bin/sh\nsleep 60\n';
 const CHILD = '#!/bin/sh\nsleep 60 &\nwait\n';
+const CHATTY = '#!/bin/sh\nwhile true; do echo "spam line"; done\n';
 
 test('a successful run reports exit 0 and captures both streams', async () => {
   const cwd = tmpDir();
@@ -121,4 +126,58 @@ test('onChunk receives output as it arrives', async () => {
     onChunk: (s) => chunks.push(s),
   });
   assert.ok(chunks.join('').includes('streamed'), 'the caller must be able to stream this to SSE');
+});
+
+test('a chatty agent that is timed out does not crash the host process', async () => {
+  // finish() ended the log while the child was still writing, and the stream
+  // had no error listener, so the next chunk raised an unhandled
+  // ERR_STREAM_WRITE_AFTER_END and took the process down. The original tests
+  // missed it because `sleep 60` is silent; real agents are not.
+  const r = await runner.run({
+    agent: shimAgent(CHATTY), prompt: 'x', cwd: tmpDir(),
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 400,
+  });
+  assert.strictEqual(r.error, 'timeout');
+  // Still alive to assert it: reaching this line at all is the assertion.
+  await new Promise((res) => setTimeout(res, 600));
+  assert.ok(true, 'process survived a chatty timeout');
+});
+
+test('a chatty agent that is cancelled does not crash the host process', async () => {
+  const handle = runner.start({
+    agent: shimAgent(CHATTY), prompt: 'x', cwd: tmpDir(),
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
+  });
+  await new Promise((res) => setTimeout(res, 300));
+  handle.cancel();
+  const r = await handle.done;
+  assert.strictEqual(r.error, 'cancelled');
+  await new Promise((res) => setTimeout(res, 600));
+  assert.ok(true, 'process survived a chatty cancel');
+});
+
+test('an unwritable log directory is reported, not recorded as success', async () => {
+  const dir = tmpDir();
+  const logDir = path.join(dir, 'logs');
+  fs.mkdirSync(logDir);
+  fs.chmodSync(logDir, 0o500); // r-x: mkdirSync succeeds, the write does not
+  try {
+    const r = await runner.run({
+      agent: shimAgent(ECHO), prompt: 'x', cwd: tmpDir(),
+      logFile: path.join(logDir, 'run.log'), timeoutMs: 10000,
+    });
+    assert.ok(r.error, 'a lost log must not be reported as a clean run');
+    assert.match(r.error, /log:/);
+  } finally {
+    fs.chmodSync(logDir, 0o700);
+  }
+});
+
+test('a bad cwd is reported as a bad cwd, not a missing agent', async () => {
+  const r = await runner.run({
+    agent: shimAgent(ECHO), prompt: 'x', cwd: '/definitely/not/here',
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 5000,
+  });
+  assert.match(r.error, /cwd does not exist/);
+  assert.ok(!/fake-agent/.test(r.error), 'the agent was blamed for the caller\'s directory');
 });
