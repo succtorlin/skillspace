@@ -169,7 +169,7 @@ test('a failed prepare leaves nothing behind', async () => {
   const root = tmpDir('skillspace-wthome-');
   await assert.rejects(
     () => worktrees.prepare(root, { kind: 'git', path: notARepo }, 'ord-fff'),
-    /worktree/,
+    /worktree: fatal: not a git repository/,
   );
   const wtRoot = path.join(root, 'worktrees');
   const leftover = fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [];
@@ -182,17 +182,56 @@ test('a worktree git created but could not finish is cleaned up', async () => {
   // the worktree fully, then exits non-zero. Repos really do have these hooks
   // (husky, git-lfs, direnv), and no agent has spawned yet, so the half-made
   // tree is git's own and safe to remove.
+  const orderId = 'ord-hook';
   const repo = tmpGitRepo();
-  fs.writeFileSync(path.join(repo, '.git', 'hooks', 'post-checkout'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  // A real hook explains itself on stderr. git's own first line is progress,
+  // so this is also what distinguishes the cause from the chatter.
+  fs.writeFileSync(
+    path.join(repo, '.git', 'hooks', 'post-checkout'),
+    '#!/bin/sh\necho "hook rejected the checkout" >&2\nexit 1\n',
+    { mode: 0o755 }
+  );
   const root = tmpDir('skillspace-wthome-');
 
   await assert.rejects(
-    () => worktrees.prepare(root, { kind: 'git', path: repo }, 'ord-hook'),
-    /worktree/
+    () => worktrees.prepare(root, { kind: 'git', path: repo }, orderId),
+    (e) => {
+      // The order records why it failed, so the reason must be the cause and
+      // not the progress line git happened to print first.
+      assert.match(e.message, /worktree/);
+      assert.ok(
+        !e.message.includes('Preparing worktree'),
+        `the order recorded git's progress line as the cause: ${e.message}`
+      );
+      return true;
+    }
   );
   const wtRoot = path.join(root, 'worktrees');
   const leftover = fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [];
   assert.deepStrictEqual(leftover, [], `prepare left ${JSON.stringify(leftover)} behind`);
+
+  // `worktree add -b` makes the branch before the checkout can fail, and no
+  // agent ran, so there is nothing here worth keeping.
+  const branches = execSync('git branch --list', { cwd: repo, encoding: 'utf8' });
+  assert.ok(!branches.includes(`skillspace/${orderId}`), 'a failed prepare leaked its branch');
+});
+
+test('gitignored output is reported, not silently discarded', async () => {
+  const repo = tmpGitRepo();
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'dist/\n');
+  execSync('git add -A', { cwd: repo });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m ignore', { cwd: repo });
+
+  const root = tmpDir('skillspace-wthome-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord-ign');
+  fs.mkdirSync(path.join(wt.cwd, 'dist'));
+  fs.writeFileSync(path.join(wt.cwd, 'dist', 'build.js'), 'output\n');
+
+  const r = await worktrees.cleanup(wt);
+  assert.strictEqual(r.ignoredOutput, 1, 'an agent that only wrote to dist/ must not read as having done nothing');
+  // and it is genuinely not committed - we are reporting, not smuggling it in
+  const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
+  assert.ok(!files.includes('dist/build.js'), 'ignored output must not be committed');
 });
 
 test('cleanup is safe to call twice', async () => {
