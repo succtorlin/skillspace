@@ -99,6 +99,22 @@ test('a timeout is failed with error "timeout", distinct from a non-zero exit', 
   assert.strictEqual(done.exitCode, null, 'a killed process has no exit code of its own');
 });
 
+test('a timeout discards the exit code of the process we killed', () => {
+  // The realistic dispatcher shape: we SIGTERM a timed-out child, close fires
+  // with 143, and we also know we timed it out. Without the guard the record
+  // would show exitCode 143 and read as an ordinary non-zero exit, losing the
+  // one fact that distinguishes "the agent gave up" from "we stopped it".
+  // The error-only case cannot catch this: exitCode defaults to null there, so
+  // the ternary is a no-op and the mutant survives.
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  orders.markRunning(root, o.id, { cwd: '/tmp/wt', agent: 'claude' });
+  const done = orders.markFinished(root, o.id, { exitCode: 143, error: 'timeout' });
+  assert.strictEqual(done.status, 'failed');
+  assert.strictEqual(done.error, 'timeout');
+  assert.strictEqual(done.exitCode, null, 'the killed process exit code must not survive');
+});
+
 test('markFailed records a failure that happened before any agent started', () => {
   const root = tmpRoot();
   const o = orders.create(root, { projectId: 'p', prompt: 'x' });
@@ -106,6 +122,13 @@ test('markFailed records a failure that happened before any agent started', () =
   assert.strictEqual(done.status, 'failed');
   assert.match(done.error, /dirty tree/);
   assert.strictEqual(done.startedAt, null, 'nothing ever started');
+
+  // And it must NULL an existing startedAt, not merely decline to set one.
+  // Leaving a stale timestamp would contradict the field's whole meaning:
+  // the board reads a non-null startedAt as "this actually ran".
+  const r = orders.create(root, { projectId: 'p', prompt: 'x' });
+  orders.markRunning(root, r.id, { cwd: '/tmp/wt', agent: 'claude' });
+  assert.strictEqual(orders.markFailed(root, r.id, 'boom').startedAt, null);
 });
 
 test('cancel is its own status, not a failure', () => {
@@ -153,4 +176,33 @@ test('reconcile marks orphaned running orders interrupted', () => {
   assert.strictEqual(orders.get(root, a.id).status, 'interrupted');
   assert.strictEqual(orders.get(root, a.id).error, 'interrupted');
   assert.strictEqual(orders.get(root, b.id).status, 'succeeded', 'settled orders are untouched');
+});
+
+test('an over-long prompt is rejected, never silently truncated', () => {
+  const root = tmpRoot();
+  assert.throws(
+    () => orders.create(root, { projectId: 'p', prompt: 'x'.repeat(100001) }),
+    /prompt is too long/
+  );
+  // and the boundary is inclusive
+  const ok = orders.create(root, { projectId: 'p', prompt: 'x'.repeat(100000) });
+  assert.strictEqual(ok.prompt.length, 100000);
+});
+
+test('countToday uses the local day, not UTC', () => {
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  // An order created "now" always counts, whatever the host zone.
+  assert.strictEqual(orders.countToday(root, 'p'), 1);
+  // One dated to local midnight today still counts; one a day earlier does not.
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  require('../lib/store').writeJson(root, `orders/${o.id}.json`,
+    { ...orders.get(root, o.id), createdAt: midnight.toISOString() });
+  assert.strictEqual(orders.countToday(root, 'p'), 1, 'local midnight is today');
+
+  const yesterday = new Date(midnight.getTime() - 1000);
+  require('../lib/store').writeJson(root, `orders/${o.id}.json`,
+    { ...orders.get(root, o.id), createdAt: yesterday.toISOString() });
+  assert.strictEqual(orders.countToday(root, 'p'), 0, 'one second before local midnight is not');
 });
