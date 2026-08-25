@@ -117,6 +117,24 @@ test('a timeout reaps the whole process group, not just the direct child', async
   assert.strictEqual(countByToken(sleeper.token), before, 'a grandchild survived the timeout');
 });
 
+test('cancel reaps the whole process group, not just the direct child', async () => {
+  // Group-kill was only exercised on the timeout path, so a cancel() that
+  // settled without signalling passed every test - while leaving the agent and
+  // its tool subprocesses running, billing, with nothing left to reap them.
+  // Cancel is the path a user actually triggers from the UI.
+  const sleeper = sleeperShim();
+  const before = countByToken(sleeper.token);
+  const handle = runner.start({
+    agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
+  });
+  await new Promise((r) => setTimeout(r, 400));
+  handle.cancel();
+  await handle.done;
+  await new Promise((r) => setTimeout(r, 1200));
+  assert.strictEqual(countByToken(sleeper.token), before, 'a grandchild survived the cancel');
+});
+
 test('cancel stops a running agent and reports cancelled', async () => {
   const handle = runner.start({
     agent: shimAgent(SLOW), prompt: 'x', cwd: tmpDir(),
@@ -129,22 +147,31 @@ test('cancel stops a running agent and reports cancelled', async () => {
 });
 
 test('a missing agent binary is reported, not thrown', async () => {
-  const r = await runner.run({
+  const handle = runner.start({
     agent: { id: 'ghost', bin: '/definitely/not/here/ghost', buildArgs: (p) => ['-p', p] },
     prompt: 'x', cwd: tmpDir(), logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 5000,
   });
+  // The spawn failure arrives asynchronously, after start() has already handed
+  // back a pid, so an un-normalised pid is `undefined` and a `pid !== null`
+  // check does not mean what it looks like.
+  assert.strictEqual(handle.pid, null, 'a failed spawn must report a null pid, not undefined');
+  const r = await handle.done;
   assert.ok(r.error, 'a missing binary must surface as an error');
   assert.match(r.error, /ghost/, 'the message must name the binary');
 });
 
-test('onChunk receives output as it arrives', async () => {
+test('onChunk receives output as it arrives, from both streams', async () => {
   const chunks = [];
   await runner.run({
     agent: shimAgent(ECHO), prompt: 'streamed', cwd: tmpDir(),
     logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 10000,
     onChunk: (s) => chunks.push(s),
   });
-  assert.ok(chunks.join('').includes('streamed'), 'the caller must be able to stream this to SSE');
+  const streamed = chunks.join('');
+  assert.ok(streamed.includes('streamed'), 'the caller must be able to stream this to SSE');
+  // Stderr is where agents explain failures. A UI fed only stdout would stream
+  // the run happily and silently drop the diagnosis.
+  assert.ok(streamed.includes('stderr line'), 'stderr never reached the callback');
 });
 
 test('a chatty agent that is timed out does not crash the host process', async () => {
@@ -202,16 +229,38 @@ test('a bad cwd is reported as a bad cwd, not a missing agent', async () => {
 });
 
 test('the reason a chatty run ended reaches the log', async () => {
-  // Two independent halves prevent the crash (the error listener and the
-  // detach), so neither alone fails the crash tests. What the detach uniquely
-  // buys is the tail: without it the write-after-end destroys the stream and
-  // the queued buffer - marker included - is dropped. The record survives the
-  // process, but loses the line explaining why the run ended.
+  // This pins the drain-wait: resolving without waiting for the stream to
+  // finish leaves the marker still queued, and a caller reading the log the
+  // instant done resolves misses the one line explaining the record.
+  //
+  // It also pins "no write-after-end occurs", which is carried by the detach OR
+  // by log.writable - removing either alone keeps this green, removing both
+  // destroys the stream with the marker still queued. It does NOT pin the
+  // detach specifically; nothing does, and that is a property of defence in
+  // depth rather than a gap to close.
   const logFile = path.join(tmpDir(), 'run.log');
   const r = await runner.run({
     agent: shimAgent(CHATTY), prompt: 'x', cwd: tmpDir(), logFile, timeoutMs: 400,
   });
   assert.strictEqual(r.error, 'timeout');
-  assert.match(fs.readFileSync(logFile, 'utf8'), /timeout after 400ms/,
+  const atResolve = fs.readFileSync(logFile, 'utf8');
+  assert.match(atResolve, /timeout after 400ms/,
     'the marker explaining the outcome never reached the log');
+  // The marker alone is a flaky pin: on a short backlog it can happen to be
+  // flushed already, and a mutant that drops the drain-wait then survives. The
+  // drain itself is the deterministic property - without the wait the file is
+  // still being written after done resolved.
+  await new Promise((res) => setTimeout(res, 700));
+  assert.strictEqual(fs.readFileSync(logFile, 'utf8').length, atResolve.length,
+    'the log was still being written after done resolved');
+});
+
+test('a throwing onChunk cannot kill the run, and leaves a trace', async () => {
+  const logFile = path.join(tmpDir(), 'run.log');
+  const r = await runner.run({
+    agent: shimAgent(ECHO), prompt: 'x', cwd: tmpDir(), logFile, timeoutMs: 10000,
+    onChunk: () => { throw new Error('consumer exploded'); },
+  });
+  assert.strictEqual(r.exitCode, 0, 'a broken consumer must not kill an agent mid-edit');
+  assert.match(fs.readFileSync(logFile, 'utf8'), /onChunk threw/, 'the failure vanished silently');
 });
