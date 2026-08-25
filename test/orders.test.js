@@ -213,20 +213,24 @@ test('every terminal state resists a late write, not just failed', () => {
   // close event. reconcile() settles by writing directly rather than through
   // patch(), so 'interrupted' is the state most likely to meet a late close -
   // and it was the least defended.
-  const root = tmpRoot();
   const settle = {
-    succeeded: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
-                         orders.markFinished(root, id, { exitCode: 0 }); },
-    failed:    (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
-                         orders.markFinished(root, id, { exitCode: 9 }); },
-    cancelled: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
-                         orders.markCancelled(root, id); },
-    interrupted: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
-                           orders.reconcile(root); },
+    succeeded: (root, id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                               orders.markFinished(root, id, { exitCode: 0 }); },
+    failed:    (root, id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                               orders.markFinished(root, id, { exitCode: 9 }); },
+    cancelled: (root, id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                               orders.markCancelled(root, id); },
+    interrupted: (root, id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                                 orders.reconcile(root); },
   };
   for (const [state, reach] of Object.entries(settle)) {
+    // A root per iteration. Sharing one was correct only because 'interrupted'
+    // happens to sort last and every earlier case settles before it runs -
+    // neither of which the test asserted. One stray running peer and the shared
+    // reconcile() would rewrite it underneath the assertion.
+    const root = tmpRoot();
     const o = orders.create(root, { projectId: `p-${state}`, prompt: 'x' });
-    reach(o.id);
+    reach(root, o.id);
     const before = orders.get(root, o.id);
     assert.strictEqual(before.status, state, `setup failed to reach ${state}`);
 
@@ -247,4 +251,77 @@ test('ids from one process are monotonically increasing', () => {
   const sorted = [...ids].sort();
   assert.deepStrictEqual(ids, sorted, 'ids must sort in creation order');
   assert.strictEqual(new Set(ids).size, 500, 'ids must be unique');
+});
+
+test('a malformed record cannot crash list or reconcile, or escape the cap', () => {
+  const root = tmpRoot();
+  const good = orders.create(root, { projectId: 'p', prompt: 'x' });
+  const store = require('../lib/store');
+  // Sorts BEFORE the real id, which is the position that used to throw.
+  store.writeJson(root, 'orders/ord-000000AAAA.json', { id: 'ord-000000AAAA', createdAt: 12345 });
+  store.writeJson(root, 'orders/ord-000000BBBB.json', 'not even an object');
+
+  const all = orders.list(root);
+  assert.strictEqual(all.length, 1, 'malformed records must be skipped, not thrown on');
+  assert.strictEqual(all[0].id, good.id);
+  assert.strictEqual(orders.reconcile(root), 0, 'boot must not crash on a malformed record');
+  assert.strictEqual(orders.countToday(root, 'p'), 1, 'an undateable record must not inflate or escape the count');
+});
+
+test('an undateable record carrying a real projectId cannot escape the cap', () => {
+  // The fail-open countToday used to have: a non-string createdAt reaches
+  // localDay, yields NaN-NaN-NaN, and matches nothing - so the order exists but
+  // never counts against the day's budget. usable() is what closes it, so the
+  // record has to share the projectId being counted or the filter hides the bug.
+  const root = tmpRoot();
+  orders.create(root, { projectId: 'p', prompt: 'x' });
+  require('../lib/store').writeJson(root, 'orders/ord-000000CCCC.json',
+    { id: 'ord-000000CCCC', projectId: 'p', createdAt: 12345, status: 'queued' });
+  assert.strictEqual(orders.countToday(root, 'p'), 1);
+});
+
+test('a contradictory exit code and error fails safe, never succeeds', () => {
+  // exitCode 0 with an error is a caller mistake, and the safe reading is
+  // failure: this module's thesis is that exiting zero is not evidence of
+  // having done the right thing. The suite could not previously tell the
+  // fail-safe from a plain `exitCode === 0` check.
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  orders.markRunning(root, o.id, { cwd: '/tmp', agent: 'a' });
+  const done = orders.markFinished(root, o.id, { exitCode: 0, error: 'cancelled' });
+  assert.strictEqual(done.status, 'failed');
+});
+
+test('an over-long acceptance is rejected, and a present one is trimmed', () => {
+  // acceptance is what a verdict gets judged against in plan 2b. Truncating it
+  // destroys the criterion on disk while leaving something that still reads as
+  // a criterion.
+  const root = tmpRoot();
+  assert.throws(
+    () => orders.create(root, { projectId: 'p', prompt: 'x', acceptance: 'a'.repeat(100001) }),
+    /acceptance is too long/
+  );
+  const ok = orders.create(root, { projectId: 'p', prompt: 'x', acceptance: '  tests pass  ' });
+  assert.strictEqual(ok.acceptance, 'tests pass', 'acceptance is trimmed like its peers');
+  // Absent or blank stays the empty string rather than becoming null.
+  assert.strictEqual(orders.create(root, { projectId: 'p', prompt: 'x' }).acceptance, '');
+  assert.strictEqual(orders.create(root, { projectId: 'p', prompt: 'x', acceptance: '   ' }).acceptance, '');
+});
+
+test('markFailed with no message does not record an error named "undefined"', () => {
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  const done = orders.markFailed(root, o.id);
+  assert.strictEqual(done.status, 'failed');
+  assert.notStrictEqual(done.error, 'undefined');
+  assert.match(done.error, /unspecified/);
+});
+
+test('title truncation never splits a surrogate pair', () => {
+  const root = tmpRoot();
+  // 300 astral-plane code points: a naive slice(0, 200) cuts one in half and
+  // leaves a lone high surrogate, which renders as a replacement glyph.
+  const o = orders.create(root, { projectId: 'p', prompt: 'x', title: '\u{1F600}'.repeat(300) });
+  assert.strictEqual(Array.from(o.title).length, 200, 'truncated by code point, not code unit');
+  assert.ok(!/[\uD800-\uDBFF]$/.test(o.title), 'must not end on a lone high surrogate');
 });
