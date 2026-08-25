@@ -99,6 +99,14 @@ async function orderRoutes(ctx) {
         // runOrder rejecting means a bug in dispatch, not a failed order - a
         // failed order is recorded on the order itself. This path leaves no
         // durable trace, so put one on the record too.
+        //
+        // Reachable from outside, and tested: orders.countToday runs in
+        // runOrder's prologue before the try that catches everything else, so
+        // an orders/ directory that is writable but not READABLE makes it
+        // throw here while leaving markFailed able to record the outcome. See
+        // "a dispatch that rejects is recorded on the order" in
+        // test/orders-api.test.js. Without markFailed the order sits at queued
+        // forever and the reason exists only on a console nobody is reading.
         console.error('[server] order %s failed to dispatch:', order.id, e.message);
         try { orders.markFailed(root, order.id, `dispatch: ${e.message}`); } catch (_) {}
       })

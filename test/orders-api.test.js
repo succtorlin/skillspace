@@ -283,6 +283,69 @@ test('the number of simultaneous orders is bounded', async () => {
   s.child.kill('SIGKILL');
 });
 
+test('a completed order releases its slot', async () => {
+  // The bound test fires slow orders simultaneously, so it proves the limit is
+  // enforced but never that a slot comes back. A leaked slot is worse than no
+  // bound at all: after N completed orders the server refuses every further
+  // one until it restarts. Needs the DEFAULT bound of 4 - against the main
+  // server's raised 32 a leak would take 32 orders to surface.
+  const home = tmp('skillspace-slothome-');
+  const s = await startServer(home);
+  const project = await makeProject(undefined, s.base);
+  const statuses = [];
+  for (let i = 0; i < 6; i++) {
+    // Fast agent (no SLOW_MARK), awaited in sequence, so each finishes before
+    // the next POST. 150ms is comfortably longer than the shim's whole life -
+    // measured at 15-40ms from spawn to runOrder resolving on a dir project,
+    // where worktree cleanup is a no-op.
+    const r = await json('POST', '/api/orders', { projectId: project.id, prompt: `seq${i}` }, s.base);
+    statuses.push(r.status);
+    await new Promise((res) => setTimeout(res, 150));
+  }
+  assert.deepStrictEqual(statuses, [200, 200, 200, 200, 200, 200],
+    `a slot was not released: ${statuses.join(',')}`);
+  s.child.kill('SIGKILL');
+});
+
+test('a dispatch that rejects is recorded on the order, not just the console', async () => {
+  // runOrder rejecting means a bug in dispatch rather than a failed order -
+  // dispatch records a failed order itself - so this is the one outcome with
+  // no durable trace unless the route writes one.
+  //
+  // Reaching it from outside takes a real fault, not a stub: orders.countToday
+  // runs in runOrder's prologue, BEFORE the try that catches everything else,
+  // and it calls readdir. An orders/ directory with write+execute but no READ
+  // makes that throw while leaving the store writable enough for markFailed to
+  // record the outcome - which is exactly the asymmetry this test needs, since
+  // an unwritable store would leave the order queued either way and prove
+  // nothing.
+  const home = tmp('skillspace-rejecthome-');
+  const s = await startServer(home);
+  const project = await makeProject(undefined, s.base);
+
+  // One normal order first, so orders/ exists to be chmod-ed, and settled.
+  await json('POST', '/api/orders', { projectId: project.id, prompt: 'warm up' }, s.base);
+  await new Promise((r) => setTimeout(r, 500));
+
+  const odir = path.join(home, 'orders');
+  fs.chmodSync(odir, 0o300);
+  let id;
+  try {
+    const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'boom' }, s.base);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    id = r.body.order.id;
+    await new Promise((r2) => setTimeout(r2, 600));
+  } finally {
+    fs.chmodSync(odir, 0o700);
+  }
+
+  const after = (await json('GET', '/api/orders/' + id, undefined, s.base)).body.order;
+  assert.strictEqual(after.status, 'failed',
+    'a rejected dispatch left the order queued forever, with the reason only on the console');
+  assert.match(after.error, /^dispatch: /);
+  s.child.kill('SIGKILL');
+});
+
 test('GET /api/orders lists newest first and filters by project', async () => {
   const a = await makeProject();
   const b = await makeProject();
@@ -343,11 +406,19 @@ test('POST /api/orders refuses a top-level navigation', async () => {
     { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate' },
     { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Dest': 'document' },
   ];
+  // Cancel is state-changing too, and carries the same guard.
+  const seeded = seedOrder(storeRoot, 'queued');
   for (const h of shapes) {
     const res = await rawRequest('POST', '/api/orders', h, body);
     assert.match(res, /^HTTP\/1\.1 403 /,
       `navigation shape ${JSON.stringify(h)} was allowed: ${res.slice(0, 40)}`);
+
+    const cancelRes = await rawRequest('POST', `/api/orders/${seeded}/cancel`, h, '');
+    assert.match(cancelRes, /^HTTP\/1\.1 403 /,
+      `navigation shape ${JSON.stringify(h)} reached cancel: ${cancelRes.slice(0, 40)}`);
   }
+  // and none of those navigations actually cancelled anything
+  assert.strictEqual((await json('GET', '/api/orders/' + seeded)).body.order.status, 'queued');
   // The shape the console actually uses must still work.
   const ok = await rawRequest('POST', '/api/orders', {
     'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty',
