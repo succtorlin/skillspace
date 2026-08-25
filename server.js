@@ -9,9 +9,11 @@ const path = require('path');
 const os = require('os');
 const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
-const projects = require('./lib/projects');
+// orders is required here for the boot reconciliation only; the routes that
+// use projects and dispatch live in routes/.
 const orders = require('./lib/orders');
-const dispatch = require('./lib/dispatch');
+const projectRoutes = require('./routes/projects');
+const orderRoutes = require('./routes/orders');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -637,6 +639,26 @@ function readBody(req) {
 // "../projects" would resolve inside the root and reach another namespace.
 const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
 
+// Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
+// still carrying a separator into the store. A malformed escape like %ZZ is
+// not a decodable id at all, so it is rejected the same way a bad one is.
+// Answers the 400 itself and returns null, so a caller's next line is a guard
+// rather than a fourth copy of this.
+function plainIdFrom(res, raw, label) {
+  let id;
+  try {
+    id = decodeURIComponent(raw);
+  } catch (_) {
+    sendJson(res, 400, { error: `invalid ${label} id` });
+    return null;
+  }
+  if (!isPlainId(id)) {
+    sendJson(res, 400, { error: `invalid ${label} id` });
+    return null;
+  }
+  return id;
+}
+
 // The bind stops the network reaching us; this stops a web page doing it. A
 // cross-origin POST with Content-Type: text/plain is a CORS "simple request" -
 // no preflight - so any site the user visits could write to the registry. And
@@ -748,49 +770,19 @@ async function route(req, res, u, p) {
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
-  if (p === '/api/projects' && req.method === 'GET') {
-    return sendJson(res, 200, { projects: projects.list(SKILLSPACE_HOME) });
-  }
-
-  if (p === '/api/projects' && req.method === 'POST') {
-    const body = await readBody(req);
-    if (body[ABORTED]) return; // no client left to answer, and nothing to store
-    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
-    try {
-      return sendJson(res, 200, { project: projects.create(SKILLSPACE_HOME, body) });
-    } catch (e) {
-      // create() emits exactly two caller-fault shapes; anything else (EACCES
-      // on an unwritable store, for one) is ours, and reporting it as 400 told
-      // the user their input was bad when the disk was.
-      const msg = String((e && e.message) || e);
-      const clientFault = /^path (does not exist|is not a directory)/.test(msg);
-      return sendJson(res, clientFault ? 400 : 500, { error: msg });
-    }
-  }
-
-  // Single trailing segment only: startsWith would also swallow nested routes
-  // like /api/projects/:id/goals/:goalId, answering "invalid project id" for a
-  // path this handler was never meant to own.
-  const delMatch = req.method === 'DELETE' && p.match(/^\/api\/projects\/([^/]+)$/);
-  if (delMatch) {
-    let id;
-    try {
-      // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
-      // still carrying a separator into the store. A malformed escape like %ZZ
-      // is not a decodable id at all, so it is rejected the same way a bad one is.
-      id = decodeURIComponent(delMatch[1]);
-    } catch (_) {
-      return sendJson(res, 400, { error: 'invalid project id' });
-    }
-    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid project id' });
-    if (!projects.remove(SKILLSPACE_HOME, id)) {
-      // remove() reports whether anything matched, so an unknown id 404s
-      // instead of reporting a success that never happened.
-      return sendJson(res, 404, { error: 'no such project' });
-    }
-    // The record is gone; the working directory is deliberately untouched.
-    return sendJson(res, 200, { ok: true, filesKept: true });
-  }
+  // Both modules answer or decline; neither overlaps any path below, so the
+  // order they are tried in and their position here are free. Everything they
+  // need is passed in - reaching back into this file from routes/ would make
+  // the dependency circular.
+  const ctx = {
+    req, res, u, p,
+    root: SKILLSPACE_HOME,
+    sendJson, readBody, OVERSIZE, ABORTED,
+    plainIdFrom, isTopLevelNavigation,
+    AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS,
+  };
+  if (await projectRoutes(ctx)) return;
+  if (await orderRoutes(ctx)) return;
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
@@ -919,99 +911,6 @@ async function route(req, res, u, p) {
     const dir = await pickFolder(u.searchParams.get('for'));
     if (!dir) return sendJson(res, 200, { cancelled: true });
     return sendJson(res, 200, { dir });
-  }
-
-  // ---------- 工单 ----------
-
-  if (p === '/api/orders' && req.method === 'GET') {
-    const projectId = u.searchParams.get('project') || null;
-    return sendJson(res, 200, {
-      orders: orders.list(SKILLSPACE_HOME, projectId ? { projectId } : {}),
-    });
-  }
-
-  if (p === '/api/orders' && req.method === 'POST') {
-    // Creating an order spawns a credentialed agent, so it carries the same
-    // navigation guard as /api/run: a link clicked in Slack or Mail must not
-    // be able to start work.
-    if (isTopLevelNavigation(req)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('forbidden: /api/orders is not a navigable URL');
-    }
-    const body = await readBody(req);
-    if (body[ABORTED]) return;
-    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
-
-    const project = projects.get(SKILLSPACE_HOME, String(body.projectId || ''));
-    if (!project) return sendJson(res, 404, { error: 'no such project' });
-
-    let order;
-    try {
-      order = orders.create(SKILLSPACE_HOME, {
-        projectId: project.id,
-        prompt: body.prompt,
-        title: body.title,
-        acceptance: body.acceptance,
-      });
-    } catch (e) {
-      // orders.create emits its own caller-fault shapes; anything else is ours.
-      const msg = String((e && e.message) || e);
-      const clientFault = /(is required|is too long)$/.test(msg);
-      return sendJson(res, clientFault ? 400 : 500, { error: msg });
-    }
-
-    // Dispatch WITHOUT awaiting: runOrder resolves only when the agent exits,
-    // which is up to the project's orderTimeoutMs - 15 minutes by default. The
-    // caller gets the queued record now and follows progress via GET.
-    const agent = AGENTS.find((a) => a.id === body.agent) || AGENTS[0] || null;
-    dispatch
-      .runOrder(SKILLSPACE_HOME, { order, project, agent })
-      .catch((e) => console.warn('[server] order %s failed to dispatch:', order.id, e.message));
-
-    return sendJson(res, 200, { order });
-  }
-
-  const orderMatch = p.match(/^\/api\/orders\/([^/]+)$/);
-  if (orderMatch && req.method === 'GET') {
-    let id;
-    try {
-      id = decodeURIComponent(orderMatch[1]);
-    } catch (_) {
-      return sendJson(res, 400, { error: 'invalid order id' });
-    }
-    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid order id' });
-    const order = orders.get(SKILLSPACE_HOME, id);
-    if (!order) return sendJson(res, 404, { error: 'no such order' });
-    return sendJson(res, 200, { order });
-  }
-
-  const cancelMatch = p.match(/^\/api\/orders\/([^/]+)\/cancel$/);
-  if (cancelMatch && req.method === 'POST') {
-    if (isTopLevelNavigation(req)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('forbidden');
-    }
-    let id;
-    try {
-      id = decodeURIComponent(cancelMatch[1]);
-    } catch (_) {
-      return sendJson(res, 400, { error: 'invalid order id' });
-    }
-    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid order id' });
-
-    const existing = orders.get(SKILLSPACE_HOME, id);
-    if (!existing) return sendJson(res, 404, { error: 'no such order' });
-    if (existing.status !== 'queued' && existing.status !== 'running') {
-      return sendJson(res, 409, { error: `order is already ${existing.status}` });
-    }
-    // dispatch.cancel only reaches a RUNNING order. A queued one, or one still
-    // preparing its worktree, has no handle yet - and that is exactly the
-    // window a user is most likely to click cancel.
-    if (!dispatch.cancel(id)) orders.markCancelled(SKILLSPACE_HOME, id);
-    // Re-read rather than trusting a return: markCancelled goes through patch,
-    // which hands back the UNCHANGED record for an order that settled between
-    // the check above and here.
-    return sendJson(res, 200, { order: orders.get(SKILLSPACE_HOME, id) });
   }
 
   // 返回「粘贴到 Codex 的口令」文本（供前端预览 + 复制）

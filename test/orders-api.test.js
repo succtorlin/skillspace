@@ -70,11 +70,11 @@ function childEnvFor(home) {
   };
 }
 
-async function startServer(home) {
+async function startServer(home, extraEnv) {
   const port = await freePort();
   const proc = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...childEnvFor(home), PORT: String(port) },
+    env: { ...childEnvFor(home), PORT: String(port), ...(extraEnv || {}) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   children.push(proc);
@@ -102,10 +102,16 @@ let base, storeRoot;
 before(async () => {
   rigAgent();
   storeRoot = tmp('skillspace-ordershome-');
-  const s = await startServer(storeRoot);
+  // The concurrency bound is raised out of the way here so the tests that are
+  // not about it never measure it: several of them fire orders back to back,
+  // and a dispatch stays in flight for a few ms after its POST returns. The
+  // bound gets its own server, at the real default, below.
+  const s = await startServer(storeRoot, { SKILLSPACE_MAX_RUNS: '32' });
   base = s.base;
-  // The rig is load-bearing for every dispatch below: if the shim were not the
-  // agent the server found, these tests would spawn the user's real one.
+  // The rig is load-bearing for every dispatch below: POST /api/orders spawns
+  // a real, credentialed agent, so a rig that failed OPEN would silently run
+  // the user's own `claude` on their account against a temp directory. This
+  // assertion is what makes that a red test instead.
   const cfg = await (await fetch(base + '/api/config')).json();
   assert.deepStrictEqual(cfg.agents, ['claude'], 'test rig did not isolate the agent');
 });
@@ -127,9 +133,9 @@ const json = async (method, p, body, at) => {
   return { status: r.status, body: parsed };
 };
 
-async function makeProject(extra) {
+async function makeProject(extra, at) {
   const dir = tmp('skillspace-orderwork-');
-  const r = await json('POST', '/api/projects', { name: 'Orders', path: dir, ...(extra || {}) });
+  const r = await json('POST', '/api/projects', { name: 'Orders', path: dir, ...(extra || {}) }, at);
   assert.strictEqual(r.status, 200, 'project fixture failed: ' + JSON.stringify(r.body));
   return r.body.project;
 }
@@ -205,6 +211,76 @@ test('POST /api/orders returns immediately, without waiting for the agent', asyn
     elapsed < 2000,
     `POST took ${elapsed}ms — the route waited for the agent (shim sleeps ${SLOW_SECONDS}s)`
   );
+});
+
+test('POST /api/orders refuses an unrecognised agent instead of substituting', async () => {
+  // Silently falling back to AGENTS[0] does not merely surprise: runOrder
+  // writes the substituted id onto the order record, so the store ends up
+  // asserting the caller asked for an agent they never named.
+  const project = await makeProject();
+  const r = await json('POST', '/api/orders', {
+    projectId: project.id, prompt: 'do a thing', agent: 'totally-bogus',
+  });
+  assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error, /totally-bogus/, 'the refusal must name the agent');
+
+  // and the refusal created nothing
+  const listed = (await json('GET', `/api/orders?project=${project.id}`)).body.orders;
+  assert.deepStrictEqual(listed, [], 'a refused agent still created an order');
+});
+
+test('POST /api/orders defaults the agent when none is named', async () => {
+  const project = await makeProject();
+  const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'no agent named' });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  // The rig installs exactly one, so the default is observable on the record
+  // once dispatch has claimed it.
+  await new Promise((r2) => setTimeout(r2, 400));
+  const after = (await json('GET', '/api/orders/' + r.body.order.id)).body.order;
+  assert.strictEqual(after.agent, 'claude');
+});
+
+test('POST /api/orders refuses when no agent is installed at all', async () => {
+  // Same branch as the unrecognised id, other half: with nothing installed the
+  // old code dispatched with agent null and let runOrder mark the order failed,
+  // which spent a record to say what the request could have been told.
+  const emptyBin = tmp('skillspace-noagent-');
+  const home = tmp('skillspace-noagenthome-');
+  const s = await startServer(home, { PATH: `${emptyBin}:/usr/bin:/bin` });
+  const cfg = await (await fetch(s.base + '/api/config')).json();
+  assert.deepStrictEqual(cfg.agents, [], 'fixture still found an agent');
+
+  const project = await makeProject(undefined, s.base);
+  const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x' }, s.base);
+  assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+  assert.deepStrictEqual((await json('GET', '/api/orders', undefined, s.base)).body.orders, []);
+  s.child.kill('SIGKILL');
+});
+
+test('the number of simultaneous orders is bounded', async () => {
+  // Its own server, at the real default bound, so this measures the bound and
+  // not whatever the rest of the file happens to have in flight.
+  const home = tmp('skillspace-boundhome-');
+  const s = await startServer(home);
+  // A slow agent, so the accepted orders are still in flight when the next
+  // request arrives - otherwise the bound would never be reached and this
+  // would pass against no bound at all.
+  const project = await makeProject(undefined, s.base);
+  const accepted = [];
+  for (let i = 0; i < 8; i++) {
+    const r = await json('POST', '/api/orders', {
+      projectId: project.id, prompt: `${SLOW_MARK} n${i}`,
+    }, s.base);
+    accepted.push(r.status);
+  }
+  assert.ok(accepted.includes(429), `no request was refused: ${accepted.join(',')}`);
+  assert.ok(accepted.filter((x) => x === 200).length <= 4, 'more orders ran than the bound allows');
+
+  // A refused request must not leave a queued order behind.
+  const listed = (await json('GET', `/api/orders?project=${project.id}`, undefined, s.base)).body.orders;
+  assert.strictEqual(listed.length, accepted.filter((x) => x === 200).length,
+    'a refused request created an order that will never be dispatched');
+  s.child.kill('SIGKILL');
 });
 
 test('GET /api/orders lists newest first and filters by project', async () => {
