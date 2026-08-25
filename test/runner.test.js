@@ -28,22 +28,40 @@ function shimAgent(script) {
   return { id: 'fake', bin, buildArgs: (p) => ['-p', p] };
 }
 
-// Counts machine-wide, and `pgrep -f` matches ANY command line containing this
-// string - including the shell you drive these tests from. A driving command that
-// mentions the literal pattern will be counted as a sleeper and skew this. Use a
-// non-self-matching pattern like "slee[p] 60" when poking at it by hand.
-function countSleepers() {
+// A uniquely-named sleeper, so the count cannot see another copy of this suite
+// running concurrently - which happens routinely on a shared worktree, and which
+// showed up as a DECREASE (the other copy's sleeper dying between the two
+// samples) rather than the increase a real leak produces.
+//
+// This replaced a machine-wide `pgrep -f "sleep 60"`, whose trap is worth
+// recording: `pgrep -f` matches ANY command line containing the string,
+// including the shell you drive these tests from, so a driving command that
+// merely mentions the pattern gets counted as a sleeper. That is why the token
+// exists. Poking at a machine-wide count by hand needs a non-self-matching
+// pattern like "slee[p] 60".
+function sleeperShim() {
+  const token = `skillspace-sleeper-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const dir = tmpDir('skillspace-sleeper-');
+  const bin = path.join(dir, token);
+  fs.writeFileSync(bin, '#!/bin/sh\nsleep 60\n');
+  fs.chmodSync(bin, 0o755);
+  return { token, bin };
+}
+
+function countByToken(token) {
   try {
-    return execSync('pgrep -f "sleep 60" | wc -l', { encoding: 'utf8' }).trim();
+    return execSync(`pgrep -f ${token} | wc -l`, { encoding: 'utf8' }).trim();
   } catch (_) {
     return '0';
   }
 }
 
+// Note for mutation testing: CHATTY never exits on its own, so a mutant that
+// disables the timeout wedges this whole file instead of failing it. Scope such
+// a run with `node --test --test-name-pattern '<test name>'`.
 const ECHO = '#!/bin/sh\necho "stdout: $2"\necho "stderr line" >&2\nexit 0\n';
 const FAIL = '#!/bin/sh\necho "going wrong"\nexit 7\n';
 const SLOW = '#!/bin/sh\nsleep 60\n';
-const CHILD = '#!/bin/sh\nsleep 60 &\nwait\n';
 const CHATTY = '#!/bin/sh\nwhile true; do echo "spam line"; done\n';
 
 test('a successful run reports exit 0 and captures both streams', async () => {
@@ -89,13 +107,14 @@ test('a run past its timeout is killed and reported as timeout', async () => {
 test('a timeout reaps the whole process group, not just the direct child', async () => {
   // Agent CLIs spawn tool subprocesses. Killing only the direct pid leaves
   // those orphaned to PID 1 - still writing files, still billing, invisible.
-  const before = countSleepers();
+  const sleeper = sleeperShim();
+  const before = countByToken(sleeper.token);
   await runner.run({
-    agent: shimAgent(CHILD), prompt: 'x', cwd: tmpDir(),
+    agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
     logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 700,
   });
   await new Promise((r) => setTimeout(r, 1500));
-  assert.strictEqual(countSleepers(), before, 'a grandchild survived the timeout');
+  assert.strictEqual(countByToken(sleeper.token), before, 'a grandchild survived the timeout');
 });
 
 test('cancel stops a running agent and reports cancelled', async () => {
@@ -180,4 +199,19 @@ test('a bad cwd is reported as a bad cwd, not a missing agent', async () => {
   });
   assert.match(r.error, /cwd does not exist/);
   assert.ok(!/fake-agent/.test(r.error), 'the agent was blamed for the caller\'s directory');
+});
+
+test('the reason a chatty run ended reaches the log', async () => {
+  // Two independent halves prevent the crash (the error listener and the
+  // detach), so neither alone fails the crash tests. What the detach uniquely
+  // buys is the tail: without it the write-after-end destroys the stream and
+  // the queued buffer - marker included - is dropped. The record survives the
+  // process, but loses the line explaining why the run ended.
+  const logFile = path.join(tmpDir(), 'run.log');
+  const r = await runner.run({
+    agent: shimAgent(CHATTY), prompt: 'x', cwd: tmpDir(), logFile, timeoutMs: 400,
+  });
+  assert.strictEqual(r.error, 'timeout');
+  assert.match(fs.readFileSync(logFile, 'utf8'), /timeout after 400ms/,
+    'the marker explaining the outcome never reached the log');
 });
