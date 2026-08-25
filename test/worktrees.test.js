@@ -14,12 +14,15 @@ function tmpDir(prefix) {
   created.push(d);
   return d;
 }
+function gitCommit(cwd, message) {
+  execSync(`git -c user.email=t@t -c user.name=t commit -q -m ${message}`, { cwd });
+}
 function tmpGitRepo() {
   const d = tmpDir('skillspace-wtrepo-');
   execSync('git init -q', { cwd: d });
   fs.writeFileSync(path.join(d, 'file.txt'), 'original\n');
   execSync('git add -A', { cwd: d });
-  execSync('git -c user.email=t@t -c user.name=t commit -q -m init', { cwd: d });
+  gitCommit(d, 'init');
   return d;
 }
 after(() => {
@@ -70,7 +73,7 @@ test('a dir project runs in the project itself and says it is not isolated', asy
   const r = await worktrees.cleanup(wt);
   assert.deepStrictEqual(
     r,
-    { removed: false, committed: false, branchKept: false, ignoredOutput: 0 },
+    { removed: false, committed: false, branchKept: false, ignoredOutput: 0, preserveError: null },
     'a dir project must report that nothing was removed, committed or kept'
   );
   assert.ok(fs.existsSync(dir), 'cleanup must never remove a dir project');
@@ -153,13 +156,12 @@ test('a legitimate branch is used as the base', async () => {
   // which branch was checked out. Give each branch a file only it has.
   const repo = tmpGitRepo();
   const c = { cwd: repo };
-  const commit = (m) => execSync(`git -c user.email=t@t -c user.name=t commit -q -m ${m}`, c);
   execSync('git checkout -q -b feature-x', c);
   fs.writeFileSync(path.join(repo, 'branch-only.txt'), 'on feature-x\n');
-  execSync('git add -A', c); commit('feature');
+  execSync('git add -A', c); gitCommit(repo, 'feature');
   execSync('git checkout -q -', c);
   fs.writeFileSync(path.join(repo, 'main-only.txt'), 'on the default branch\n');
-  execSync('git add -A', c); commit('main');
+  execSync('git add -A', c); gitCommit(repo, 'main');
 
   const root = tmpDir('skillspace-wthome-');
   const wt = await worktrees.prepare(root, { kind: 'git', path: repo, branch: 'feature-x' }, 'ord-eee');
@@ -239,7 +241,7 @@ test('gitignored output is reported, not silently discarded', async () => {
   const repo = tmpGitRepo();
   fs.writeFileSync(path.join(repo, '.gitignore'), 'dist/\n');
   execSync('git add -A', { cwd: repo });
-  execSync('git -c user.email=t@t -c user.name=t commit -q -m ignore', { cwd: repo });
+  gitCommit(repo, 'ignore');
 
   const root = tmpDir('skillspace-wthome-');
   const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord-ign');
@@ -282,7 +284,7 @@ test('a cleanup that commits real work still excludes ignored output', async () 
   const repo = tmpGitRepo();
   fs.writeFileSync(path.join(repo, '.gitignore'), 'dist/\n.env\nnode_modules/\n');
   execSync('git add -A', { cwd: repo });
-  execSync('git -c user.email=t@t -c user.name=t commit -q -m ignore', { cwd: repo });
+  gitCommit(repo, 'ignore');
 
   const root = tmpDir('skillspace-wthome-');
   const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_mixed');
@@ -295,7 +297,9 @@ test('a cleanup that commits real work still excludes ignored output', async () 
 
   const r = await worktrees.cleanup(wt);
   assert.strictEqual(r.committed, true, 'the tracked change must be committed');
-  assert.ok(r.ignoredOutput >= 3, `expected the ignored files to be counted, got ${r.ignoredOutput}`);
+  // Porcelain ENTRIES, not files: dist/ and node_modules/ each collapse to one
+  // line, so three ignored paths read as exactly 3.
+  assert.strictEqual(r.ignoredOutput, 3, `expected 3 ignored entries, got ${r.ignoredOutput}`);
 
   const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
   assert.match(files, /src\.js/, 'the real work was not preserved');
@@ -304,34 +308,110 @@ test('a cleanup that commits real work still excludes ignored output', async () 
   }
 });
 
-test('an ambient GIT_DIR cannot retarget the worktree', async () => {
+test('ambient git env vars cannot retarget the worktree or the snapshot', async () => {
   // A GIT_DIR inherited from a hook or a parent process would otherwise make
-  // git operate on a different repository than the project entirely.
+  // git operate on a different repository than the project entirely, and a
+  // GIT_INDEX_FILE from that same hook diverts the preservation commit - the
+  // agent's work would be staged through a foreign index and never land.
   const repo = tmpGitRepo();
   fs.writeFileSync(path.join(repo, 'real-only.txt'), 'the real project\n');
   execSync('git add -A', { cwd: repo });
-  execSync('git -c user.email=t@t -c user.name=t commit -q -m real', { cwd: repo });
+  gitCommit(repo, 'real');
 
   const decoy = tmpGitRepo();
   fs.writeFileSync(path.join(decoy, 'decoy-only.txt'), 'the wrong project\n');
   execSync('git add -A', { cwd: decoy });
-  execSync('git -c user.email=t@t -c user.name=t commit -q -m decoy', { cwd: decoy });
+  gitCommit(decoy, 'decoy');
 
   const root = tmpDir('skillspace-wthome-');
-  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
-  let wt;
+  const VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'];
+  const saved = Object.fromEntries(VARS.map((k) => [k, process.env[k]]));
+  let wt, r;
   try {
     process.env.GIT_DIR = path.join(decoy, '.git');
     process.env.GIT_WORK_TREE = decoy;
+    process.env.GIT_INDEX_FILE = path.join(decoy, '.git', 'foreign-index');
     wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_env');
+    assert.ok(fs.existsSync(path.join(wt.cwd, 'real-only.txt')), 'the worktree was not built from the project');
+    assert.ok(!fs.existsSync(path.join(wt.cwd, 'decoy-only.txt')), 'an ambient GIT_DIR retargeted the worktree at another repo');
+    // the agent works, and the snapshot must be staged through OUR index
+    fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'the work\n');
+    r = await worktrees.cleanup(wt);
   } finally {
-    for (const k of ['GIT_DIR', 'GIT_WORK_TREE']) {
+    for (const k of VARS) {
       if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
     }
   }
-  assert.ok(fs.existsSync(path.join(wt.cwd, 'real-only.txt')), 'the worktree was not built from the project');
-  assert.ok(!fs.existsSync(path.join(wt.cwd, 'decoy-only.txt')), 'an ambient GIT_DIR retargeted the worktree at another repo');
-  await worktrees.cleanup(wt);
+  assert.strictEqual(r.committed, true, `the snapshot commit failed: ${r.preserveError}`);
+  const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
+  assert.match(files, /agent-output\.txt/, 'an ambient GIT_INDEX_FILE diverted the snapshot commit');
+});
+
+test("the user's pre-commit hook does not block preserving the agent's work", async () => {
+  // A linked worktree shares the common dir's hooks, so husky/lint-staged fires
+  // on our snapshot - and agent-written code failing lint is the normal case,
+  // not an exotic one. Their commit policy must not cost the agent its work.
+  const repo = tmpGitRepo();
+  const hookDir = path.join(repo, '.git', 'hooks');
+  fs.mkdirSync(hookDir, { recursive: true });
+  fs.writeFileSync(path.join(hookDir, 'pre-commit'), '#!/bin/sh\necho "lint failed" >&2\nexit 1\n');
+  fs.chmodSync(path.join(hookDir, 'pre-commit'), 0o755);
+
+  const root = tmpDir('skillspace-wthome-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_hookfail');
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'the only copy\n');
+
+  const r = await worktrees.cleanup(wt);
+  assert.strictEqual(r.committed, true, "the user's lint policy blocked our snapshot commit");
+  assert.strictEqual(r.preserveError, null);
+  const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
+  assert.match(files, /agent-output\.txt/, 'the work was not preserved');
+});
+
+test('work that cannot be committed is kept, not deleted and reported as nothing', async () => {
+  // --no-verify and gpgsign=false deliberately neutralise the hook and signing
+  // triggers, so the residual failure class is environmental: a full disk or an
+  // unwritable object store. That is what this simulates.
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_nosave');
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'the only copy\n');
+
+  const objects = path.join(repo, '.git', 'objects');
+  let r;
+  try {
+    execSync(`chmod -R 555 ${objects}`);
+    r = await worktrees.cleanup(wt);
+  } finally {
+    execSync(`chmod -R 755 ${objects}`); // so the fixture can be torn down
+  }
+
+  assert.strictEqual(r.committed, false);
+  assert.ok(r.preserveError, 'a failed preservation must be distinguishable from an agent that did nothing');
+  assert.strictEqual(r.removed, false, 'a tree holding the only copy of the work must not be removed');
+  assert.ok(
+    fs.existsSync(path.join(wt.cwd, 'agent-output.txt')),
+    "the only copy of the agent's work was deleted"
+  );
+});
+
+test('cleanup refuses a persisted record whose cwd is the project itself', async () => {
+  // wt round-trips through persistence, so a corrupted record must not turn
+  // cleanup into "delete the user's entire project" and report all-clear.
+  const dir = tmpDir('skillspace-plain-');
+  fs.writeFileSync(path.join(dir, 'user-work.txt'), 'not ours to delete\n');
+  const forged = {
+    cwd: dir, isolated: true, branch: 'skillspace/ord_forged',
+    projectPath: dir, orderId: 'ord_forged',
+  };
+
+  const r = await worktrees.cleanup(forged);
+  assert.strictEqual(r.removed, false);
+  assert.match(r.preserveError, /cwd is the project itself/);
+  assert.ok(
+    fs.existsSync(path.join(dir, 'user-work.txt')),
+    "cleanup deleted the user's project from a persisted record"
+  );
 });
 
 test('cleanup is safe to call twice', async () => {
