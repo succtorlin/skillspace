@@ -44,6 +44,27 @@ after(() => {
 // nothing here should depend on inheriting the developer's environment.
 const testEnv = () => ({ PATH: process.env.PATH, HOME: process.env.HOME });
 
+// Poll an observable rather than sleeping a guessed interval - the same helper
+// test/orders-api.test.js already carries, and for the same reason its comment
+// gives: a fixed sleep encodes a warm-machine timing that does not hold under
+// contention. Fails loudly on timeout instead of falling through to a
+// confusing assertion.
+async function waitFor(what, predicate, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await predicate();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+function pidsIn(file) {
+  return fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)
+    : [];
+}
+
 const OK = '#!/bin/sh\necho "did the work"\nexit 0\n';
 const BAD = '#!/bin/sh\necho "broke"\nexit 4\n';
 const SLOW = '#!/bin/sh\nsleep 60\n';
@@ -502,9 +523,8 @@ test('a refusal returns null rather than a record with no id', async () => {
 test('two orders on a dir project do not run at once', async () => {
   // A plain directory has no isolation mechanism, so both agents would edit the
   // user's own files simultaneously - the corruption lib/worktrees exists to
-  // prevent. Measured before this guard: two agents spawned 2.7ms apart into
-  // the identical cwd. The interval is not the point and varies; the identical
-  // cwd is.
+  // prevent. The interval between the two spawns is harness-dependent and not
+  // the point; the identical cwd is.
   const root = tmpDir('skillspace-home-');
   const work = tmpDir('skillspace-work-');
   const project = projects.create(root, { path: work });
@@ -516,9 +536,17 @@ test('two orders on a dir project do not run at once', async () => {
   const agent = shimAgent(`#!/bin/sh\necho "$$" >> "${tally}"\nsleep 5\nexit 0\n`);
 
   const running = dispatch.runOrder(root, { childEnv: testEnv, order: first, project, agent });
-  await new Promise((r) => setTimeout(r, 300));
+  // Wait for the first agent to have ACTUALLY written its pid, not for a
+  // guessed interval. This also removes the race that made this test flaky:
+  // cancelling on a timer could SIGTERM the shim between exec and its append,
+  // leaving an empty tally that read as "no agent ran".
+  await waitFor('the first agent to record itself', () => pidsIn(tally).length >= 1);
+
   const refused = await dispatch.runOrder(root, { childEnv: testEnv, order: second, project, agent });
 
+  // The primary property, and the deterministic one: the guard refuses. The
+  // agent count below corroborates it but cannot be the main assertion, since
+  // zero agents is a SAFE outcome and only two is a failure.
   assert.strictEqual(refused.refused, 'project busy',
     'a second order was allowed into the user\'s own directory');
   assert.strictEqual(orders.get(root, second.id).status, 'queued',
@@ -527,10 +555,8 @@ test('two orders on a dir project do not run at once', async () => {
   dispatch.cancel(first.id);
   await running;
 
-  const ran = fs.existsSync(tally)
-    ? fs.readFileSync(tally, 'utf8').split('\n').filter(Boolean)
-    : [];
-  assert.strictEqual(ran.length, 1, `${ran.length} agents ran in one unisolated directory`);
+  const pids = pidsIn(tally);
+  assert.ok(pids.length <= 1, `${pids.length} agents ran in one unisolated directory`);
 });
 
 test('a git project still runs two orders at once', async () => {
@@ -548,11 +574,23 @@ test('a git project still runs two orders at once', async () => {
 
   const ra = dispatch.runOrder(root, { childEnv: testEnv, order: a, project, agent });
   const rb = dispatch.runOrder(root, { childEnv: testEnv, order: b, project, agent });
-  await new Promise((r) => setTimeout(r, 700));
 
-  assert.strictEqual(orders.get(root, a.id).status, 'running');
-  assert.strictEqual(orders.get(root, b.id).status, 'running',
-    'the dir-project guard also serialised an isolated project');
+  // Poll for both to be running - `git worktree add` is not instant and its
+  // duration varies. Settling EARLY is also an accepted stopping condition, so
+  // a record that fails is captured and reported rather than spinning until an
+  // opaque timeout: if the concurrent-worktree-add race ever bites here, the
+  // assertion below prints the status and the error that caused it.
+  const seen = await waitFor('both orders to reach a stable state', () => {
+    const sa = orders.get(root, a.id);
+    const sb = orders.get(root, b.id);
+    if (!sa || !sb) return false;
+    if (sa.status === 'running' && sb.status === 'running') return { sa, sb };
+    if (orders.SETTLED.has(sa.status) || orders.SETTLED.has(sb.status)) return { sa, sb };
+    return false;
+  });
+
+  assert.strictEqual(seen.sa.status, 'running', `order a is ${seen.sa.status}: ${seen.sa.error}`);
+  assert.strictEqual(seen.sb.status, 'running', `order b is ${seen.sb.status}: ${seen.sb.error}`);
 
   dispatch.cancel(a.id);
   dispatch.cancel(b.id);
