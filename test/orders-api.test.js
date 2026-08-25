@@ -4,7 +4,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const net = require('net');
 
 const store = require('../lib/store');
@@ -72,9 +72,18 @@ function childEnvFor(home) {
 
 async function startServer(home, extraEnv) {
   const port = await freePort();
+  const env = { ...childEnvFor(home), PORT: String(port), ...(extraEnv || {}) };
+  // Structural, and checked for EVERY server rather than only the first: the
+  // later ones are otherwise safe purely by inheriting fakeBin/fakeHome, and a
+  // future test passing its own HOME would fail OPEN in silence. server.js
+  // builds its child PATH as `${os.homedir()}/.local/bin:$PATH` with no way to
+  // override it, and that is where a real `claude` lives, so HOME is the bit
+  // that actually isolates the agent.
+  assert.strictEqual(env.HOME, fakeHome,
+    'a server was started with a HOME the rig does not control');
   const proc = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...childEnvFor(home), PORT: String(port), ...(extraEnv || {}) },
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   children.push(proc);
@@ -94,6 +103,14 @@ async function startServer(home, extraEnv) {
     }
     await new Promise((r) => setTimeout(r, 100));
   }
+  // POST /api/orders spawns a real, credentialed agent, so a rig that failed
+  // open would run the user's own `claude` on their account against a temp
+  // directory. Every agent this server can see must be the shim. (The empty
+  // set is legitimate - one test starts a server with no agent installed.)
+  const cfg = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  assert.ok(cfg.agents.every((id) => id === 'claude'),
+    `test rig did not isolate the agent: ${JSON.stringify(cfg.agents)}`);
+
   return { child: proc, port, base: `http://127.0.0.1:${port}`, stdout: () => out };
 }
 
@@ -108,12 +125,11 @@ before(async () => {
   // bound gets its own server, at the real default, below.
   const s = await startServer(storeRoot, { SKILLSPACE_MAX_RUNS: '32' });
   base = s.base;
-  // The rig is load-bearing for every dispatch below: POST /api/orders spawns
-  // a real, credentialed agent, so a rig that failed OPEN would silently run
-  // the user's own `claude` on their account against a temp directory. This
-  // assertion is what makes that a red test instead.
+  // startServer asserts the isolation for every server it starts, this one
+  // included. Assert the positive case once here too: the shim must actually
+  // be FOUND, or the whole suite would dispatch nothing and still pass.
   const cfg = await (await fetch(base + '/api/config')).json();
-  assert.deepStrictEqual(cfg.agents, ['claude'], 'test rig did not isolate the agent');
+  assert.deepStrictEqual(cfg.agents, ['claude'], 'the shim was not detected');
 });
 
 after(() => {
@@ -211,6 +227,27 @@ test('POST /api/orders returns immediately, without waiting for the agent', asyn
     elapsed < 2000,
     `POST took ${elapsed}ms — the route waited for the agent (shim sleeps ${SLOW_SECONDS}s)`
   );
+});
+
+test("an over-long prompt is the caller's fault, not a server error", async () => {
+  // lib/orders throws "prompt is too long (100001 > 100000)" - the phrase is
+  // not at the END of the message, so an alternation anchored there matched
+  // nothing and every oversize input came back 500: SkillSpace claiming it
+  // broke, for an input the user only needs to shorten. The boundary itself
+  // was never exercised, which is how the anchor survived.
+  const project = await makeProject();
+  const at = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x'.repeat(100000) });
+  assert.strictEqual(at.status, 200, 'the limit itself must be accepted');
+
+  const over = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x'.repeat(100001) });
+  assert.strictEqual(over.status, 400, 'an over-long prompt is a 400, not a 500');
+  assert.match(over.body.error, /is too long/);
+
+  // acceptance carries the same limit and the same message shape
+  const acc = await json('POST', '/api/orders', {
+    projectId: project.id, prompt: 'ok', acceptance: 'y'.repeat(100001),
+  });
+  assert.strictEqual(acc.status, 400);
 });
 
 test('POST /api/orders refuses an unrecognised agent instead of substituting', async () => {
@@ -479,6 +516,41 @@ test('cancel of an unknown order is 404, of a settled order is 409', async () =>
     assert.strictEqual(r.status, 409, `cancelling a ${settled} order got ${r.status}`);
     assert.match(r.body.error, new RegExp(settled));
   }
+});
+
+test('shutting the server down cancels its agents instead of orphaning them', async () => {
+  // The timeout that bounds a stuck agent is a setTimeout inside the server
+  // process, and agents are spawned detached - their own process group - so
+  // they never see a signal sent to the server's. Killing the console without
+  // cancelling therefore left credentialed agents reparented to init with no
+  // time bound at all, which is the product's core claim inverted.
+  const home = tmp('skillspace-shutdownhome-');
+  const s = await startServer(home);
+  const project = await makeProject(undefined, s.base);
+
+  // A marker that reaches the shim's argv, so the agent is findable by pgrep -
+  // the order record carries no pid.
+  const mark = `SHUTDOWN-MARK-${process.pid}-${Date.now()}`;
+  const alive = () => {
+    try { return Number(execSync(`pgrep -f ${mark} | wc -l`).toString().trim()); } catch (_) { return 0; }
+  };
+
+  const ord = (await json('POST', '/api/orders', {
+    projectId: project.id, prompt: `${SLOW_MARK} ${mark}`,
+  }, s.base)).body.order;
+
+  for (let i = 0; i < 50 && alive() === 0; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(alive() > 0, 'the agent never started, so this proves nothing about shutdown');
+
+  s.child.kill('SIGTERM');
+  await new Promise((r) => s.child.on('exit', r));
+  for (let i = 0; i < 80 && alive() > 0; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.strictEqual(alive(), 0, 'the agent outlived the server with no time bound');
+
+  // and the record says why it ended, rather than leaving reconcile to guess
+  const rec = JSON.parse(fs.readFileSync(path.join(home, 'orders', ord.id + '.json'), 'utf8'));
+  assert.strictEqual(rec.status, 'cancelled',
+    'the server exited before the cancelled order recorded its outcome');
 });
 
 test('running orders are reconciled to interrupted on boot', async () => {

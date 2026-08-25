@@ -9,9 +9,10 @@ const path = require('path');
 const os = require('os');
 const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
-// orders is required here for the boot reconciliation only; the routes that
-// use projects and dispatch live in routes/.
+// orders and dispatch are required here for the boot reconciliation and the
+// shutdown path only; the routes that use them live in routes/.
 const orders = require('./lib/orders');
+const dispatch = require('./lib/dispatch');
 const projectRoutes = require('./routes/projects');
 const orderRoutes = require('./routes/orders');
 
@@ -720,6 +721,14 @@ function isTopLevelNavigation(req) {
   );
 }
 
+// One shape for all three refusals. The cancel route's copy had drifted to a
+// bare "forbidden", dropping the half of the message that tells whoever hits
+// it what actually happened and why.
+function denyNavigation(res, what) {
+  res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(`forbidden: ${what} is not a navigable URL`);
+}
+
 function serveStatic(res, file) {
   const full = path.join(PUBLIC, file);
   if (!full.startsWith(PUBLIC) || !fs.existsSync(full)) {
@@ -778,7 +787,7 @@ async function route(req, res, u, p) {
     req, res, u, p,
     root: SKILLSPACE_HOME,
     sendJson, readBody, OVERSIZE, ABORTED,
-    plainIdFrom, isTopLevelNavigation,
+    plainIdFrom, isTopLevelNavigation, denyNavigation,
     AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS,
   };
   if (await projectRoutes(ctx)) return;
@@ -930,10 +939,7 @@ async function route(req, res, u, p) {
     // running an attacker's prompt: Slack, Mail, Notes and IDE previews all
     // hand a URL to the browser as a top-level navigation, which arrives as
     // Sec-Fetch-Site: none and passes isCrossOrigin. EventSource does not.
-    if (isTopLevelNavigation(req)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('forbidden: /api/run is not a navigable URL');
-    }
+    if (isTopLevelNavigation(req)) return denyNavigation(res, '/api/run');
     if (req.method !== 'GET') {
       res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('method not allowed');
@@ -1056,6 +1062,41 @@ try {
   if (n) console.log(`  reconciled ${n} interrupted order(s)`);
 } catch (e) {
   console.warn('[server] could not reconcile orders:', e.message);
+}
+
+// The timeout that bounds a stuck agent is a setTimeout inside THIS process,
+// and agents run detached so they never see the signal sent to our group.
+// Without this, killing the console leaves credentialed agents running with no
+// bound at all - reconcile-on-boot then honestly records the order as
+// interrupted while the agent is still writing to the tree.
+let shuttingDown = false;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    if (shuttingDown) process.exit(130);   // a second ^C means "now"
+    shuttingDown = true;
+    const n = dispatch.cancelAll();
+    if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
+    // Exit once the socket is closed AND every cancelled order has recorded
+    // its outcome. Exiting on server.close alone fires in about 4ms - long
+    // before the runner has flushed the cancelled agent's log and markCancelled
+    // has run - which killed the agent correctly but left the order reading
+    // `running` on disk for reconcile to guess at on the next boot. runOrder
+    // deletes from inFlight in a finally, after the outcome is written, so an
+    // empty inFlight means the records are settled.
+    let closed = false;
+    server.close(() => { closed = true; });
+    const drain = setInterval(() => {
+      if (closed && dispatch.inFlightCount() === 0) {
+        clearInterval(drain);
+        process.exit(0);
+      }
+    }, 50);
+    // One second longer than the runner's 5s SIGTERM->SIGKILL escalation, so a
+    // child that ignores SIGTERM is reaped before we stop waiting for it. It is
+    // unref'd, but the drain interval above is not, so the loop stays alive
+    // long enough for this to fire on an order that never settles.
+    setTimeout(() => process.exit(0), 6000).unref();
+  });
 }
 
 server.listen(PORT, HOST_BIND, () => {

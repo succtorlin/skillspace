@@ -6,6 +6,31 @@ const dispatch = require('../lib/dispatch');
 // The order routes. Same contract as routes/projects.js: true when answered,
 // false when the path was not ours, and everything from the server arrives in
 // ctx rather than through a require back into it.
+//
+// Known limits, all recorded rather than fixed - they belong at the START of
+// plan 2b, so the goals and board modules are written against the new shape
+// instead of retrofitted onto this one:
+//
+// - DUPLICATE IN-FLIGHT REGISTRY. RUNNING_ORDERS here and dispatch's own
+//   inFlight track the same thing and release at DIFFERENT moments: this one
+//   in a .finally on runOrder, dispatch's inside runOrder's own finally. The
+//   two can disagree mid-shutdown. Folding this into dispatch.inFlightCount()
+//   would remove the second registry entirely.
+// - 2x PROCESS CEILING. /api/run and this route each cap at
+//   MAX_CONCURRENT_RUNS independently, so the real ceiling is twice the number
+//   the name promises. Consolidating on dispatch would close that too.
+// - CTX IS A BAG, NOT A FACTORY. Every handler destructures a different subset
+//   of a hand-assembled object, so a missing key is a TypeError at request
+//   time rather than at wiring time. A factory taking the server's deps once
+//   and returning the handler would move that to boot.
+// - `?project=` WITH AN EMPTY VALUE lists every order rather than none. No
+//   consumer today, but the board in plan 3 builds exactly this query and a
+//   cleared filter is the obvious way to produce it.
+// - plainIdFrom RESPONDS AND RETURNS NULL, so every caller must remember to
+//   return immediately. Fine at four call sites; misuse-prone past that.
+// - DELETE /api/projects/:id SUCCEEDS WITH ORDERS IN FLIGHT. The project
+//   record vanishes while agents are still running against its path, and the
+//   orders keep a projectId that no longer resolves.
 
 // Track in-flight order dispatches so the same bound that protects /api/run
 // protects this route. project.concurrency is the scheduler's per-project
@@ -17,7 +42,7 @@ const RUNNING_ORDERS = new Set();
 async function orderRoutes(ctx) {
   const {
     req, res, u, p, root, sendJson, readBody, OVERSIZE, ABORTED,
-    plainIdFrom, isTopLevelNavigation, AGENTS, maxConcurrentRuns,
+    plainIdFrom, isTopLevelNavigation, denyNavigation, AGENTS, maxConcurrentRuns,
   } = ctx;
 
   if (p === '/api/orders' && req.method === 'GET') {
@@ -31,8 +56,7 @@ async function orderRoutes(ctx) {
     // navigation guard as /api/run: a link clicked in Slack or Mail must not
     // be able to start work.
     if (isTopLevelNavigation(req)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('forbidden: /api/orders is not a navigable URL');
+      denyNavigation(res, '/api/orders');
       return true;
     }
     const body = await readBody(req);
@@ -83,8 +107,21 @@ async function orderRoutes(ctx) {
       });
     } catch (e) {
       // orders.create emits its own caller-fault shapes; anything else is ours.
+      //
+      // Anchored at the START, like routes/projects.js. lib/orders throws
+      // "prompt is too long (100001 > 100000)", so a trailing anchor matched
+      // the alternation and then failed - sending 500 for an input the user
+      // must shorten. Mutation testing cannot catch that: deleting the dead
+      // alternative is behaviourally identical to keeping it, which is why it
+      // took a boundary test.
+      //
+      // Matching on prose is the real weakness here. The intended fix is for
+      // lib/orders to tag its caller faults - e.code = 'EINVAL' - so this
+      // becomes a field check rather than a regex over a message anyone might
+      // reword. Deferred because lib/orders.js is closed; do it when that file
+      // is next opened.
       const msg = String((e && e.message) || e);
-      const clientFault = /(is required|is too long)$/.test(msg);
+      const clientFault = /^\w+ (is required|is too long)/.test(msg);
       sendJson(res, clientFault ? 400 : 500, { error: msg });
       return true;
     }
@@ -135,8 +172,7 @@ async function orderRoutes(ctx) {
   const cancelMatch = p.match(/^\/api\/orders\/([^/]+)\/cancel$/);
   if (cancelMatch && req.method === 'POST') {
     if (isTopLevelNavigation(req)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('forbidden');
+      denyNavigation(res, '/api/orders/:id/cancel');
       return true;
     }
     const id = plainIdFrom(res, cancelMatch[1], 'order');
