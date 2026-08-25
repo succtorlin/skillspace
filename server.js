@@ -10,6 +10,8 @@ const os = require('os');
 const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
 const projects = require('./lib/projects');
+const orders = require('./lib/orders');
+const dispatch = require('./lib/dispatch');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -919,6 +921,99 @@ async function route(req, res, u, p) {
     return sendJson(res, 200, { dir });
   }
 
+  // ---------- 工单 ----------
+
+  if (p === '/api/orders' && req.method === 'GET') {
+    const projectId = u.searchParams.get('project') || null;
+    return sendJson(res, 200, {
+      orders: orders.list(SKILLSPACE_HOME, projectId ? { projectId } : {}),
+    });
+  }
+
+  if (p === '/api/orders' && req.method === 'POST') {
+    // Creating an order spawns a credentialed agent, so it carries the same
+    // navigation guard as /api/run: a link clicked in Slack or Mail must not
+    // be able to start work.
+    if (isTopLevelNavigation(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('forbidden: /api/orders is not a navigable URL');
+    }
+    const body = await readBody(req);
+    if (body[ABORTED]) return;
+    if (body[OVERSIZE]) return sendJson(res, 413, { error: 'request body too large' });
+
+    const project = projects.get(SKILLSPACE_HOME, String(body.projectId || ''));
+    if (!project) return sendJson(res, 404, { error: 'no such project' });
+
+    let order;
+    try {
+      order = orders.create(SKILLSPACE_HOME, {
+        projectId: project.id,
+        prompt: body.prompt,
+        title: body.title,
+        acceptance: body.acceptance,
+      });
+    } catch (e) {
+      // orders.create emits its own caller-fault shapes; anything else is ours.
+      const msg = String((e && e.message) || e);
+      const clientFault = /(is required|is too long)$/.test(msg);
+      return sendJson(res, clientFault ? 400 : 500, { error: msg });
+    }
+
+    // Dispatch WITHOUT awaiting: runOrder resolves only when the agent exits,
+    // which is up to the project's orderTimeoutMs - 15 minutes by default. The
+    // caller gets the queued record now and follows progress via GET.
+    const agent = AGENTS.find((a) => a.id === body.agent) || AGENTS[0] || null;
+    dispatch
+      .runOrder(SKILLSPACE_HOME, { order, project, agent })
+      .catch((e) => console.warn('[server] order %s failed to dispatch:', order.id, e.message));
+
+    return sendJson(res, 200, { order });
+  }
+
+  const orderMatch = p.match(/^\/api\/orders\/([^/]+)$/);
+  if (orderMatch && req.method === 'GET') {
+    let id;
+    try {
+      id = decodeURIComponent(orderMatch[1]);
+    } catch (_) {
+      return sendJson(res, 400, { error: 'invalid order id' });
+    }
+    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid order id' });
+    const order = orders.get(SKILLSPACE_HOME, id);
+    if (!order) return sendJson(res, 404, { error: 'no such order' });
+    return sendJson(res, 200, { order });
+  }
+
+  const cancelMatch = p.match(/^\/api\/orders\/([^/]+)\/cancel$/);
+  if (cancelMatch && req.method === 'POST') {
+    if (isTopLevelNavigation(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('forbidden');
+    }
+    let id;
+    try {
+      id = decodeURIComponent(cancelMatch[1]);
+    } catch (_) {
+      return sendJson(res, 400, { error: 'invalid order id' });
+    }
+    if (!isPlainId(id)) return sendJson(res, 400, { error: 'invalid order id' });
+
+    const existing = orders.get(SKILLSPACE_HOME, id);
+    if (!existing) return sendJson(res, 404, { error: 'no such order' });
+    if (existing.status !== 'queued' && existing.status !== 'running') {
+      return sendJson(res, 409, { error: `order is already ${existing.status}` });
+    }
+    // dispatch.cancel only reaches a RUNNING order. A queued one, or one still
+    // preparing its worktree, has no handle yet - and that is exactly the
+    // window a user is most likely to click cancel.
+    if (!dispatch.cancel(id)) orders.markCancelled(SKILLSPACE_HOME, id);
+    // Re-read rather than trusting a return: markCancelled goes through patch,
+    // which hands back the UNCHANGED record for an order that settled between
+    // the check above and here.
+    return sendJson(res, 200, { order: orders.get(SKILLSPACE_HOME, id) });
+  }
+
   // 返回「粘贴到 Codex 的口令」文本（供前端预览 + 复制）
   if (p === '/api/prompt') {
     const name = u.searchParams.get('skill') || '';
@@ -1055,6 +1150,15 @@ async function route(req, res, u, p) {
 // (see BIND_IS_LOOPBACK): it is an opt-out of DNS-rebinding protection, which
 // is meaningless once the socket is reachable from the network anyway. The
 // Origin/Sec-Fetch-Site check still applies.
+// Any order still marked running lost its child process when the previous
+// server died. It is never assumed to have succeeded.
+try {
+  const n = orders.reconcile(SKILLSPACE_HOME);
+  if (n) console.log(`  reconciled ${n} interrupted order(s)`);
+} catch (e) {
+  console.warn('[server] could not reconcile orders:', e.message);
+}
+
 server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
   console.log(`  → http://localhost:${PORT}`);
