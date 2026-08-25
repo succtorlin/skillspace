@@ -9,6 +9,7 @@ const { execSync } = require('child_process');
 const dispatch = require('../lib/dispatch');
 const orders = require('../lib/orders');
 const projects = require('../lib/projects');
+const worktrees = require('../lib/worktrees');
 
 const created = [];
 function tmpDir(prefix) {
@@ -120,7 +121,10 @@ test('maxOrdersPerDay refuses a dispatch and does not spawn or prepare', async (
   const project = { ...base, budget: { ...base.budget, maxOrdersPerDay: 1 } };
 
   const first = orders.create(root, { projectId: project.id, prompt: 'one' });
-  await dispatch.runOrder(root, { order: first, project, agent: shimAgent(OK) });
+  const firstResult = await dispatch.runOrder(root, { order: first, project, agent: shimAgent(OK) });
+  // A cap of N runs N, not N-1: the dispatched order is already inside its own
+  // countToday, which is the only reason `>` rather than `>=` is correct.
+  assert.strictEqual(firstResult.status, 'succeeded', 'a cap of 1 must still run 1 order');
 
   const second = orders.create(root, { projectId: project.id, prompt: 'two' });
   const result = await dispatch.runOrder(root, { order: second, project, agent: shimAgent(OK) });
@@ -129,9 +133,18 @@ test('maxOrdersPerDay refuses a dispatch and does not spawn or prepare', async (
   assert.match(orders.get(root, second.id).error, /daily limit/);
   assert.strictEqual(orders.get(root, second.id).startedAt, null);
   // Refused BEFORE a worktree exists, so a refused order leaves nothing behind.
+  // An empty worktrees/ is NOT enough on its own - it is equally true of a
+  // worktree that was created and then cleaned up. The durable trace is the
+  // branch, which cleanup deliberately keeps. Scoped to the second order's id:
+  // the first order ran legitimately and its skillspace/ branch is meant to
+  // survive, so a blanket "no skillspace/ branches" check would fail here on
+  // correct code.
   const wtRoot = path.join(root, 'worktrees');
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
     'the budget check ran after the worktree was created');
+  const branches = execSync('git branch --list', { cwd: repo, encoding: 'utf8' });
+  assert.ok(!branches.includes(second.id),
+    'a refused order prepared a worktree it should never have created');
 });
 
 test('the order timeout comes from the project budget', async () => {
@@ -141,12 +154,27 @@ test('the order timeout comes from the project budget', async () => {
   const project = { ...base, budget: { ...base.budget, orderTimeoutMs: 700 } };
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
+  const started = Date.now();
   await dispatch.runOrder(root, { order, project, agent: shimAgent(SLOW) });
+  const elapsed = Date.now() - started;
 
   const stored = orders.get(root, order.id);
   assert.strictEqual(stored.status, 'failed');
   assert.strictEqual(stored.error, 'timeout');
   assert.strictEqual(stored.exitCode, null);
+  // The shim sleeps 60s, so ANY bound under 60s produces this same outcome -
+  // status alone cannot tell 700ms from a hardcoded 5000 or from 3x the
+  // budget. Elapsed time is what ties the run to the project's own number.
+  //
+  // Bracketed both ways: the lower bound catches a bound SMALLER than the
+  // budget, the upper one a larger. 1800 rather than a rounder 3000 because a
+  // 3x mutant lands at ~2195ms and would sail under it. Correct code measured
+  // 777-795ms over five runs, so the upper bound carries ~2.3x headroom and
+  // still leaves ~400ms of daylight below the nearest surviving mutant.
+  assert.ok(elapsed >= 700,
+    `the run took ${elapsed}ms - shorter than the project's own 700ms budget`);
+  assert.ok(elapsed < 1800,
+    `the run took ${elapsed}ms - the project's 700ms budget was not used`);
 });
 
 test('a dir project runs in place and the directory survives', async () => {
@@ -157,7 +185,19 @@ test('a dir project runs in place and the directory survives', async () => {
   assert.strictEqual(project.kind, 'dir');
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
-  await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  // Watch what dispatch hands cleanup. A dir project marked isolated:true would
+  // take cleanup's destructive path over the user's own directory; today that
+  // is caught only by cleanup's own guard, nothing in dispatch.
+  const realCleanup = worktrees.cleanup;
+  const seen = [];
+  worktrees.cleanup = (wt) => { seen.push(wt && wt.isolated); return realCleanup(wt); };
+  try {
+    await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  } finally {
+    worktrees.cleanup = realCleanup;
+  }
+  assert.deepStrictEqual(seen, [false],
+    'cleanup was handed a dir project as isolated');
 
   assert.strictEqual(orders.get(root, order.id).cwd, fs.realpathSync(work));
   assert.ok(fs.existsSync(path.join(work, 'keep.txt')), 'a dir project must never be cleaned up');
@@ -198,6 +238,11 @@ test('a missing agent fails the order without preparing a worktree', async () =>
   assert.match(orders.get(root, order.id).error, /agent/);
   const wtRoot = path.join(root, 'worktrees');
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
+  // Nothing ran, so unlike the budget test there is no legitimate branch here
+  // and the blanket check is the stronger one.
+  const branches = execSync('git branch --list', { cwd: repo, encoding: 'utf8' });
+  assert.ok(!branches.includes('skillspace/'),
+    'a refused order prepared a worktree it should never have created');
 });
 
 test('a throw while starting the agent settles the order, never leaves it running', async () => {
@@ -214,6 +259,10 @@ test('a throw while starting the agent settles the order, never leaves it runnin
   assert.match(orders.get(root, order.id).error, /dispatch:/);
   assert.notStrictEqual(orders.get(root, order.id).status, 'running',
     'a throw left the order live with no process behind it');
+  // markFailed would force startedAt back to null, erasing that this order got
+  // as far as being marked running. markFinished is the correct verb.
+  assert.ok(orders.get(root, order.id).startedAt,
+    'startedAt was erased; this order did start');
 });
 
 test('a second dispatch of the same order is refused', async () => {
@@ -273,4 +322,34 @@ test('cancelling during worktree preparation does not spawn an agent', async () 
   const wtRoot = path.join(root, 'worktrees');
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
     'the worktree survived an order that never ran');
+});
+
+test('a refused duplicate dispatch is distinguishable from a successful one', async () => {
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');        // dir project: no interlock
+  const project = projects.create(root, { path: work });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+  const agent = shimAgent(SLOW);
+
+  const first = dispatch.runOrder(root, { order, project, agent });
+  await new Promise((r) => setTimeout(r, 200));
+  const second = await dispatch.runOrder(root, { order, project, agent });
+
+  assert.ok(second.refused, 'a refusal must be visible to the caller');
+  assert.ok(dispatch.cancel(order.id));
+  await first;
+});
+
+test('a worktree failure releases the slot', async () => {
+  // Otherwise the Map grows forever and that order id is permanently
+  // undispatchable - the same leak the prepare catch was written to avoid.
+  const root = tmpDir('skillspace-home-');
+  const notARepo = tmpDir('skillspace-plain-');
+  const project = { ...projects.create(root, { path: notARepo }), kind: 'git' };
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  const first = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  assert.strictEqual(first.status, 'failed');
+  const second = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  assert.ok(!second.refused, 'the slot was never released');
 });
