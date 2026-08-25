@@ -199,3 +199,43 @@ test('a missing agent fails the order without preparing a worktree', async () =>
   const wtRoot = path.join(root, 'worktrees');
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
 });
+
+test('a throw while starting the agent settles the order, never leaves it running', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+  // logs/ as a regular file: runner.start's mkdirSync throws EEXIST.
+  fs.writeFileSync(path.join(root, 'logs'), 'not a directory');
+
+  const result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(orders.get(root, order.id).error, /dispatch:/);
+  assert.notStrictEqual(orders.get(root, order.id).status, 'running',
+    'a throw left the order live with no process behind it');
+});
+
+test('a second dispatch of the same order is refused', async () => {
+  const root = tmpDir('skillspace-home-');
+  // A dir project is the case with no natural interlock: prepare cannot fail,
+  // so without a guard both agents run in the user's own directory.
+  const work = tmpDir('skillspace-work-');
+  const project = projects.create(root, { path: work });
+  assert.strictEqual(project.kind, 'dir');
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  const tally = path.join(tmpDir('skillspace-tally-'), 'runs.txt');
+  const agent = shimAgent(`#!/bin/sh\nsleep 1\necho ran >> ${tally}\nexit 0\n`);
+
+  await Promise.all([
+    dispatch.runOrder(root, { order, project, agent }),
+    dispatch.runOrder(root, { order, project, agent }),
+  ]);
+
+  const ran = fs.existsSync(tally)
+    ? fs.readFileSync(tally, 'utf8').split('\n').filter(Boolean)
+    : [];
+  assert.strictEqual(ran.length, 1,
+    `the agent ran ${ran.length} times in the user's own directory`);
+});
