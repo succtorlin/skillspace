@@ -33,6 +33,7 @@ test('create stores an order and returns it queued', () => {
 test('create requires a projectId and a prompt', () => {
   const root = tmpRoot();
   assert.throws(() => orders.create(root, { prompt: 'x' }), /projectId is required/);
+  assert.throws(() => orders.create(root, { projectId: '   ', prompt: 'x' }), /projectId is required/);
   assert.throws(() => orders.create(root, { projectId: 'p' }), /prompt is required/);
   assert.throws(() => orders.create(root, { projectId: 'p', prompt: '   ' }), /prompt is required/);
 });
@@ -205,4 +206,45 @@ test('countToday uses the local day, not UTC', () => {
   require('../lib/store').writeJson(root, `orders/${o.id}.json`,
     { ...orders.get(root, o.id), createdAt: yesterday.toISOString() });
   assert.strictEqual(orders.countToday(root, 'p'), 0, 'one second before local midnight is not');
+});
+
+test('every terminal state resists a late write, not just failed', () => {
+  // The guard exists because a process we already gave up on can still fire a
+  // close event. reconcile() settles by writing directly rather than through
+  // patch(), so 'interrupted' is the state most likely to meet a late close -
+  // and it was the least defended.
+  const root = tmpRoot();
+  const settle = {
+    succeeded: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                         orders.markFinished(root, id, { exitCode: 0 }); },
+    failed:    (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                         orders.markFinished(root, id, { exitCode: 9 }); },
+    cancelled: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                         orders.markCancelled(root, id); },
+    interrupted: (id) => { orders.markRunning(root, id, { cwd: '/tmp', agent: 'a' });
+                           orders.reconcile(root); },
+  };
+  for (const [state, reach] of Object.entries(settle)) {
+    const o = orders.create(root, { projectId: `p-${state}`, prompt: 'x' });
+    reach(o.id);
+    const before = orders.get(root, o.id);
+    assert.strictEqual(before.status, state, `setup failed to reach ${state}`);
+
+    // Every late mover must bounce off it.
+    orders.markFinished(root, o.id, { exitCode: 0 });
+    orders.markCancelled(root, o.id);
+    orders.markRunning(root, o.id, { cwd: '/other', agent: 'b' });
+    assert.deepStrictEqual(orders.get(root, o.id), before, `${state} was rewritten by a late call`);
+  }
+});
+
+test('ids from one process are monotonically increasing', () => {
+  // The sort tiebreak falls back to id order, which only means anything if ids
+  // rise with creation. createdAt is millisecond-resolution and ~75% of rapid
+  // pairs share a millisecond, so the id is what actually orders them.
+  const ids = [];
+  for (let i = 0; i < 500; i++) ids.push(orders.newId());
+  const sorted = [...ids].sort();
+  assert.deepStrictEqual(ids, sorted, 'ids must sort in creation order');
+  assert.strictEqual(new Set(ids).size, 500, 'ids must be unique');
 });
