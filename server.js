@@ -48,7 +48,11 @@ const CHILD_PATH = `${path.join(os.homedir(), '.local', 'bin')}:${process.env.PA
 // ---------- 专家存储 ----------
 // 不再接任何大模型 API：专家聚类交给你已经在用的 Codex / Claude Code，
 // SkillSpace 只负责出口令、开一个回传口子、显示结果。
-const EXPERTS_FILE = path.join(__dirname, 'experts.json');
+// Overridable for the same reason SKILLSPACE_HOME is: this path ignores it,
+// so without the override running the test suite rewrites the developer's own
+// experts.json. Rooted at __dirname by default, so existing installs are
+// untouched.
+const EXPERTS_FILE = process.env.SKILLSPACE_EXPERTS_FILE || path.join(__dirname, 'experts.json');
 
 function loadExperts() {
   try {
@@ -1055,6 +1059,11 @@ async function route(req, res, u, p) {
 // (see BIND_IS_LOOPBACK): it is an opt-out of DNS-rebinding protection, which
 // is meaningless once the socket is reachable from the network anyway. The
 // Origin/Sec-Fetch-Site check still applies.
+//
+// (The reconcile and shutdown blocks below sit between that comment and the
+// server.listen() call it explains. Kept adjacent to listen rather than moved,
+// because both must run before the socket is accepting.)
+
 // Any order still marked running lost its child process when the previous
 // server died. It is never assumed to have succeeded.
 try {
@@ -1077,12 +1086,18 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     const n = dispatch.cancelAll();
     if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
     // Exit once the socket is closed AND every cancelled order has recorded
-    // its outcome. Exiting on server.close alone fires in about 4ms - long
-    // before the runner has flushed the cancelled agent's log and markCancelled
-    // has run - which killed the agent correctly but left the order reading
-    // `running` on disk for reconcile to guess at on the next boot. runOrder
-    // deletes from inFlight in a finally, after the outcome is written, so an
-    // empty inFlight means the records are settled.
+    // its outcome.
+    //
+    // The ordering, which is what this rests on: runOrder deletes from inFlight
+    // in a `finally`, and a finally runs AFTER the return expression it guards
+    // - so the outcome is on disk before the count can reach zero. Waiting on
+    // the count therefore waits on the records, not merely on the agents.
+    //
+    // Exiting on server.close alone does not: measured at ~4ms, well inside the
+    // window where the runner is still flushing the cancelled agent's log, and
+    // it left the order reading `running` for reconcile to guess at. That
+    // measurement is the motivation; the ordering above is the guarantee, and
+    // only the end state - the order reads `cancelled` - is pinned by a test.
     let closed = false;
     server.close(() => { closed = true; });
     const drain = setInterval(() => {

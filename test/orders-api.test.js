@@ -67,8 +67,36 @@ function childEnvFor(home) {
     HOME: fakeHome,
     PATH: `${fakeBin}:/usr/bin:/bin`,
     SKILLSPACE_HOME: home,
+    // EXPERTS_FILE is rooted at __dirname and ignores SKILLSPACE_HOME, so
+    // without this the suite rewrites the developer's own experts.json - the
+    // last path by which running the tests damaged their install.
+    SKILLSPACE_EXPERTS_FILE: path.join(home, 'experts.json'),
   };
 }
+
+// Poll an observable instead of sleeping a guessed interval. The fixed sleeps
+// these replace assumed 15-40ms per order, which holds on a WARM server and
+// not on a cold one: the first order on a fresh process takes ~1.3s, and under
+// load four cold orders overlap so no slot frees inside any fixed budget.
+// Fails loudly on timeout rather than falling through to a confusing assert.
+async function waitFor(what, predicate, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await predicate();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+// Settled = the dispatch is over and its slot is back. Reading the record is
+// the only observable the HTTP surface offers for that.
+const settled = (id, at) => waitFor(`order ${id} to settle`, async () => {
+  const r = await json('GET', '/api/orders/' + id, undefined, at);
+  if (r.status !== 200) return false;
+  const st = r.body.order.status;
+  return st !== 'queued' && st !== 'running' ? st : false;
+});
 
 async function startServer(home, extraEnv) {
   const port = await freePort();
@@ -116,7 +144,14 @@ async function startServer(home, extraEnv) {
 
 let base, storeRoot;
 
+// The repo's own experts.json, snapshotted before anything runs. EXPERTS_FILE
+// is rooted at __dirname rather than SKILLSPACE_HOME, so until it was made
+// overridable a suite run rewrote the developer's install.
+const REPO_EXPERTS = path.join(__dirname, '..', 'experts.json');
+let expertsBefore;
+
 before(async () => {
+  expertsBefore = fs.existsSync(REPO_EXPERTS) ? fs.readFileSync(REPO_EXPERTS, 'utf8') : null;
   rigAgent();
   storeRoot = tmp('skillspace-ordershome-');
   // The concurrency bound is raised out of the way here so the tests that are
@@ -271,9 +306,12 @@ test('POST /api/orders defaults the agent when none is named', async () => {
   const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'no agent named' });
   assert.strictEqual(r.status, 200, JSON.stringify(r.body));
   // The rig installs exactly one, so the default is observable on the record
-  // once dispatch has claimed it.
-  await new Promise((r2) => setTimeout(r2, 400));
-  const after = (await json('GET', '/api/orders/' + r.body.order.id)).body.order;
+  // once dispatch has claimed it. Poll for the claim rather than guessing how
+  // long it takes.
+  const after = await waitFor('the dispatch to claim an agent', async () => {
+    const o = (await json('GET', '/api/orders/' + r.body.order.id)).body.order;
+    return o && o.agent ? o : false;
+  });
   assert.strictEqual(after.agent, 'claude');
 });
 
@@ -337,7 +375,10 @@ test('a completed order releases its slot', async () => {
     // where worktree cleanup is a no-op.
     const r = await json('POST', '/api/orders', { projectId: project.id, prompt: `seq${i}` }, s.base);
     statuses.push(r.status);
-    await new Promise((res) => setTimeout(res, 150));
+    // Wait for THIS order to settle, which is when its slot goes back. A fixed
+    // sleep here assumed a warm server and failed 4 runs in 5 under load,
+    // where a cold first dispatch takes ~1.3s.
+    if (r.status === 200) await settled(r.body.order.id, s.base);
   }
   assert.deepStrictEqual(statuses, [200, 200, 200, 200, 200, 200],
     `a slot was not released: ${statuses.join(',')}`);
@@ -361,8 +402,8 @@ test('a dispatch that rejects is recorded on the order, not just the console', a
   const project = await makeProject(undefined, s.base);
 
   // One normal order first, so orders/ exists to be chmod-ed, and settled.
-  await json('POST', '/api/orders', { projectId: project.id, prompt: 'warm up' }, s.base);
-  await new Promise((r) => setTimeout(r, 500));
+  const warm = await json('POST', '/api/orders', { projectId: project.id, prompt: 'warm up' }, s.base);
+  await settled(warm.body.order.id, s.base);
 
   const odir = path.join(home, 'orders');
   fs.chmodSync(odir, 0o300);
@@ -371,7 +412,9 @@ test('a dispatch that rejects is recorded on the order, not just the console', a
     const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'boom' }, s.base);
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
     id = r.body.order.id;
-    await new Promise((r2) => setTimeout(r2, 600));
+    // Pollable even mid-chmod: GET /api/orders/:id reads a KNOWN path, and only
+    // readdir needs the read bit this test removed.
+    await settled(id, s.base);
   } finally {
     fs.chmodSync(odir, 0o700);
   }
@@ -569,4 +612,20 @@ test('running orders are reconciled to interrupted on boot', async () => {
   const raw = JSON.parse(fs.readFileSync(path.join(home, 'orders', id + '.json'), 'utf8'));
   assert.strictEqual(raw.status, 'interrupted');
   s.child.kill('SIGKILL');
+});
+
+// Last, so every server this file started has had its chance to write.
+test("the suite does not touch the developer's own experts.json", async () => {
+  // Provoke a write first. Without this the assertion is vacuous: nothing else
+  // in this file calls /api/experts, so the repo file would be untouched even
+  // with the override removed - which is exactly what a mutation run showed.
+  const w = await json('POST', '/api/experts', { name: 'rig-probe', summary: 'written by the suite' });
+  assert.strictEqual(w.status, 200, `the write must actually happen: ${JSON.stringify(w.body)}`);
+  // and it landed in the per-test store, not the install
+  assert.ok(fs.existsSync(path.join(storeRoot, 'experts.json')),
+    'the override is set but the server wrote somewhere else');
+
+  const now = fs.existsSync(REPO_EXPERTS) ? fs.readFileSync(REPO_EXPERTS, 'utf8') : null;
+  assert.strictEqual(now, expertsBefore,
+    'running the tests rewrote the repo experts.json - SKILLSPACE_EXPERTS_FILE is not reaching the server');
 });

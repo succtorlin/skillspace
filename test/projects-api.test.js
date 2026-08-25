@@ -47,7 +47,13 @@ async function spawnServer(env, probeHost = '127.0.0.1') {
   const port = await freePort();
   const proc = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), SKILLSPACE_HOME: tmp('skillspace-bind-'), ...env },
+    env: {
+      ...process.env, PORT: String(port), SKILLSPACE_HOME: tmp('skillspace-bind-'),
+      // EXPERTS_FILE is rooted at __dirname and ignores SKILLSPACE_HOME, so
+      // without this /api/experts rewrites the developer's own install.
+      SKILLSPACE_EXPERTS_FILE: path.join(tmp('skillspace-experts-'), 'experts.json'),
+      ...env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   // Drain both pipes: unread, they fill at 64 KiB and wedge the child. Also
@@ -84,7 +90,12 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   child = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), SKILLSPACE_HOME: storeRoot },
+    env: {
+      ...process.env, PORT: String(port), SKILLSPACE_HOME: storeRoot,
+      // See above: this suite exercises /api/experts, so without the override
+      // it writes the repo's experts.json.
+      SKILLSPACE_EXPERTS_FILE: path.join(storeRoot, 'experts.json'),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';

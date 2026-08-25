@@ -239,3 +239,38 @@ test('a second dispatch of the same order is refused', async () => {
   assert.strictEqual(ran.length, 1,
     `the agent ran ${ran.length} times in the user's own directory`);
 });
+
+test('cancelling during worktree preparation does not spawn an agent', async () => {
+  // dispatch.cancel cannot reach an order that is still preparing - there is no
+  // handle yet - so the route settles the record itself. Without an intent
+  // check, prepare finishes, markRunning silently no-ops through patch()'s
+  // settled guard, and an agent starts that the API then refuses to cancel
+  // (409, already settled): unlisted, unsupervised, and surviving a server kill.
+  //
+  // A git project is the case with a real window: `git worktree add` takes
+  // hundreds of milliseconds even on this two-file fixture. runOrder runs
+  // synchronously up to `await worktrees.prepare`, so marking the record on the
+  // next line lands squarely inside that window with no tick needed.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  assert.strictEqual(project.kind, 'git');
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  const marker = path.join(tmpDir('skillspace-mark-'), 'spawned.txt');
+  const agent = shimAgent(`#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`);
+
+  const running = dispatch.runOrder(root, { order, project, agent });
+  assert.strictEqual(dispatch.cancel(order.id), false,
+    'the premise is that cancel cannot reach an order still preparing');
+  orders.markCancelled(root, order.id);   // what the route does in this window
+  await running;
+
+  assert.ok(!fs.existsSync(marker), 'an agent was spawned for an order already cancelled');
+  assert.strictEqual(orders.get(root, order.id).status, 'cancelled');
+
+  // and the abandoned worktree is not left holding the branch
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
+    'the worktree survived an order that never ran');
+});

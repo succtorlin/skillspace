@@ -27,7 +27,12 @@ const dispatch = require('../lib/dispatch');
 //   consumer today, but the board in plan 3 builds exactly this query and a
 //   cleared filter is the obvious way to produce it.
 // - plainIdFrom RESPONDS AND RETURNS NULL, so every caller must remember to
-//   return immediately. Fine at four call sites; misuse-prone past that.
+//   return immediately. Fine at the three call sites it has; misuse-prone past
+//   that.
+// - SHUTDOWN EXIT CODES are cosmetic rather than correct: the 6s hatch exits 0
+//   after giving up on an order that never settled, and a second signal of any
+//   kind exits 130, which is the code for SIGINT specifically. Both are wrong
+//   in a way only a script reading $? would notice, and nothing does.
 // - DELETE /api/projects/:id SUCCEEDS WITH ORDERS IN FLIGHT. The project
 //   record vanishes while agents are still running against its path, and the
 //   orders keep a projectId that no longer resolves.
