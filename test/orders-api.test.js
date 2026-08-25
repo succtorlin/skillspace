@@ -42,6 +42,14 @@ function freePort() {
 // `${os.homedir()}/.local/bin:$PATH` unconditionally, which is where a real
 // `claude` usually lives; os.homedir() reads $HOME on POSIX.
 //
+// The shim lives ONLY in fakeHome/.local/bin, and fakeBin is deliberately NOT
+// on PATH. That is the whole point: detection uses CHILD_PATH
+// (`$HOME/.local/bin:$PATH`) while the spawn uses whatever env it is handed, so
+// a shim reachable through both routes cannot tell the two apart. It was on
+// PATH as well, which is exactly why a spawn that ignored CHILD_PATH went
+// unnoticed - the agent was found anyway. Put it back on PATH and this suite
+// stops being able to observe which path spawned it.
+//
 // The shim exits 0 instantly unless the prompt names SLOW-AGENT, in which case
 // it sleeps — that is how "the route did not wait for the agent" becomes
 // observable rather than merely asserted.
@@ -50,9 +58,12 @@ const SLOW_MARK = 'SLOW-AGENT';
 const SLOW_SECONDS = 20;
 
 function rigAgent() {
-  fakeBin = tmp('skillspace-bin-');
+  fakeBin = tmp('skillspace-bin-');           // kept empty: a decoy that must NOT resolve
   fakeHome = tmp('skillspace-fakehome-');
-  const shim = path.join(fakeBin, 'claude');
+  // Where Claude Code actually installs, and the only place the shim exists.
+  const localBin = path.join(fakeHome, '.local', 'bin');
+  fs.mkdirSync(localBin, { recursive: true });
+  const shim = path.join(localBin, 'claude');
   // agent.buildArgs for claude is (p) => ['-p', p], so the prompt is $2.
   fs.writeFileSync(
     shim,
@@ -65,6 +76,8 @@ function childEnvFor(home) {
   return {
     ...process.env,
     HOME: fakeHome,
+    // fakeBin is empty and stays that way: the ONLY route to the shim is
+    // $HOME/.local/bin, which only CHILD_PATH provides.
     PATH: `${fakeBin}:/usr/bin:/bin`,
     SKILLSPACE_HOME: home,
     // EXPERTS_FILE is rooted at __dirname and ignores SKILLSPACE_HOME, so
@@ -102,12 +115,18 @@ async function startServer(home, extraEnv) {
   const port = await freePort();
   const env = { ...childEnvFor(home), PORT: String(port), ...(extraEnv || {}) };
   // Structural, and checked for EVERY server rather than only the first: the
-  // later ones are otherwise safe purely by inheriting fakeBin/fakeHome, and a
-  // future test passing its own HOME would fail OPEN in silence. server.js
-  // builds its child PATH as `${os.homedir()}/.local/bin:$PATH` with no way to
-  // override it, and that is where a real `claude` lives, so HOME is the bit
-  // that actually isolates the agent.
-  assert.strictEqual(env.HOME, fakeHome,
+  // later ones are otherwise safe purely by inheriting fakeHome, and a future
+  // test passing its own HOME would fail OPEN in silence. server.js builds its
+  // child PATH as `${os.homedir()}/.local/bin:$PATH` with no way to override
+  // it, and that is where a real `claude` lives, so HOME is the bit that
+  // actually isolates the agent.
+  //
+  // A test may substitute a DIFFERENT home - the no-agent fixture needs one
+  // with no .local/bin - but only ever a directory this rig created. That is
+  // the property worth guarding; pinning the exact value also forbade
+  // legitimate fixtures, and now that the shim lives under HOME rather than on
+  // PATH, hiding the agent is only possible by changing HOME.
+  assert.ok(created.includes(env.HOME),
     'a server was started with a HOME the rig does not control');
   const proc = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
@@ -270,17 +289,24 @@ test("an over-long prompt is the caller's fault, not a server error", async () =
   // nothing and every oversize input came back 500: SkillSpace claiming it
   // broke, for an input the user only needs to shorten. The boundary itself
   // was never exercised, which is how the anchor survived.
-  const project = await makeProject();
-  const at = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x'.repeat(100000) });
+  // A PROJECT PER PROBE. The accepted order below is still dispatching when the
+  // next POST arrives, and an unisolated project now takes one order at a time,
+  // so reusing one project would answer 409 (project busy) before the prompt
+  // was ever validated - masking the 400 this test exists to pin.
+  const at = await json('POST', '/api/orders', {
+    projectId: (await makeProject()).id, prompt: 'x'.repeat(100000),
+  });
   assert.strictEqual(at.status, 200, 'the limit itself must be accepted');
 
-  const over = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x'.repeat(100001) });
+  const over = await json('POST', '/api/orders', {
+    projectId: (await makeProject()).id, prompt: 'x'.repeat(100001),
+  });
   assert.strictEqual(over.status, 400, 'an over-long prompt is a 400, not a 500');
   assert.match(over.body.error, /is too long/);
 
   // acceptance carries the same limit and the same message shape
   const acc = await json('POST', '/api/orders', {
-    projectId: project.id, prompt: 'ok', acceptance: 'y'.repeat(100001),
+    projectId: (await makeProject()).id, prompt: 'ok', acceptance: 'y'.repeat(100001),
   });
   assert.strictEqual(acc.status, 400);
 });
@@ -321,7 +347,12 @@ test('POST /api/orders refuses when no agent is installed at all', async () => {
   // which spent a record to say what the request could have been told.
   const emptyBin = tmp('skillspace-noagent-');
   const home = tmp('skillspace-noagenthome-');
-  const s = await startServer(home, { PATH: `${emptyBin}:/usr/bin:/bin` });
+  // HOME as well as PATH: the shim lives in fakeHome/.local/bin and CHILD_PATH
+  // prepends $HOME/.local/bin unconditionally, so hiding it means giving this
+  // server a home that has no .local/bin at all. Still a rig-created temp dir,
+  // which is what startServer's guard actually requires.
+  const emptyHome = tmp('skillspace-noagenthome-empty-');
+  const s = await startServer(home, { PATH: `${emptyBin}:/usr/bin:/bin`, HOME: emptyHome });
   const cfg = await (await fetch(s.base + '/api/config')).json();
   assert.deepStrictEqual(cfg.agents, [], 'fixture still found an agent');
 
@@ -340,9 +371,14 @@ test('the number of simultaneous orders is bounded', async () => {
   // A slow agent, so the accepted orders are still in flight when the next
   // request arrives - otherwise the bound would never be reached and this
   // would pass against no bound at all.
-  const project = await makeProject(undefined, s.base);
+  // ONE PROJECT PER ORDER. These are plain directories, and an unisolated
+  // project now runs one order at a time, so eight orders on one project would
+  // measure that serialisation rather than the global bound this test is about.
   const accepted = [];
+  const projectIds = [];
   for (let i = 0; i < 8; i++) {
+    const project = await makeProject(undefined, s.base);
+    projectIds.push(project.id);
     const r = await json('POST', '/api/orders', {
       projectId: project.id, prompt: `${SLOW_MARK} n${i}`,
     }, s.base);
@@ -352,8 +388,11 @@ test('the number of simultaneous orders is bounded', async () => {
   assert.ok(accepted.filter((x) => x === 200).length <= 4, 'more orders ran than the bound allows');
 
   // A refused request must not leave a queued order behind.
-  const listed = (await json('GET', `/api/orders?project=${project.id}`, undefined, s.base)).body.orders;
-  assert.strictEqual(listed.length, accepted.filter((x) => x === 200).length,
+  let listed = 0;
+  for (const id of projectIds) {
+    listed += (await json('GET', `/api/orders?project=${id}`, undefined, s.base)).body.orders.length;
+  }
+  assert.strictEqual(listed, accepted.filter((x) => x === 200).length,
     'a refused request created an order that will never be dispatched');
   s.child.kill('SIGKILL');
 });
@@ -429,8 +468,13 @@ test('a dispatch that rejects is recorded on the order, not just the console', a
 test('GET /api/orders lists newest first and filters by project', async () => {
   const a = await makeProject();
   const b = await makeProject();
+  // Sequential, not concurrent: this test needs two orders on the SAME project
+  // to exercise the filter, and an unisolated project runs one at a time. Wait
+  // for each to settle rather than racing the guard.
   const first = (await json('POST', '/api/orders', { projectId: a.id, prompt: 'first' })).body.order;
+  await settled(first.id);
   const second = (await json('POST', '/api/orders', { projectId: a.id, prompt: 'second' })).body.order;
+  await settled(second.id);
   const other = (await json('POST', '/api/orders', { projectId: b.id, prompt: 'other' })).body.order;
 
   const all = await json('GET', '/api/orders');
@@ -628,4 +672,78 @@ test("the suite does not touch the developer's own experts.json", async () => {
   const now = fs.existsSync(REPO_EXPERTS) ? fs.readFileSync(REPO_EXPERTS, 'utf8') : null;
   assert.strictEqual(now, expertsBefore,
     'running the tests rewrote the repo experts.json - SKILLSPACE_EXPERTS_FILE is not reaching the server');
+});
+
+test('a dispatched agent does not inherit the machine\'s credentials', async () => {
+  // The allowlist exists and /api/run uses it; this path silently opted out, so
+  // an agent spawned by an order held every AWS, GitHub and npm token in the
+  // server's environment. Canaries in the server env, a shim that dumps its own
+  // env into the order log, and the log must not contain them.
+  const home = tmp('skillspace-canaryhome-');
+  const agentHome = tmp('skillspace-canaryagent-');
+  const localBin = path.join(agentHome, '.local', 'bin');
+  fs.mkdirSync(localBin, { recursive: true });
+  const shim = path.join(localBin, 'claude');
+  fs.writeFileSync(shim, '#!/bin/sh\nenv\nexit 0\n');
+  fs.chmodSync(shim, 0o755);
+
+  const s = await startServer(home, {
+    HOME: agentHome,
+    AWS_SECRET_ACCESS_KEY: 'AKIA-CANARY',
+    GITHUB_TOKEN: 'ghp_CANARY',
+  });
+  const project = await makeProject(undefined, s.base);
+  const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x' }, s.base);
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  await settled(r.body.order.id, s.base);
+
+  const log = fs.readFileSync(path.join(home, 'logs', `${r.body.order.id}.log`), 'utf8');
+  // Guard against a vacuous pass: if the shim never ran, the log contains no
+  // canary for the trivial reason and both assertions below succeed for free.
+  assert.match(log, /PATH=/, 'the shim never dumped its environment');
+  assert.ok(!log.includes('AKIA-CANARY'), 'the agent inherited an AWS credential');
+  assert.ok(!log.includes('ghp_CANARY'), 'the agent inherited a GitHub token');
+  s.child.kill('SIGKILL');
+});
+
+test('an agent installed only in ~/.local/bin can actually be dispatched', async () => {
+  // Detection uses CHILD_PATH, the spawn did not - so a standard install was
+  // detected, accepted, and then failed with ENOENT, leaving a skillspace/<id>
+  // branch behind per attempt. The rig now places the shim only under
+  // $HOME/.local/bin, so this passes only if the spawn uses CHILD_PATH too.
+  const home = tmp('skillspace-localbinhome-');
+  const s = await startServer(home);
+  const cfg = await (await fetch(s.base + '/api/config')).json();
+  assert.deepStrictEqual(cfg.agents, ['claude'], 'fixture did not detect the shim');
+
+  const project = await makeProject(undefined, s.base);
+  const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x' }, s.base);
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  const status = await settled(r.body.order.id, s.base);
+
+  assert.strictEqual(status, 'succeeded',
+    'an agent /api/config reports as installed could not be spawned');
+  const log = fs.readFileSync(path.join(home, 'logs', `${r.body.order.id}.log`), 'utf8');
+  assert.ok(!/ENOENT/.test(log), `spawn failed: ${log.slice(0, 200)}`);
+  s.child.kill('SIGKILL');
+});
+
+test('a second order on an unisolated project is refused without leaving a record', async () => {
+  // dispatch enforces the serialisation regardless; the route asks first so the
+  // refusal is a 409 rather than a queued order nothing will ever dispatch -
+  // there is no scheduler yet to pick one up later.
+  const project = await makeProject();
+  const first = await json('POST', '/api/orders', {
+    projectId: project.id, prompt: `${SLOW_MARK} holds the directory`,
+  });
+  assert.strictEqual(first.status, 200, JSON.stringify(first.body));
+
+  const second = await json('POST', '/api/orders', { projectId: project.id, prompt: 'wants in' });
+  assert.strictEqual(second.status, 409, JSON.stringify(second.body));
+
+  const listed = (await json('GET', `/api/orders?project=${project.id}`)).body.orders;
+  assert.strictEqual(listed.length, 1,
+    'the refused request left an order that will never be dispatched');
+
+  await json('POST', `/api/orders/${first.body.order.id}/cancel`);
 });

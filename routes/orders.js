@@ -38,16 +38,24 @@ const dispatch = require('../lib/dispatch');
 //   orders keep a projectId that no longer resolves.
 
 // Track in-flight order dispatches so the same bound that protects /api/run
-// protects this route. project.concurrency is the scheduler's per-project
-// limit and does not exist yet; maxOrdersPerDay is a daily cap, not a
-// simultaneous one. Without this a loop - or a held-down button - starts an
-// unbounded number of credentialed agents.
+// protects this route. This is the GLOBAL ceiling on concurrent agents;
+// maxOrdersPerDay is a daily cap, not a simultaneous one. Without this a loop -
+// or a held-down button - starts an unbounded number of credentialed agents.
+//
+// Per-project limiting is no longer entirely absent: dispatch serialises
+// UNISOLATED (dir) projects on its own, refusing a second concurrent order
+// with `refused: 'project busy'`, because two agents in one plain directory
+// corrupt each other's edits. What is still missing is the graded
+// project.concurrency limit for GIT projects, which get a worktree each and so
+// need a throughput policy rather than a correctness guard - that belongs to
+// the scheduler.
 const RUNNING_ORDERS = new Set();
 
 async function orderRoutes(ctx) {
   const {
     req, res, u, p, root, sendJson, readBody, OVERSIZE, ABORTED,
     plainIdFrom, isTopLevelNavigation, denyNavigation, AGENTS, maxConcurrentRuns,
+    childEnv,
   } = ctx;
 
   if (p === '/api/orders' && req.method === 'GET') {
@@ -95,6 +103,19 @@ async function orderRoutes(ctx) {
       return true;
     }
 
+    // An unisolated project runs one order at a time - two agents in one plain
+    // directory corrupt each other's edits. dispatch enforces that regardless;
+    // asking here too is what keeps a refusal from becoming a queued order
+    // nothing will ever dispatch, since there is no scheduler to retry it. The
+    // window between this check and dispatch's claim is harmless: dispatch
+    // re-checks, and the worst case is the 409 arriving as a refusal instead.
+    if (project.kind !== 'git' && dispatch.projectBusy(project.id)) {
+      sendJson(res, 409, {
+        error: '该项目已有任务在运行（未隔离的目录一次只能跑一个）',
+      });
+      return true;
+    }
+
     // Also before create(): a refused request must not leave a queued order
     // that nothing will ever dispatch.
     if (RUNNING_ORDERS.size >= maxConcurrentRuns) {
@@ -136,7 +157,7 @@ async function orderRoutes(ctx) {
     // caller gets the queued record now and follows progress via GET.
     RUNNING_ORDERS.add(order.id);
     dispatch
-      .runOrder(root, { order, project, agent })
+      .runOrder(root, { order, project, agent, childEnv })
       .catch((e) => {
         // runOrder rejecting means a bug in dispatch, not a failed order - a
         // failed order is recorded on the order itself. This path leaves no

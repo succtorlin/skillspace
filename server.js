@@ -793,6 +793,9 @@ async function route(req, res, u, p) {
     sendJson, readBody, OVERSIZE, ABORTED,
     plainIdFrom, isTopLevelNavigation, denyNavigation,
     AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS,
+    // The credential allowlist and CHILD_PATH. /api/run has always used it;
+    // the orders path could not reach it, so it spawned with process.env.
+    childEnv,
   };
   if (await projectRoutes(ctx)) return;
   if (await orderRoutes(ctx)) return;

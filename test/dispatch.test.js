@@ -38,6 +38,12 @@ after(() => {
   }
 });
 
+// dispatch requires an explicit child-environment policy rather than defaulting
+// to process.env, so every call site supplies one. Minimal on purpose: the
+// shims are /bin/sh scripts that call sleep and echo, so they need a PATH, and
+// nothing here should depend on inheriting the developer's environment.
+const testEnv = () => ({ PATH: process.env.PATH, HOME: process.env.HOME });
+
 const OK = '#!/bin/sh\necho "did the work"\nexit 0\n';
 const BAD = '#!/bin/sh\necho "broke"\nexit 4\n';
 const SLOW = '#!/bin/sh\nsleep 60\n';
@@ -48,7 +54,7 @@ test('a dispatched order runs isolated, succeeds, and is recorded', async () => 
   const project = projects.create(root, { path: repo });
   const order = orders.create(root, { projectId: project.id, prompt: 'do it' });
 
-  const result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  const result = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
 
   assert.strictEqual(result.status, 'succeeded');
   const stored = orders.get(root, order.id);
@@ -64,7 +70,7 @@ test('the worktree is removed after the order finishes', async () => {
   const repo = tmpGitRepo();
   const project = projects.create(root, { path: repo });
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
-  await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
   const wtRoot = path.join(root, 'worktrees');
   const left = fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [];
   assert.deepStrictEqual(left, [], `worktree left behind: ${JSON.stringify(left)}`);
@@ -77,7 +83,7 @@ test('the agent\'s work survives on the order branch', async () => {
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
   const agent = shimAgent('#!/bin/sh\necho "output" > agent-made.txt\nexit 0\n');
 
-  await dispatch.runOrder(root, { order, project, agent });
+  await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
 
   const files = execSync(`git ls-tree -r --name-only skillspace/${order.id}`, { cwd: repo, encoding: 'utf8' });
   assert.match(files, /agent-made\.txt/, 'the agent\'s work was discarded');
@@ -88,7 +94,7 @@ test('a non-zero exit records failed with the exit code, and still cleans up', a
   const repo = tmpGitRepo();
   const project = projects.create(root, { path: repo });
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
-  await dispatch.runOrder(root, { order, project, agent: shimAgent(BAD) });
+  await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(BAD) });
 
   const stored = orders.get(root, order.id);
   assert.strictEqual(stored.status, 'failed');
@@ -116,7 +122,7 @@ test('a worktree that cannot be created fails the order before any agent starts'
   worktrees.cleanup = (wt) => { cleanupCalls.push(wt); return realCleanup(wt); };
   let result;
   try {
-    result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+    result = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
   } finally {
     worktrees.cleanup = realCleanup;
   }
@@ -136,13 +142,13 @@ test('maxOrdersPerDay refuses a dispatch and does not spawn or prepare', async (
   const project = { ...base, budget: { ...base.budget, maxOrdersPerDay: 1 } };
 
   const first = orders.create(root, { projectId: project.id, prompt: 'one' });
-  const firstResult = await dispatch.runOrder(root, { order: first, project, agent: shimAgent(OK) });
+  const firstResult = await dispatch.runOrder(root, { childEnv: testEnv, order: first, project, agent: shimAgent(OK) });
   // A cap of N runs N, not N-1: the dispatched order is already inside its own
   // countToday, which is the only reason `>` rather than `>=` is correct.
   assert.strictEqual(firstResult.status, 'succeeded', 'a cap of 1 must still run 1 order');
 
   const second = orders.create(root, { projectId: project.id, prompt: 'two' });
-  const result = await dispatch.runOrder(root, { order: second, project, agent: shimAgent(OK) });
+  const result = await dispatch.runOrder(root, { childEnv: testEnv, order: second, project, agent: shimAgent(OK) });
 
   assert.strictEqual(result.status, 'failed');
   assert.match(orders.get(root, second.id).error, /daily limit/);
@@ -170,7 +176,7 @@ test('the order timeout comes from the project budget', async () => {
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
   const started = Date.now();
-  await dispatch.runOrder(root, { order, project, agent: shimAgent(SLOW) });
+  await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(SLOW) });
   const elapsed = Date.now() - started;
 
   const stored = orders.get(root, order.id);
@@ -210,7 +216,7 @@ test('a dir project runs in place and the directory survives', async () => {
   const seen = [];
   worktrees.cleanup = (wt) => { seen.push(wt && wt.isolated); return realCleanup(wt); };
   try {
-    await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+    await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
   } finally {
     worktrees.cleanup = realCleanup;
   }
@@ -228,7 +234,7 @@ test('cancel stops a running order and records cancelled', async () => {
   const project = projects.create(root, { path: repo });
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
-  const running = dispatch.runOrder(root, { order, project, agent: shimAgent(SLOW) });
+  const running = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(SLOW) });
   await new Promise((r) => setTimeout(r, 400));
   assert.strictEqual(dispatch.cancel(order.id), true);
   const result = await running;
@@ -250,7 +256,7 @@ test('a missing agent fails the order without preparing a worktree', async () =>
   const project = projects.create(root, { path: repo });
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
-  const result = await dispatch.runOrder(root, { order, project, agent: null });
+  const result = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: null });
 
   assert.strictEqual(result.status, 'failed');
   assert.match(orders.get(root, order.id).error, /agent/);
@@ -271,7 +277,7 @@ test('a throw while starting the agent settles the order, never leaves it runnin
   // logs/ as a regular file: runner.start's mkdirSync throws EEXIST.
   fs.writeFileSync(path.join(root, 'logs'), 'not a directory');
 
-  const result = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  const result = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
 
   assert.strictEqual(result.status, 'failed');
   assert.match(orders.get(root, order.id).error, /dispatch:/);
@@ -296,8 +302,8 @@ test('a second dispatch of the same order is refused', async () => {
   const agent = shimAgent(`#!/bin/sh\nsleep 1\necho ran >> ${tally}\nexit 0\n`);
 
   await Promise.all([
-    dispatch.runOrder(root, { order, project, agent }),
-    dispatch.runOrder(root, { order, project, agent }),
+    dispatch.runOrder(root, { childEnv: testEnv, order, project, agent }),
+    dispatch.runOrder(root, { childEnv: testEnv, order, project, agent }),
   ]);
 
   const ran = fs.existsSync(tally)
@@ -330,7 +336,7 @@ test('cancelling during worktree preparation does not spawn an agent', async () 
   const marker = path.join(tmpDir('skillspace-mark-'), 'spawned.txt');
   const agent = shimAgent(`#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`);
 
-  const running = dispatch.runOrder(root, { order, project, agent });
+  const running = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
   assert.strictEqual(dispatch.cancel(order.id), false,
     'the premise is that cancel cannot reach an order still preparing');
   orders.markCancelled(root, order.id);   // what the route does in this window
@@ -356,11 +362,15 @@ test('a refused duplicate dispatch is distinguishable from a successful one', as
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
   const agent = shimAgent(SLOW);
 
-  const first = dispatch.runOrder(root, { order, project, agent });
+  const first = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
   await new Promise((r) => setTimeout(r, 200));
-  const second = await dispatch.runOrder(root, { order, project, agent });
+  const second = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
 
-  assert.ok(second.refused, 'a refusal must be visible to the caller');
+  // The exact reason, not merely truthiness: on a dir project the project-busy
+  // guard would also fire if the duplicate guard were removed, so a truthy
+  // check cannot tell which one answered.
+  assert.strictEqual(second.refused, 'already dispatched',
+    'a refusal must be visible to the caller, and say which guard answered');
   assert.ok(dispatch.cancel(order.id));
   await first;
 });
@@ -373,9 +383,9 @@ test('a worktree failure releases the slot', async () => {
   const project = { ...projects.create(root, { path: notARepo }), kind: 'git' };
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
 
-  const first = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  const first = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
   assert.strictEqual(first.status, 'failed');
-  const second = await dispatch.runOrder(root, { order, project, agent: shimAgent(OK) });
+  const second = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
   assert.ok(!second.refused, 'the slot was never released');
 });
 
@@ -395,8 +405,8 @@ test('the slot is claimed before any await, so a running order stays cancellable
   // await, so a claim staked before that await is already visible here, while
   // one staked after prepare resolves is not. Sleeping first would let a late
   // claim settle and the mutant would sail through.
-  const first = dispatch.runOrder(root, { order, project, agent });
-  const second = await dispatch.runOrder(root, { order, project, agent });
+  const first = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
+  const second = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
 
   assert.strictEqual(second.refused, 'already dispatched');
 
@@ -420,7 +430,7 @@ test('an order that settles as failed during preparation does not spawn either',
   const marker = path.join(tmpDir('skillspace-mark-'), 'spawned.txt');
   const agent = shimAgent(`#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`);
 
-  const running = dispatch.runOrder(root, { order, project, agent });
+  const running = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
   orders.markFailed(root, order.id, 'settled by something else mid-prepare');
   await running;
 
@@ -447,7 +457,7 @@ test('a store failure while marking the order running leaks nothing', async () =
     // the same state is reached through chflags - match both rather than
     // pinning one errno.
     await assert.rejects(
-      () => dispatch.runOrder(root, { order, project, agent: shimAgent(OK) }),
+      () => dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) }),
       /EACCES|EPERM/,
       'a store that cannot record the run must reject, not resolve'
     );
@@ -472,7 +482,7 @@ test('a refusal returns null rather than a record with no id', async () => {
   const order = orders.create(root, { projectId: project.id, prompt: 'x' });
   const agent = shimAgent(SLOW);
 
-  const first = dispatch.runOrder(root, { order, project, agent });
+  const first = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
   await new Promise((r) => setTimeout(r, 250));
 
   // Assert the layout rather than assuming it: a wrong path here would delete
@@ -482,9 +492,116 @@ test('a refusal returns null rather than a record with no id', async () => {
   assert.ok(fs.existsSync(recordPath), `order record not at ${recordPath}`);
   fs.unlinkSync(recordPath);
 
-  const second = await dispatch.runOrder(root, { order, project, agent });
+  const second = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
 
   assert.strictEqual(second, null, 'a refusal with no record must be null, not a partial object');
   dispatch.cancel(order.id);
   await first;
+});
+
+test('two orders on a dir project do not run at once', async () => {
+  // A plain directory has no isolation mechanism, so both agents would edit the
+  // user's own files simultaneously - the corruption lib/worktrees exists to
+  // prevent. Measured before this guard: two agents spawned 2.7ms apart into
+  // the identical cwd. The interval is not the point and varies; the identical
+  // cwd is.
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');
+  const project = projects.create(root, { path: work });
+  assert.strictEqual(project.kind, 'dir');
+  const first = orders.create(root, { projectId: project.id, prompt: 'one' });
+  const second = orders.create(root, { projectId: project.id, prompt: 'two' });
+
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = shimAgent(`#!/bin/sh\necho "$$" >> "${tally}"\nsleep 5\nexit 0\n`);
+
+  const running = dispatch.runOrder(root, { childEnv: testEnv, order: first, project, agent });
+  await new Promise((r) => setTimeout(r, 300));
+  const refused = await dispatch.runOrder(root, { childEnv: testEnv, order: second, project, agent });
+
+  assert.strictEqual(refused.refused, 'project busy',
+    'a second order was allowed into the user\'s own directory');
+  assert.strictEqual(orders.get(root, second.id).status, 'queued',
+    'a refusal must not settle the order - it can run once the first finishes');
+
+  dispatch.cancel(first.id);
+  await running;
+
+  const ran = fs.existsSync(tally)
+    ? fs.readFileSync(tally, 'utf8').split('\n').filter(Boolean)
+    : [];
+  assert.strictEqual(ran.length, 1, `${ran.length} agents ran in one unisolated directory`);
+});
+
+test('a git project still runs two orders at once', async () => {
+  // The guard must not serialise the isolated case: each order gets its own
+  // worktree, so concurrency there is a throughput question for the scheduler,
+  // not a correctness one. A guard that caught git projects too would quietly
+  // halve throughput and look like it was working.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  assert.strictEqual(project.kind, 'git');
+  const a = orders.create(root, { projectId: project.id, prompt: 'a' });
+  const b = orders.create(root, { projectId: project.id, prompt: 'b' });
+  const agent = shimAgent(SLOW);
+
+  const ra = dispatch.runOrder(root, { childEnv: testEnv, order: a, project, agent });
+  const rb = dispatch.runOrder(root, { childEnv: testEnv, order: b, project, agent });
+  await new Promise((r) => setTimeout(r, 700));
+
+  assert.strictEqual(orders.get(root, a.id).status, 'running');
+  assert.strictEqual(orders.get(root, b.id).status, 'running',
+    'the dir-project guard also serialised an isolated project');
+
+  dispatch.cancel(a.id);
+  dispatch.cancel(b.id);
+  await Promise.all([ra, rb]);
+});
+
+test('a dispatch with no child environment policy is refused, not defaulted', async () => {
+  // The tempting default is process.env, and that is the leak this closes: on a
+  // developer machine it is every AWS, GitHub and npm token they hold. Refusing
+  // means a caller that forgets finds out at the first order instead of quietly
+  // handing an agent the lot. Nothing is created and no agent runs.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  const marker = path.join(tmpDir('skillspace-mark-'), 'spawned.txt');
+  const agent = shimAgent(`#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`);
+
+  // deliberately no childEnv
+  const result = await dispatch.runOrder(root, { order, project, agent });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(orders.get(root, order.id).error, /environment/);
+  assert.ok(!fs.existsSync(marker), 'an agent ran with no environment policy');
+  assert.strictEqual(orders.get(root, order.id).startedAt, null);
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], [],
+    'a refused dispatch prepared a worktree');
+});
+
+test('a duplicate dispatch on a git project is refused as a duplicate', async () => {
+  // A git project is where the duplicate guard stands alone: the project-busy
+  // guard does not apply to isolated projects, so nothing else can produce a
+  // refusal here. On a dir project the two guards overlap and either could be
+  // the one answering.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  assert.strictEqual(project.kind, 'git');
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+  const agent = shimAgent(SLOW);
+
+  const first = dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
+  const second = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent });
+
+  assert.strictEqual(second.refused, 'already dispatched');
+
+  await new Promise((r) => setTimeout(r, 400));
+  assert.strictEqual(dispatch.cancel(order.id), true);
+  assert.strictEqual((await first).status, 'cancelled');
 });
