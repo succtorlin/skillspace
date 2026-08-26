@@ -325,3 +325,32 @@ test('title truncation never splits a surrogate pair', () => {
   assert.strictEqual(Array.from(o.title).length, 200, 'truncated by code point, not code unit');
   assert.ok(!/[\uD800-\uDBFF]$/.test(o.title), 'must not end on a lone high surrogate');
 });
+
+test('attachToGoal fills the reserved fields', () => {
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  assert.strictEqual(o.goalId, null);
+  assert.strictEqual(o.seq, null);
+  const linked = orders.attachToGoal(root, o.id, 'goal-1', 3);
+  assert.strictEqual(linked.goalId, 'goal-1');
+  assert.strictEqual(linked.seq, 3);
+  assert.strictEqual(orders.get(root, o.id).goalId, 'goal-1');
+  assert.strictEqual(orders.get(root, o.id).seq, 3);
+});
+
+test('attachToGoal refuses a link it could only write as "not attached"', () => {
+  // String(null) writes the literal "null" as a goal id, and Number('x') writes
+  // NaN - which JSON.stringify turns into `null` on disk, the exact value that
+  // means the field was never set. Either coercion produces an order that reads
+  // as attached to a goal nothing can find, or attached with no position.
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  for (const badGoal of [null, undefined, '', '   ', 7, {}]) {
+    assert.throws(() => orders.attachToGoal(root, o.id, badGoal, 0), /goalId is required/);
+  }
+  for (const badSeq of [null, undefined, NaN, -1, 1.5, '0']) {
+    assert.throws(() => orders.attachToGoal(root, o.id, 'goal-1', badSeq), /seq must be/);
+  }
+  assert.strictEqual(orders.get(root, o.id).goalId, null, 'a refused link still wrote');
+  assert.strictEqual(orders.get(root, o.id).seq, null, 'a refused link still wrote');
+});

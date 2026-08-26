@@ -1,0 +1,526 @@
+'use strict';
+const { test, after } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execSync } = require('child_process');
+
+const plan = require('../lib/plan');
+const goals = require('../lib/goals');
+const orders = require('../lib/orders');
+const projects = require('../lib/projects');
+
+const created = [];
+function tmpDir(prefix) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix || 'skillspace-plan-'));
+  created.push(d);
+  return d;
+}
+function tmpGitRepo() {
+  const d = tmpDir('skillspace-planrepo-');
+  execSync('git init -q', { cwd: d });
+  fs.writeFileSync(path.join(d, 'file.txt'), 'original\n');
+  execSync('git add -A', { cwd: d });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m init', { cwd: d });
+  return d;
+}
+function shimAgent(script) {
+  const dir = tmpDir('skillspace-shim-');
+  const bin = path.join(dir, 'fake-pm');
+  fs.writeFileSync(bin, script);
+  fs.chmodSync(bin, 0o755);
+  return { id: 'fake', bin, buildArgs: (p) => ['-p', p] };
+}
+after(() => {
+  for (const d of created) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+const testEnv = () => ({ ...process.env });
+
+const PLAN_OK = `#!/bin/sh
+cat <<'JSON'
+[{"title":"one","prompt":"do one","acceptance":"one is done"},
+ {"title":"two","prompt":"do two","acceptance":"two is done"}]
+JSON
+exit 0
+`;
+const PLAN_PROSE = '#!/bin/sh\necho "I would start by reading the README."\nexit 0\n';
+// printf, not `echo -n`: on macOS /bin/sh (bash 3.2 with xpg_echo) `echo -n`
+// prints a literal "-n" and a newline, so this shim emitted 30 lines of prose
+// and no array at all. The over-budget test then FAILED - "no JSON plan"
+// matches neither alternative of /30.*12|too many/ - which is worse than it
+// sounds rather than better: a red baseline makes every mutation result taken
+// against it void, and a harness that scores a mutant by "did the named test
+// fail?" reports M1 KILLED without the mutation having done anything. With
+// printf, M1 dies on the signal it is supposed to: orders.list(...).length
+// comes back 30 where 0 is expected.
+const PLAN_BIG = `#!/bin/sh
+printf '['
+i=0
+while [ $i -lt 30 ]; do
+  [ $i -gt 0 ] && printf ','
+  printf '{"title":"t","prompt":"p","acceptance":"a"}'
+  i=$((i+1))
+done
+printf ']\\n'
+exit 0
+`;
+
+test('a goal is decomposed into persisted orders', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'make it good' });
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'running');
+  assert.strictEqual(result.orderIds.length, 2);
+  const first = orders.get(root, result.orderIds[0]);
+  assert.strictEqual(first.goalId, goal.id);
+  assert.strictEqual(first.seq, 0);
+  assert.strictEqual(first.prompt, 'do one');
+  assert.strictEqual(first.acceptance, 'one is done');
+  assert.strictEqual(first.status, 'queued', 'this plan does not dispatch them');
+  assert.strictEqual(orders.get(root, result.orderIds[1]).seq, 1);
+  assert.strictEqual(result.pmAgent, 'fake', 'the goal must record which agent planned it');
+});
+
+test('the PM runs in an isolated worktree, not the project itself', async () => {
+  // The PM is told not to modify anything, which is a hope, not a guarantee.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(`#!/bin/sh\npwd > "${path.join(root, 'pm-cwd.txt')}"\n${PLAN_OK.split('\n').slice(1).join('\n')}`);
+
+  await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  const cwd = fs.readFileSync(path.join(root, 'pm-cwd.txt'), 'utf8').trim();
+  assert.notStrictEqual(cwd, fs.realpathSync(repo), 'the PM ran in the user\'s own tree');
+  assert.match(cwd, /worktrees/);
+});
+
+test('the PM worktree is removed afterwards', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const wtRoot = path.join(root, 'worktrees');
+  const left = () => (fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : []);
+
+  const ok = goals.create(root, { projectId: project.id, text: 'x' });
+  await plan.decompose(root, { goal: ok, project, agent: shimAgent(PLAN_OK), childEnv: testEnv });
+  assert.deepStrictEqual(left(), [], 'a successful plan left its worktree behind');
+
+  // A success-only cleanup passes the assertion above and still leaks a
+  // worktree per failed goal, which is the whole reason the cleanup is in a
+  // `finally`. Every failure return after prepare() has to be covered too, so
+  // this half of the test is what actually pins it.
+  const bad = goals.create(root, { projectId: project.id, text: 'y' });
+  const r = await plan.decompose(root, {
+    goal: bad, project, agent: shimAgent('#!/bin/sh\necho boom >&2\nexit 3\n'), childEnv: testEnv,
+  });
+  assert.strictEqual(r.status, 'failed');
+  assert.deepStrictEqual(left(), [], 'a failed plan left its worktree behind');
+});
+
+test('unparseable output fails the goal and keeps the raw text', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_PROSE), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /no JSON plan/);
+  assert.match(result.rawPlan, /README/, 'the evidence of what the prompt produced was discarded');
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0, 'no orders on a failed plan');
+});
+
+test('a plan over maxOrdersPerGoal fails the goal whole and dispatches nothing', async () => {
+  // Spec 8a: running the first 12 of a 30-order plan produces a half-executed
+  // goal that looks complete. The full plan is retained so the human can
+  // narrow the goal and try again.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const project = { ...base, budget: { ...base.budget, maxOrdersPerGoal: 12 } };
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_BIG), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /30.*12|too many/);
+  assert.match(result.rawPlan, /title/, 'the plan must be retained so it can be narrowed');
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+});
+
+test('an impossible cap fails the goal without spawning anything', async () => {
+  // goals.withinBudget honours a numeric cap literally - 0 means none allowed,
+  // not unlimited - so every plan would be refused. Spending a credentialed
+  // agent run to discover that is the expensive path to a knowable answer.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const project = { ...base, budget: { ...base.budget, maxOrdersPerGoal: 0 } };
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const marker = path.join(root, 'pm-ran.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /maxOrdersPerGoal is 0/);
+  assert.ok(!fs.existsSync(marker), 'the PM was spawned for a cap that can never be satisfied');
+
+  // A present-but-non-numeric cap takes the same path: withinBudget refuses it,
+  // so spawning to discover that is the same wasted run.
+  const g2 = goals.create(root, { projectId: project.id, text: 'y' });
+  const bad = { ...base, budget: { ...base.budget, maxOrdersPerGoal: '12' } };
+  const r2 = await plan.decompose(root, { goal: g2, project: bad, agent, childEnv: testEnv });
+  assert.strictEqual(r2.status, 'failed');
+  assert.match(r2.error, /maxOrdersPerGoal is "12"/);
+  assert.ok(!fs.existsSync(marker), 'a non-numeric cap still spawned the PM');
+});
+
+test('a budget that is not an object is refused rather than read as unlimited', async () => {
+  // goals.withinBudget fails CLOSED on the budget's shape - it says so - and
+  // normalising a malformed budget to {} here would hand it back the one answer
+  // it refuses to give by accident: unlimited. Asked at size 1 rather than
+  // re-derived, so the two can never drift apart.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const marker = path.join(root, 'pm-ran.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${marker}"\n${PLAN_OK.split('\n').slice(1).join('\n')}`);
+
+  // Arrays are in this list deliberately: [] and [1] are objects, so a guard
+  // written as `typeof budget === 'object'` lets them through to be read as an
+  // absent cap, i.e. unlimited. withinBudget refuses them; so must this.
+  const shapes = [
+    [0, /the budget is 0/],
+    ['12', /the budget is "12"/],
+    [[], /the budget is \[\]/],
+    [[1], /the budget is \[1\]/],
+    [false, /the budget is false/],
+    [NaN, /the budget is NaN/],
+  ];
+  for (const [budget, expected] of shapes) {
+    const goal = goals.create(root, { projectId: base.id, text: 'x' });
+    const result = await plan.decompose(root, {
+      goal, project: { ...base, budget }, agent, childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed', `budget ${String(budget)} was accepted`);
+    assert.match(result.error, /no plan can be accepted/);
+    // The refusal is the only place these shapes ever surface, so it has to
+    // name the one it got. String([]) is '' and String([1]) is '1' - an array
+    // would otherwise report as a blank message or as a plain number.
+    assert.match(result.error, expected);
+  }
+  assert.ok(!fs.existsSync(marker), 'a malformed budget still spawned the PM');
+  assert.strictEqual(orders.list(root, { projectId: base.id }).length, 0);
+});
+
+test('a PM that exits non-zero fails the goal with its output', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent('#!/bin/sh\necho "model overloaded" >&2\nexit 3\n');
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /exit(ed)? 3|exit code 3/);
+  assert.match(result.rawPlan, /overloaded/);
+
+  // A PM that printed a plan and THEN died is the case where dropping the exit
+  // check stops enforcing anything: the plan parses, so extraction succeeds and
+  // the goal runs on the output of a run that did not finish.
+  const g2 = goals.create(root, { projectId: project.id, text: 'y' });
+  const crashed = shimAgent(`${PLAN_OK.replace('exit 0', '')}echo "then it died" >&2\nexit 1\n`);
+  const r2 = await plan.decompose(root, { goal: g2, project, agent: crashed, childEnv: testEnv });
+  assert.strictEqual(r2.status, 'failed', 'a plan from a crashed PM was accepted');
+  assert.match(r2.error, /exit(ed)? 1/);
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+});
+
+test('a missing agent fails the goal without creating a worktree', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  const result = await plan.decompose(root, { goal, project, agent: null, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /agent/);
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
+});
+
+test('a missing childEnv policy fails the goal without spawning anything', async () => {
+  // Same contract as dispatch: the only sensible default is process.env, which
+  // is the credential leak the allowlist exists to prevent.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const marker = path.join(root, 'pm-ran.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+
+  for (const childEnv of [undefined, null, {}, 'process.env', true]) {
+    const g = goals.create(root, { projectId: project.id, text: 'x' });
+    const result = await plan.decompose(root, { goal: g, project, agent, childEnv });
+    assert.strictEqual(result.status, 'failed', `childEnv ${String(childEnv)} was accepted`);
+    assert.match(result.error, /child environment/);
+  }
+  // A truthy non-function is the drift that matters: `!childEnv` would let an
+  // object through, and the runner falls back to process.env for anything that
+  // is not a usable env - which is the leak, arriving by a different door.
+  assert.ok(!fs.existsSync(marker), 'the PM was spawned with no environment policy');
+});
+
+test('a plan wrapped in ANSI colour still extracts', async () => {
+  // ESC[32m contains a '[', and arraySpans counts brackets - one colour code
+  // swallows the plan. Agent CLIs emit colour by default, so this is the
+  // common case rather than an edge case.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(
+    '#!/bin/sh\nprintf \'\\033[32mHere is the plan:\\033[0m\\n\'\n' +
+    'cat <<\'JSON\'\n[{"title":"one","prompt":"do one","acceptance":"a"}]\nJSON\nexit 0\n'
+  );
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'running', `colour broke extraction: ${result.error}`);
+  assert.strictEqual(result.orderIds.length, 1);
+});
+
+test('a plan that cannot be persisted leaves no orphaned orders', async () => {
+  // orders.create throws on a caller fault mid-loop; the orders already written
+  // must not survive as invisible work a scheduler could pick up.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const real = orders.create;
+  let n = 0;
+  orders.create = (...args) => {
+    if (++n === 2) throw new Error('prompt is too long (100001 > 100000)');
+    return real(...args);
+  };
+  try {
+    const result = await plan.decompose(root, {
+      goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /could not persist the plan/);
+    const live = orders.list(root, { projectId: project.id })
+      .filter((o) => o.status !== 'cancelled');
+    assert.deepStrictEqual(live, [], 'orphaned orders survived a failed plan');
+  } finally {
+    orders.create = real;
+  }
+});
+
+test('an order created but not yet attached is still rolled back', async () => {
+  // The orphan the create-loop catch is really guarding: attachToGoal throws
+  // AFTER orders.create has already written the record. If the id is recorded
+  // only once attaching succeeds, that order survives the rollback as a
+  // `queued` record with goalId null - work no goal points at, which a
+  // scheduler would nonetheless be free to run.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const real = orders.attachToGoal;
+  let n = 0;
+  orders.attachToGoal = (...args) => {
+    if (++n === 2) throw new Error('seq must be a non-negative integer, got null');
+    return real(...args);
+  };
+  try {
+    const result = await plan.decompose(root, {
+      goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /could not persist the plan/);
+    const live = orders.list(root, { projectId: project.id })
+      .filter((o) => o.status !== 'cancelled');
+    assert.deepStrictEqual(
+      live.map((o) => ({ id: o.id, goalId: o.goalId, status: o.status })), [],
+      'an order created but not attached escaped the rollback'
+    );
+  } finally {
+    orders.attachToGoal = real;
+  }
+});
+
+test('a caller-supplied onChunk still receives the output', async () => {
+  // Capturing internally must not steal the stream plan 3's live log needs.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  let seen = '';
+
+  await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    onChunk: (c) => { seen += c; },
+  });
+
+  assert.match(seen, /title/, 'the caller\'s onChunk was not called');
+});
+
+test('a header line already in the log does not reach the extractor', async () => {
+  // The runner opens the log in append mode and a caller may have written a
+  // header into it. Reading the file back would feed that to the extractor.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const logFile = plan.logFileFor(root, goal.id);
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, '=== header [{"title":"ghost","prompt":"p"}] ===\n');
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'running');
+  assert.strictEqual(result.orderIds.length, 2, 'a plan from the header leaked in');
+  assert.strictEqual(orders.get(root, result.orderIds[0]).title, 'one');
+  // The order-count assertions above CANNOT tell the two sources apart on this
+  // input: the header's array is first in the file, so "the last plausible
+  // array wins" picks the real plan either way. What the log-reading version
+  // cannot do is keep the goal's evidence clean - rawPlan is supposed to be
+  // what the PM said, not what happened to be lying in the log file.
+  assert.doesNotMatch(result.rawPlan, /ghost/, 'the log file\'s contents were kept as the PM\'s output');
+  assert.doesNotMatch(result.rawPlan, /=== header/, 'the log file was read back instead of the stream');
+});
+
+test('output past the capture cap fails the goal rather than being parsed', async () => {
+  // The cap is a runaway guard, and the tail of a runaway transcript can parse
+  // perfectly well - so a plan extracted from a truncated capture would be a
+  // plan the PM never finished writing. Refuse instead, and keep what arrived.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  // 11.5 MB of filler, then a perfectly valid one-order plan at the very end.
+  const agent = shimAgent(
+    '#!/bin/sh\ni=0\nwhile [ $i -lt 44 ]; do\n'
+    + '  head -c 262144 /dev/zero | tr \'\\0\' \'a\'\n  i=$((i+1))\ndone\n'
+    + 'printf \'\\n[{"title":"t","prompt":"p","acceptance":"a"}]\\n\'\nexit 0\n'
+  );
+
+  let forwarded = 0;
+  const result = await plan.decompose(root, {
+    goal, project, agent, childEnv: testEnv, onChunk: (c) => { forwarded += c.length; },
+  });
+
+  assert.strictEqual(result.status, 'failed', 'a plan was extracted from a runaway transcript');
+  assert.match(result.error, /more than 10485760/);
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+  // CAPTURE_CAP bounds what THIS module holds, not what the caller sees. A live
+  // log that goes silent at 10MB looks like an agent that stopped.
+  assert.ok(forwarded > 11 * 1024 * 1024, `caller saw only ${forwarded} bytes past the cap`);
+  // Exactly the cap, not "the cap plus whatever the overflowing chunk carried".
+  // The number in the error message is the number that was kept, or the record
+  // says something the code did not do.
+  assert.strictEqual(result.rawPlan.length, 10 * 1024 * 1024);
+});
+
+test('a PM that times out fails the goal on the timeout, not on what it printed', async () => {
+  // A killed run's output can parse perfectly well - the plan may be complete
+  // on stdout and the agent still hung afterwards. Extracting from it accepts
+  // work from a run we terminated, and the goal then reads as planned.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const project = { ...base, budget: { ...base.budget, orderTimeoutMs: 250 } };
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(`${PLAN_OK.replace('exit 0', '')}sleep 30\n`);
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'failed', 'a plan from a timed-out PM was accepted');
+  assert.match(result.error, /timeout/);
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+});
+
+test('a worktree that cannot be prepared fails the goal instead of escaping', async () => {
+  // A throw out of decompose leaves the goal in `planning`, which nothing in
+  // this plan moves on - only reconcile() at the next boot clears it. The
+  // caller has to get an outcome, not an exception.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  // What a previous crashed run of this id leaves behind. worktrees.prepare
+  // refuses it rather than deleting what may be the only copy of that work.
+  const dest = path.join(root, 'worktrees', goal.id);
+  fs.mkdirSync(dest, { recursive: true });
+  fs.writeFileSync(path.join(dest, 'leftover.txt'), 'from a crashed run');
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /worktree/);
+  assert.strictEqual(goals.get(root, goal.id).status, 'failed', 'the goal was left in planning');
+  assert.ok(fs.existsSync(path.join(dest, 'leftover.txt')), 'the crashed run\'s work was deleted');
+});
+
+test('the PM is asked not to colour its output', async () => {
+  // Belt and braces with stripAnsi: NO_COLOR and TERM=dumb are the request, and
+  // stripping is what happens when a CLI ignores it. The request is worth
+  // pinning on its own - a caller-supplied childEnv must not be able to
+  // reinstate colour by omission, and childEnv is spread FIRST for that reason.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const out = path.join(root, 'child-env.txt');
+  const agent = shimAgent(
+    `#!/bin/sh\nprintf 'NO_COLOR=%s TERM=%s\\n' "$NO_COLOR" "$TERM" > "${out}"\n`
+    + `${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+
+  await plan.decompose(root, {
+    goal, project, agent, childEnv: () => ({ ...process.env, TERM: 'xterm-256color' }),
+  });
+
+  assert.strictEqual(fs.readFileSync(out, 'utf8').trim(), 'NO_COLOR=1 TERM=dumb');
+});
+
+test('a dir project plans in place and its files survive', async () => {
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');
+  fs.writeFileSync(path.join(work, 'keep.txt'), 'precious');
+  const project = projects.create(root, { path: work });
+  assert.strictEqual(project.kind, 'dir');
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'running');
+  assert.ok(fs.existsSync(path.join(work, 'keep.txt')), 'a dir project must never be cleaned up');
+});
