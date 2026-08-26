@@ -60,7 +60,10 @@ Add to `test/orders-api.test.js`:
 test('the process-wide agent ceiling is MAX_CONCURRENT_RUNS, not twice it', async () => {
   // /api/run and /api/orders each capped independently, so the real ceiling
   // was 2x the constant. One registry means one ceiling.
-  const { child: kid, port } = await startServer({ SKILLSPACE_MAX_RUNS: '2' });
+  // startServer(home, extraEnv) - TWO arguments. Passing one object makes it
+  // the home and never sets SKILLSPACE_MAX_RUNS, so the ceiling silently stays
+  // at the default 4 and this test passes vacuously.
+  const { child: kid, port } = await startServer(tmp('skillspace-ceiling-'), { SKILLSPACE_MAX_RUNS: '2' });
   const b2 = `http://127.0.0.1:${port}`;
   try {
     const p1 = await makeProjectOn(b2);
@@ -151,7 +154,10 @@ const routeDeps = {
 const projectRoutes = require('./routes/projects')(routeDeps);
 const orderRoutes = require('./routes/orders')(routeDeps);
 ```
-Place those two `require` calls at module scope beside the other requires, not inside the handler.
+The `require` calls go at the top with the others, but the **invocation** cannot:
+`OVERSIZE` and `ABORTED` are `const` further down `server.js`, so calling the
+factories at line 17 is a temporal-dead-zone throw at boot. Require at the top,
+invoke once at module scope *below* those consts - still once per process.
 
 In the handler:
 ```js
@@ -218,6 +224,26 @@ EOF
 ```
 
 ---
+
+> **Task 1 outcome (landed as `34ac657`, 215 tests).** Three errors in this
+> plan's own Task 1 were caught by executing it, and they are recorded here
+> because they are the shape to watch for in Tasks 2-5:
+>
+> 1. **The prescribed fix was one-directional.** It closed the 2x ceiling for
+>    `/api/run` but not for the orders route, so an order could still be
+>    admitted while `/api/run` held the only slot - two agents at a ceiling of
+>    one, reproduced on the parent commit by the reviewer independently.
+> 2. **The prescribed test did not pin the prescribed fix.** Under the mutant
+>    that reverts the orders gate, the suite was 214/215 and the only failure
+>    was a test the *implementer* added. Following this plan literally would
+>    have produced a green suite over a live bug.
+> 3. **The prescribed test would have passed vacuously** on a wrong
+>    `startServer` signature, and one instruction (invoke the factories beside
+>    the top-level requires) was a temporal-dead-zone throw.
+>
+> The lesson for the tasks below: **a test written in this plan is a starting
+> point, not a specification.** If a mutant survives, the test is wrong, not
+> the mutant - add the test that kills it and say so.
 
 ## Task 2: The goal record
 
@@ -1311,7 +1337,7 @@ EOF
 
 - [ ] **Step 1: Write the failing test**
 
-Create `test/goals-api.test.js`. Model the harness on `test/orders-api.test.js` — read it and reuse `startServer` (including its `HOME`/`PATH` rig and the `/api/config` assertion), `freePort`, `tmp`, and `waitFor`. **The shim must live in `fakeHome/.local/bin` only**, never on `PATH`; that is what makes the rig able to observe which path spawned the agent.
+Create `test/goals-api.test.js`. Model the harness on `test/orders-api.test.js` — read it and reuse `startServer` (**`startServer(home, extraEnv)` takes two arguments**; passing a single options object silently sets neither and yields a vacuous pass) (including its `HOME`/`PATH` rig and the `/api/config` assertion), `freePort`, `tmp`, and `waitFor`. **The shim must live in `fakeHome/.local/bin` only**, never on `PATH`; that is what makes the rig able to observe which path spawned the agent.
 
 Tests:
 
