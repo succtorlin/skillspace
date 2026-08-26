@@ -1070,6 +1070,52 @@ test('a missing agent fails the goal without creating a worktree', async () => {
   assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
 });
 
+test('a plan wrapped in ANSI colour still extracts', async () => {
+  // ESC[32m contains a '[', and arraySpans counts brackets - one colour code
+  // swallows the plan. Agent CLIs emit colour by default, so this is the
+  // common case rather than an edge case.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(
+    '#!/bin/sh\nprintf \'\\033[32mHere is the plan:\\033[0m\\n\'\n' +
+    'cat <<\'JSON\'\n[{"title":"one","prompt":"do one","acceptance":"a"}]\nJSON\nexit 0\n'
+  );
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'running', `colour broke extraction: ${result.error}`);
+  assert.strictEqual(result.orderIds.length, 1);
+});
+
+test('a plan that cannot be persisted leaves no orphaned orders', async () => {
+  // orders.create throws on a caller fault mid-loop; the orders already written
+  // must not survive as invisible work a scheduler could pick up.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const real = orders.create;
+  let n = 0;
+  orders.create = (...args) => {
+    if (++n === 2) throw new Error('prompt is too long (100001 > 100000)');
+    return real(...args);
+  };
+  try {
+    const result = await plan.decompose(root, {
+      goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /could not persist the plan/);
+    const live = orders.list(root, { projectId: project.id })
+      .filter((o) => o.status !== 'cancelled');
+    assert.deepStrictEqual(live, [], 'orphaned orders survived a failed plan');
+  } finally {
+    orders.create = real;
+  }
+});
+
 test('a caller-supplied onChunk still receives the output', async () => {
   // Capturing internally must not steal the stream plan 3's live log needs.
   const root = tmpDir('skillspace-home-');
@@ -1225,7 +1271,8 @@ async function decompose(root, { goal, project, agent, childEnv, onChunk }) {
       cwd: wt.cwd,
       logFile: logFileFor(root, goal.id),
       timeoutMs: budget.orderTimeoutMs || 900000,
-      env: childEnv(agent),
+      // NO_COLOR and TERM=dumb are belt and braces with stripAnsi above.
+      env: { ...childEnv(agent), NO_COLOR: '1', TERM: 'dumb' },
       onChunk: capture,
     });
   } finally {
@@ -1235,7 +1282,13 @@ async function decompose(root, { goal, project, agent, childEnv, onChunk }) {
     await worktrees.cleanup(wt);
   }
 
-  const raw = captured;
+  // ANSI colour is the common case, not an edge case: ESC[32m contains a '[',
+  // and arraySpans counts brackets - one colour code swallows the whole plan
+  // and it extracts as "no JSON plan". Agent CLIs emit colour by default and
+  // server.js passes TERM through, so ask the child not to (NO_COLOR, TERM=dumb
+  // in childEnv below) AND strip what arrives anyway, because a CLI that
+  // ignores both is likelier than a plan that survives one code.
+  const raw = stripAnsi(captured);
   if (truncated) {
     // A plan that overflowed the cap is almost certainly not a plan. Refusing
     // beats extracting from a half-transcript that happens to parse.
@@ -1262,18 +1315,41 @@ async function decompose(root, { goal, project, agent, childEnv, onChunk }) {
     );
   }
 
-  const orderIds = entries.map((e, seq) => {
-    const o = orders.create(root, {
-      projectId: project.id,
-      prompt: e.prompt,
-      title: e.title,
-      acceptance: e.acceptance,
+  // orders.create THROWS on a caller fault, and it is called in a loop after
+  // earlier orders of the same plan are already on disk. An uncaught throw here
+  // leaves those orphans behind and the goal stuck in `planning`, which only a
+  // reboot clears. pm.js welds its limits to orders.js's so this should be
+  // unreachable - but "should be unreachable" is not a reason to persist a
+  // half-plan when it is not.
+  const orderIds = [];
+  try {
+    entries.forEach((e, seq) => {
+      const o = orders.create(root, {
+        projectId: project.id,
+        prompt: e.prompt,
+        title: e.title,
+        acceptance: e.acceptance,
+      });
+      orders.attachToGoal(root, o.id, goal.id, seq);
+      orderIds.push(o.id);
     });
-    orders.attachToGoal(root, o.id, goal.id, seq);
-    return o.id;
-  });
+  } catch (e) {
+    // Best-effort rollback. A goal pointing at nothing is recoverable; orders
+    // pointing at no goal are invisible work that a scheduler may still run.
+    for (const id of orderIds) {
+      try { orders.markCancelled(root, id, 'plan abandoned: ' + e.message); } catch (__) {}
+    }
+    return goals.failPlanning(root, goal.id, `could not persist the plan: ${e.message}`, raw);
+  }
 
   return goals.planned(root, goal.id, { orderIds, pmAgent: agent.id, rawPlan: raw });
+}
+
+// CSI/OSC sequences only - enough for what a CLI emits, and deliberately not a
+// general terminal parser.
+const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]|\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g;
+function stripAnsi(text) {
+  return typeof text === 'string' ? text.replace(ANSI, '') : '';
 }
 
 module.exports = { decompose, logFileFor };
@@ -1308,7 +1384,7 @@ test('attachToGoal fills the reserved fields', () => {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `node --test 'test/plan.test.js'` → 11 passing. Then `node --test 'test/orders.test.js'` → 26.
+Run: `node --test 'test/plan.test.js'` → 13 passing. Then `node --test 'test/orders.test.js'` → 26.
 Then `node --test 'test/*.test.js'` — report the real number.
 
 - [ ] **Step 6: Mutation-verify the ordering guarantees**
@@ -1338,6 +1414,12 @@ Then `node --test 'test/*.test.js'` — report the real number.
 #   Move the `cap < 1` block after the runner.run call
 #   Expect: "an impossible cap fails the goal without spawning anything" FAILS
 #   on the marker assertion - the goal still fails, but a credentialed agent ran
+# M5c: stripAnsi removed
+#   const raw = captured;
+#   Expect: "a plan wrapped in ANSI colour still extracts" FAILS with no JSON plan
+# M5d: the order-creation loop loses its try/catch
+#   Expect: "a plan that cannot be persisted leaves no orphaned orders" FAILS -
+#   the throw escapes decompose, and the goal is left in `planning`
 # M6: capture ignores the caller's onChunk
 #   In capture(), drop the `if (onChunk) onChunk(chunk);` line
 #   Expect: "a caller-supplied onChunk still receives the output" FAILS
