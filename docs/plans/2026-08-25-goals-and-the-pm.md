@@ -1016,6 +1016,25 @@ test('a plan over maxOrdersPerGoal fails the goal whole and dispatches nothing',
   assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
 });
 
+test('an impossible cap fails the goal without spawning anything', async () => {
+  // goals.withinBudget honours a numeric cap literally - 0 means none allowed,
+  // not unlimited - so every plan would be refused. Spending a credentialed
+  // agent run to discover that is the expensive path to a knowable answer.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const project = { ...base, budget: { ...base.budget, maxOrdersPerGoal: 0 } };
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const marker = path.join(root, 'pm-ran.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /maxOrdersPerGoal is 0/);
+  assert.ok(!fs.existsSync(marker), 'the PM was spawned for a cap that can never be satisfied');
+});
+
 test('a PM that exits non-zero fails the goal with its output', async () => {
   const root = tmpDir('skillspace-home-');
   const repo = tmpGitRepo();
@@ -1145,6 +1164,15 @@ async function decompose(root, { goal, project, agent, childEnv, onChunk }) {
     return goals.failPlanning(root, goal.id, 'no child environment policy supplied', null);
   }
 
+  // Refuse an impossible cap BEFORE spawning. goals.withinBudget treats a
+  // numeric cap literally, so maxOrdersPerGoal: 0 refuses every plan - and
+  // finding that out after a fifteen-minute credentialed agent run, having
+  // asked it for "at most 0 work orders", is the expensive way to learn it.
+  const cap = ((project && project.budget) || {}).maxOrdersPerGoal;
+  if (Number.isFinite(cap) && cap < 1) {
+    return goals.failPlanning(root, goal.id, `maxOrdersPerGoal is ${cap}: no plan can be accepted`, null);
+  }
+
   let wt;
   try {
     wt = await worktrees.prepare(root, project, goal.id);
@@ -1265,7 +1293,7 @@ test('attachToGoal fills the reserved fields', () => {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `node --test 'test/plan.test.js'` → 10 passing. Then `node --test 'test/orders.test.js'` → 26.
+Run: `node --test 'test/plan.test.js'` → 11 passing. Then `node --test 'test/orders.test.js'` → 26.
 Then `node --test 'test/*.test.js'` — report the real number.
 
 - [ ] **Step 6: Mutation-verify the ordering guarantees**
@@ -1291,6 +1319,10 @@ Then `node --test 'test/*.test.js'` — report the real number.
 #   (this is the shape the plan itself got wrong first - the header's array is
 #    LAST in the file only if the agent printed nothing, so confirm the test
 #    fails for the RIGHT reason and say what it reported)
+# M5b: the impossible-cap check moves below the spawn
+#   Move the `cap < 1` block after the runner.run call
+#   Expect: "an impossible cap fails the goal without spawning anything" FAILS
+#   on the marker assertion - the goal still fails, but a credentialed agent ran
 # M6: capture ignores the caller's onChunk
 #   In capture(), drop the `if (onChunk) onChunk(chunk);` line
 #   Expect: "a caller-supplied onChunk still receives the output" FAILS
