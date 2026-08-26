@@ -1032,6 +1032,13 @@ test('an impossible cap fails the goal without spawning anything', async () => {
 
   assert.strictEqual(result.status, 'failed');
   assert.match(result.error, /maxOrdersPerGoal is 0/);
+  // A present-but-non-numeric cap takes the same path: withinBudget refuses it,
+  // so spawning to discover that is the same wasted run.
+  const g2 = goals.create(root, { projectId: project.id, text: 'y' });
+  const bad = { ...base, budget: { ...base.budget, maxOrdersPerGoal: '12' } };
+  const r2 = await plan.decompose(root, { goal: g2, project: bad, agent, childEnv: testEnv });
+  assert.strictEqual(r2.status, 'failed');
+  assert.ok(!fs.existsSync(marker), 'a non-numeric cap still spawned the PM');
   assert.ok(!fs.existsSync(marker), 'the PM was spawned for a cap that can never be satisfied');
 });
 
@@ -1168,9 +1175,17 @@ async function decompose(root, { goal, project, agent, childEnv, onChunk }) {
   // numeric cap literally, so maxOrdersPerGoal: 0 refuses every plan - and
   // finding that out after a fifteen-minute credentialed agent run, having
   // asked it for "at most 0 work orders", is the expensive way to learn it.
+  // This must match goals.withinBudget exactly: it says "unlimited" only for a
+  // genuinely ABSENT cap, so a present-but-unusable one ('12', 0, -1, null)
+  // refuses every plan. A narrower guard here would spawn the agent, wait the
+  // full run, and refuse afterwards - the expensive path this exists to close.
   const cap = ((project && project.budget) || {}).maxOrdersPerGoal;
-  if (Number.isFinite(cap) && cap < 1) {
-    return goals.failPlanning(root, goal.id, `maxOrdersPerGoal is ${cap}: no plan can be accepted`, null);
+  const capPresent = !(cap === undefined || cap === null);
+  if (capPresent && !(Number.isFinite(cap) && cap >= 1)) {
+    return goals.failPlanning(
+      root, goal.id,
+      `maxOrdersPerGoal is ${JSON.stringify(cap)}: no plan can be accepted`, null
+    );
   }
 
   let wt;
