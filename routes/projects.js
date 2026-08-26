@@ -1,5 +1,11 @@
 'use strict';
 const projects = require('../lib/projects');
+const requireDeps = require('./deps');
+
+// Must stay in step with the destructure below. Deliberately shorter than the
+// orders route's: the server hands both modules the same object, and taking
+// keys this one does not use would hide which capabilities it really has.
+const REQUIRED = ['root', 'sendJson', 'readBody', 'OVERSIZE', 'ABORTED', 'plainIdFrom'];
 
 // The project routes, lifted out of server.js unchanged. A factory taking the
 // server's dependencies once and returning a handler that answers true when it
@@ -13,6 +19,7 @@ const projects = require('../lib/projects');
 // server hands both modules the same deps, and taking keys it does not need
 // would hide which capabilities this one really has.
 module.exports = (deps) => {
+  requireDeps('routes/projects', deps, REQUIRED);
   const { root, sendJson, readBody, OVERSIZE, ABORTED, plainIdFrom } = deps;
 
   return async ({ req, res, p }) => {

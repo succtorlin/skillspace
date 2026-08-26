@@ -643,3 +643,49 @@ test('a duplicate dispatch on a git project is refused as a duplicate', async ()
   assert.strictEqual(dispatch.cancel(order.id), true);
   assert.strictEqual((await first).status, 'cancelled');
 });
+
+test('a caller that never asks about capacity is refused by runOrder itself', async () => {
+  // The ceiling used to live only in the two route handlers, which made it
+  // opt-in: a caller reaching runOrder directly - "run every order in this
+  // goal" is the obvious next shape - spawned as many agents as it liked and
+  // nothing refused it. runOrder is the one door every dispatched agent goes
+  // through, so the bound belongs here too.
+  //
+  // Unconfigured is unbounded by design, so this configures and then puts it
+  // back. Restored in a finally: leaking a ceiling into the tests that follow
+  // would refuse their dispatches and read as an unrelated failure.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'over the line' });
+
+  // Guard against a vacuous pass: unconfigured, this exact call must SUCCEED,
+  // so a refusal below is the predicate and not the fixture.
+  assert.strictEqual(dispatch.atCapacity(), false, 'a previous test leaked a ceiling');
+
+  let asked = 0;
+  try {
+    dispatch.setCapacity(() => { asked += 1; return true; });
+    const result = await dispatch.runOrder(root, {
+      childEnv: testEnv, order, project, agent: shimAgent(OK),
+    });
+    assert.strictEqual(result.refused, 'at capacity', JSON.stringify(result));
+    assert.ok(asked > 0, 'runOrder never consulted the ceiling');
+  } finally {
+    dispatch.setCapacity(null);
+  }
+
+  // Refused, not failed: nothing was started, so `queued` is the honest status
+  // and a future scheduler can still pick it up.
+  assert.strictEqual(orders.get(root, order.id).status, 'queued');
+  // And nothing was claimed - a refusal that leaked a slot would make the
+  // ceiling tighten by one on every refusal until no order could run at all.
+  assert.strictEqual(dispatch.inFlightCount(), 0);
+
+  // Now unconfigured again, the same order dispatches. This is what makes the
+  // assertion above about the predicate rather than about anything else.
+  const ok = await dispatch.runOrder(root, {
+    childEnv: testEnv, order, project, agent: shimAgent(OK),
+  });
+  assert.strictEqual(ok.status, 'succeeded', JSON.stringify(ok));
+});

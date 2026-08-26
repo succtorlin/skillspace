@@ -13,6 +13,11 @@ const { URL } = require('url');
 // shutdown path only; the routes that use them live in routes/.
 const orders = require('./lib/orders');
 const dispatch = require('./lib/dispatch');
+// For reap() only. It carries the pid guard this file's own inline version
+// lacked: when spawn fails asynchronously the handle's pid is undefined, so
+// -pid is NaN, process.kill throws, and the fallback child.kill() reaches a
+// libuv handle whose pid is 0 - which signals OUR OWN process group.
+const runner = require('./lib/runner');
 const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
 
@@ -325,11 +330,39 @@ const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
 // each used to count only their own pool, which made the real process limit
 // twice the configured number. Counting only the OTHER side's pool in one
 // direction closes half of that and leaves the other half open - an order
-// could still be admitted while /api/run held every slot - so both gates go
-// through here. RUNNING holds this route's SSE children (it needs the handles
-// for shutdown); dispatch owns the orders' claims because it owns the release.
+// could still be admitted while /api/run held every slot - so every gate goes
+// through here. RUNNING holds this route's SSE children, which shutdown reaps
+// directly; dispatch owns the orders' claims because it owns the release.
 function agentsRunning() {
   return RUNNING.size + dispatch.inFlightCount();
+}
+
+// ONE ceiling, written once and asked in three places: /api/run's gate, the
+// orders route's gate, and - the one that matters - inside dispatch.runOrder
+// itself, so a caller that never asks is refused anyway. Three hand-copies of
+// `count >= MAX` could disagree; one predicate cannot.
+//
+// This call is also what makes the wiring observable. Delete it and dispatch is
+// unconfigured, atCapacity() is false everywhere, and BOTH ceiling tests in
+// test/orders-api.test.js fail - rather than a silent unbounded server that
+// every existing test still passes.
+dispatch.setCapacity(() => agentsRunning() >= MAX_CONCURRENT_RUNS);
+
+// The other half of the shutdown. dispatch.cancelAll() reaps the orders; these
+// are /api/run's children, which nothing reaped at all - they are spawned
+// detached precisely so they never see the signal sent to our group, and the
+// RUN_TIMEOUT_MS that bounds them is a setTimeout inside THIS process. Killing
+// the console therefore left credentialed agents running with no bound, which
+// is the exact outcome the shutdown block's own comment says it exists to
+// prevent. Measured: SIGTERM with an /api/run agent live, server exits 0, agent
+// survives.
+//
+// Snapshot the set: finish() deletes from RUNNING as each child closes, and
+// that can happen while we are still iterating.
+function reapRunning(signal) {
+  const children = [...RUNNING];
+  for (const child of children) runner.reap(child, signal);
+  return children.length;
 }
 
 // Matches the design's orderTimeoutMs default (spec §8a), which calls it the
@@ -799,7 +832,7 @@ const routeDeps = {
   root: SKILLSPACE_HOME,
   sendJson, readBody, OVERSIZE, ABORTED,
   plainIdFrom, isTopLevelNavigation, denyNavigation,
-  AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS, agentsRunning,
+  AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS,
   // The credential allowlist and CHILD_PATH. /api/run has always used it;
   // the orders path could not reach it, so it spawned with process.env.
   childEnv,
@@ -978,8 +1011,9 @@ async function route(req, res, u, p) {
     // Bounded because each spawn is a real billed invocation and nothing else
     // limits them. The design's per-project maxConcurrent (2 git / 1 dir) does
     // not reach this route, which predates it.
-    // The two routes share one ceiling; agentsRunning() is that one ceiling.
-    if (agentsRunning() >= MAX_CONCURRENT_RUNS) {
+    // The one ceiling, asked through dispatch so this route, the orders route
+    // and runOrder itself cannot drift apart.
+    if (dispatch.atCapacity()) {
       res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end(`too many agents running (${MAX_CONCURRENT_RUNS})`);
     }
@@ -1028,12 +1062,10 @@ async function route(req, res, u, p) {
     RUNNING.add(child);
 
     let settled = false;
-    const reap = (signal) => {
-      // Negative pid signals the whole group. Falls back to the direct child
-      // if the group is already gone, so a dead pid cannot throw here.
-      try { process.kill(-child.pid, signal); }
-      catch (_) { try { child.kill(signal); } catch (__) {} }
-    };
+    // Negative pid signals the whole group, so the agent's tool subprocesses go
+    // with it. runner.reap owns that plus the pid<=0 guard; the copy that used
+    // to live here had the group kill but not the guard.
+    const reap = (signal) => runner.reap(child, signal);
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -1111,7 +1143,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     if (shuttingDown) process.exit(130);   // a second ^C means "now"
     shuttingDown = true;
-    const n = dispatch.cancelAll();
+    const n = dispatch.cancelAll() + reapRunning('SIGTERM');
     if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
     // Exit once the socket is closed AND every cancelled order has recorded
     // its outcome.
@@ -1126,18 +1158,29 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     // it left the order reading `running` for reconcile to guess at. That
     // measurement is the motivation; the ordering above is the guarantee, and
     // only the end state - the order reads `cancelled` - is pinned by a test.
+    // KNOWN LIMIT: server.close() does not close a client's idle keep-alive
+    // socket, so after an /api/run stream ends `closed` still lags by the
+    // keep-alive timeout - measured at ~4s from SIGTERM to exit with one SSE
+    // client attached, against ~270ms for an order. The agent is dead well
+    // before that (the reap above is synchronous), so this is exit latency
+    // rather than an escaped agent. closeIdleConnections() would cut it; left
+    // alone because it changes shutdown for every route at once and this
+    // follow-up is about the orphan.
     let closed = false;
     server.close(() => { closed = true; });
     const drain = setInterval(() => {
-      if (closed && dispatch.inFlightCount() === 0) {
+      if (closed && agentsRunning() === 0) {
         clearInterval(drain);
         process.exit(0);
       }
     }, 50);
-    // One second longer than the runner's 5s SIGTERM->SIGKILL escalation, so a
-    // child that ignores SIGTERM is reaped before we stop waiting for it. It is
-    // unref'd, but the drain interval above is not, so the loop stays alive
-    // long enough for this to fire on an order that never settles.
+    // The same 5s SIGTERM->SIGKILL escalation the runner applies to orders,
+    // applied to /api/run's children, which have no runner to do it for them.
+    setTimeout(() => reapRunning('SIGKILL'), 5000).unref();
+    // One second longer than that escalation, so a child that ignores SIGTERM
+    // is reaped before we stop waiting for it. It is unref'd, but the drain
+    // interval above is not, so the loop stays alive long enough for this to
+    // fire on an order that never settles.
     setTimeout(() => process.exit(0), 6000).unref();
   });
 }

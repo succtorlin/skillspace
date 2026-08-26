@@ -210,6 +210,25 @@ async function makeProject(extra, at) {
   return r.body.project;
 }
 
+// SIGKILL skips the server's own shutdown handler, so an /api/run child - which
+// is detached, and whose only time bound is a setTimeout inside that process -
+// is orphaned, and the mkdtemp run directory it was given leaks. SIGTERM lets
+// the handler reap and clean up; SIGKILL only if the process will not go.
+//
+// Measured: this file now leaks zero /tmp/skillspace-run-* per run.
+// test/projects-api.test.js still SIGKILLs and still leaks one; left alone
+// deliberately, because that file is the unedited safety net for the refactor
+// this follow-up belongs to and the leak is cosmetic.
+async function stopServer(child, ms = 8000) {
+  if (child.exitCode !== null) return;
+  child.kill('SIGTERM');
+  const deadline = Date.now() + ms;
+  while (child.exitCode === null && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  if (child.exitCode === null) child.kill('SIGKILL');
+}
+
 // A project on a server other than the shared one. makeProject already takes a
 // base; this names the common case so a test reads as "a project over there"
 // rather than as an argument-shaped hole.
@@ -795,12 +814,14 @@ test('the process-wide agent ceiling is MAX_CONCURRENT_RUNS, not twice it', asyn
       `the two orders were not in flight: ${listed.map((o) => o.status).join(',')}`
     );
     const text = await run.text();
-    assert.ok(
-      run.status === 429 || /too many/.test(text),
-      `/api/run kept its own pool: ${run.status} ${text.slice(0, 80)}`
-    );
+    // strictEqual, not `status === 429 || /too many/.test(text)`. The looser
+    // shape is the one that has masked a real guard here before: it passes on
+    // any body that happens to contain the phrase, and the status was pinned
+    // only by the test below - which is about the opposite direction.
+    assert.strictEqual(run.status, 429,
+      `/api/run kept its own pool: ${run.status} ${text.slice(0, 80)}`);
   } finally {
-    kid.kill('SIGKILL');
+    await stopServer(kid);
   }
 });
 
@@ -837,6 +858,75 @@ test('an order cannot slip past the ceiling while /api/run holds it', async () =
     const listed = (await json('GET', '/api/orders', undefined, b3)).body.orders;
     assert.strictEqual(listed.length, 0, 'the refused order was recorded anyway');
   } finally {
-    kid.kill('SIGKILL');
+    await stopServer(kid);
   }
+});
+
+test("shutting the server down reaps /api/run's agent, not only its orders", async () => {
+  // dispatch.cancelAll() covers the orders; nothing covered /api/run's
+  // children, which are spawned detached for the same reason - their own
+  // process group - and whose only time bound is a setTimeout inside the dying
+  // process. Measured before the fix: server exits 0, agent survives.
+  const home = tmp('skillspace-runshutdown-');
+  const s = await startServer(home);
+
+  // A marker that reaches the shim's argv, so the agent is findable: /api/run
+  // keeps no record at all, so there is no id to look anything up by.
+  const mark = `RUN-SHUTDOWN-${process.pid}-${Date.now()}`;
+  const alive = () => {
+    try { return Number(execSync(`pgrep -f ${mark} | wc -l`).toString().trim()); } catch (_) { return 0; }
+  };
+
+  // Headers only - draining the stream would wait out the agent.
+  const held = await fetch(`${s.base}/api/run?skill=x&task=${SLOW_MARK} ${mark}`);
+  assert.strictEqual(held.status, 200);
+  for (let i = 0; i < 50 && alive() === 0; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(alive() > 0, 'the agent never started, so this proves nothing about shutdown');
+
+  s.child.kill('SIGTERM');
+  await new Promise((r) => s.child.on('exit', r));
+  for (let i = 0; i < 80 && alive() > 0; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.strictEqual(alive(), 0, 'the agent outlived the server with no time bound');
+});
+
+test('a route factory refuses to construct without every dependency it needs', async () => {
+  // Destructuring a missing key binds `undefined`, so both factories used to
+  // construct happily and fail at the first request that needed the key - in a
+  // handler, as a bare TypeError, with no hint that the cause was the wiring.
+  // Both carried a comment promising otherwise. This is what makes it true.
+  const makeOrderRoutes = require('../routes/orders');
+  const makeProjectRoutes = require('../routes/projects');
+  const stub = () => {};
+  const full = {
+    root: storeRoot, sendJson: stub, readBody: stub,
+    OVERSIZE: Symbol('o'), ABORTED: Symbol('a'), plainIdFrom: stub,
+    isTopLevelNavigation: stub, denyNavigation: stub,
+    AGENTS: [], maxConcurrentRuns: 4, childEnv: stub,
+  };
+  // The wiring is right, so this must still construct - otherwise every
+  // assertion below passes for the wrong reason.
+  assert.strictEqual(typeof makeOrderRoutes(full), 'function');
+  assert.strictEqual(typeof makeProjectRoutes(full), 'function');
+
+  for (const key of Object.keys(full)) {
+    const { [key]: _omitted, ...rest } = full;
+    assert.throws(
+      () => makeOrderRoutes(rest),
+      (e) => e instanceof TypeError && e.message.includes(key),
+      `omitting ${key} constructed the orders route anyway`
+    );
+  }
+
+  // Named because it is the one whose absence used to be silent rather than
+  // loud: the ceiling gate read `agentsRunning() >= maxConcurrentRuns`, and
+  // `n >= undefined` is false, so the bound simply disappeared. The gate now
+  // goes through dispatch.atCapacity() and no longer reads it, but the key is
+  // still required - a 429 that says "(undefined)" is a wiring fault too.
+  const { maxConcurrentRuns: _drop, ...noMax } = full;
+  assert.throws(() => makeOrderRoutes(noMax), /missing dependency: maxConcurrentRuns/);
+
+  // routes/projects takes a deliberately smaller set, so a key the orders
+  // route needs and it does not must NOT be required of it.
+  const { childEnv: _c, AGENTS: _a, ...lean } = full;
+  assert.strictEqual(typeof makeProjectRoutes(lean), 'function');
 });

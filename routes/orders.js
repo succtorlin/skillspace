@@ -2,6 +2,14 @@
 const projects = require('../lib/projects');
 const orders = require('../lib/orders');
 const dispatch = require('../lib/dispatch');
+const requireDeps = require('./deps');
+
+// Must stay in step with the destructure below; see the Known limits note.
+const REQUIRED = [
+  'root', 'sendJson', 'readBody', 'OVERSIZE', 'ABORTED',
+  'plainIdFrom', 'isTopLevelNavigation', 'denyNavigation',
+  'AGENTS', 'maxConcurrentRuns', 'childEnv',
+];
 
 // The order routes. Same contract as routes/projects.js: a factory taking the
 // server's dependencies once and returning a handler that answers true when it
@@ -9,13 +17,25 @@ const dispatch = require('../lib/dispatch');
 // arrives through the factory rather than through a require back into it -
 // reaching back into server.js would make the dependency circular.
 //
-// Constants bind at construction, so a missing capability is a wiring-time
-// fault rather than a TypeError on the first request that happens to need it.
+// Constants bind at construction, and REQUIRED is checked there, so a
+// capability the server forgot to wire is a boot-time fault rather than a
+// TypeError on the first request that happens to need it.
 //
 // Known limits, all recorded rather than fixed - they belong at the START of
 // plan 2b, so the goals and board modules are written against the new shape
 // instead of retrofitted onto this one:
 //
+// - A CAPACITY REFUSAL FROM dispatch LEAVES A QUEUED ORDER. This route asks
+//   first so the refusal is a 429 before any record exists, but a caller that
+//   skips this route and calls runOrder directly gets `refused: 'at capacity'`
+//   on a record that stays `queued`, and nothing retries it - there is still no
+//   scheduler. Whoever writes that caller owns the leftover until there is one.
+// - THE REQUIRED LIST IS A SECOND PLACE TO EDIT. It must stay in step with the
+//   destructure below; drift costs only the boot-time check for the new key,
+//   never correctness, so an omission degrades to the old behaviour rather than
+//   breaking. A Proxy that threw on any undefined read would remove the
+//   duplication and was rejected: it would also forbid a genuinely optional
+//   dependency, which the three modules coming next are likely to want.
 // - `?project=` WITH AN EMPTY VALUE lists every order rather than none. No
 //   consumer today, but the board in plan 3 builds exactly this query and a
 //   cleared filter is the obvious way to produce it.
@@ -30,10 +50,11 @@ const dispatch = require('../lib/dispatch');
 //   record vanishes while agents are still running against its path, and the
 //   orders keep a projectId that no longer resolves.
 
-// The GLOBAL ceiling on concurrent agents is agentsRunning() in server.js -
-// one count over both pools, which /api/run gates on too. maxOrdersPerDay is a
-// daily cap, not a simultaneous one; without this bound a loop - or a
-// held-down button - starts an unbounded number of credentialed agents.
+// The GLOBAL ceiling on concurrent agents is one predicate, set on dispatch at
+// boot in server.js and spanning both pools - this route's orders and
+// /api/run's SSE children. maxOrdersPerDay is a daily cap, not a simultaneous
+// one; without this bound a loop - or a held-down button - starts an unbounded
+// number of credentialed agents.
 //
 // Per-project limiting is no longer entirely absent: dispatch serialises
 // UNISOLATED (dir) projects on its own, refusing a second concurrent order
@@ -44,10 +65,11 @@ const dispatch = require('../lib/dispatch');
 // the scheduler.
 
 module.exports = (deps) => {
+  requireDeps('routes/orders', deps, REQUIRED);
   const {
     root, sendJson, readBody, OVERSIZE, ABORTED,
     plainIdFrom, isTopLevelNavigation, denyNavigation, AGENTS, maxConcurrentRuns,
-    agentsRunning, childEnv,
+    childEnv,
   } = deps;
 
   return async ({ req, res, u, p }) => {
@@ -115,11 +137,15 @@ module.exports = (deps) => {
       // One registry, and one ceiling. dispatch owns the orders' in-flight
       // state because it owns the claim and the release; a second Set here
       // tracked the same fact and released at a different moment, so the two
-      // could disagree mid-shutdown. agentsRunning() adds /api/run's own pool,
-      // because a ceiling only this route can see is not a process ceiling:
-      // gating on the orders count alone still let an order in while /api/run
-      // held every slot.
-      if (agentsRunning() >= maxConcurrentRuns) {
+      // could disagree mid-shutdown.
+      //
+      // atCapacity() spans BOTH pools, because a ceiling only this route can
+      // see is not a process ceiling: counting orders alone still let one in
+      // while /api/run held every slot. runOrder enforces the same predicate,
+      // so this check is not the guard - it is what turns the guard's refusal
+      // into a 429 BEFORE a record exists, since nothing would ever retry a
+      // queued order dispatch declined.
+      if (dispatch.atCapacity()) {
         sendJson(res, 429, { error: `too many orders running (${maxConcurrentRuns})` });
         return true;
       }
