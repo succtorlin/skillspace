@@ -210,6 +210,11 @@ async function makeProject(extra, at) {
   return r.body.project;
 }
 
+// A project on a server other than the shared one. makeProject already takes a
+// base; this names the common case so a test reads as "a project over there"
+// rather than as an argument-shaped hole.
+const makeProjectOn = (at) => makeProject(undefined, at);
+
 // undici rewrites Sec-Fetch-Mode on its own requests, so a fetch-based version
 // of the navigation test passes for the wrong reason. Raw socket, real bytes.
 function rawRequest(method, pathname, extraHeaders, body) {
@@ -746,4 +751,92 @@ test('a second order on an unisolated project is refused without leaving a recor
     'the refused request left an order that will never be dispatched');
 
   await json('POST', `/api/orders/${first.body.order.id}/cancel`);
+});
+
+test('the process-wide agent ceiling is MAX_CONCURRENT_RUNS, not twice it', async () => {
+  // /api/run and /api/orders each capped independently, so the real ceiling
+  // was 2x the constant. One registry means one ceiling.
+  const { child: kid, base: b2 } = await startServer(
+    tmp('skillspace-ceilinghome-'), { SKILLSPACE_MAX_RUNS: '2' }
+  );
+  try {
+    const p1 = await makeProjectOn(b2);
+    const p2 = await makeProjectOn(b2);
+    const a = await fetch(`${b2}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Mode': 'cors' },
+      body: JSON.stringify({ projectId: p1.id, prompt: `${SLOW_MARK} one` }),
+    });
+    const b = await fetch(`${b2}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Mode': 'cors' },
+      body: JSON.stringify({ projectId: p2.id, prompt: `${SLOW_MARK} two` }),
+    });
+    assert.strictEqual(a.status, 200);
+    assert.strictEqual(b.status, 200);
+    // Both order slots are now taken - dispatch claims before its first await,
+    // so the claim is already made by the time the POST above is answered.
+    // /api/run must see the same full pool.
+    //
+    // The third task is deliberately NOT slow: this is about whether the
+    // request is admitted, not about holding a slot. A slow one made the
+    // accepted case stream for 20s, by which time the two orders had finished
+    // and the vacuous-pass guard below fired instead of the real assertion -
+    // the failure was right but said the wrong thing.
+    const run = await fetch(`${b2}/api/run?skill=x&task=third agent`, {
+      headers: { 'Sec-Fetch-Mode': 'cors' },
+    });
+    // Read the pool BEFORE draining the response, so a refusal is checked
+    // against the moment the request was made. Guards a vacuous pass: a 429
+    // means nothing if the two orders had already settled.
+    const listed = (await (await fetch(`${b2}/api/orders`)).json()).orders;
+    assert.strictEqual(
+      listed.filter((o) => o.status === 'queued' || o.status === 'running').length, 2,
+      `the two orders were not in flight: ${listed.map((o) => o.status).join(',')}`
+    );
+    const text = await run.text();
+    assert.ok(
+      run.status === 429 || /too many/.test(text),
+      `/api/run kept its own pool: ${run.status} ${text.slice(0, 80)}`
+    );
+  } finally {
+    kid.kill('SIGKILL');
+  }
+});
+
+test('an order cannot slip past the ceiling while /api/run holds it', async () => {
+  // The other half of the same property, and the half a one-directional fix
+  // leaves open: making /api/run count the orders' pool closes the 2x ceiling
+  // in one direction only. Gating the orders route on the ORDERS count alone
+  // still admitted an order while /api/run held every slot - measured at
+  // MAX_RUNS=1, which produced two concurrent agents.
+  const { child: kid, base: b3 } = await startServer(
+    tmp('skillspace-ceilingrun-'), { SKILLSPACE_MAX_RUNS: '1' }
+  );
+  try {
+    // Occupy the one slot from the /api/run side. The response resolves on
+    // headers, so the SSE stream is deliberately left undrained - draining it
+    // would wait out the agent and free the slot before the assertion.
+    const held = await fetch(`${b3}/api/run?skill=x&task=${SLOW_MARK} holds the only slot`);
+    assert.strictEqual(held.status, 200);
+    // Guard against a vacuous pass: prove the slot really is held before
+    // concluding anything from a refusal on the other route.
+    const second = await fetch(`${b3}/api/run?skill=x&task=also wants in`);
+    await second.text();
+    assert.strictEqual(second.status, 429, '/api/run did not hold the slot it was given');
+
+    const project = await makeProjectOn(b3);
+    const r = await json('POST', '/api/orders', {
+      projectId: project.id, prompt: 'sneaks past the ceiling',
+    }, b3);
+    assert.strictEqual(r.status, 429,
+      `the orders route could not see /api/run's pool: ${JSON.stringify(r.body)}`);
+
+    // And nothing was persisted: a refusal must not leave a queued order that
+    // nothing will ever dispatch.
+    const listed = (await json('GET', '/api/orders', undefined, b3)).body.orders;
+    assert.strictEqual(listed.length, 0, 'the refused order was recorded anyway');
+  } finally {
+    kid.kill('SIGKILL');
+  }
 });

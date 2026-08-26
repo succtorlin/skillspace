@@ -13,8 +13,8 @@ const { URL } = require('url');
 // shutdown path only; the routes that use them live in routes/.
 const orders = require('./lib/orders');
 const dispatch = require('./lib/dispatch');
-const projectRoutes = require('./routes/projects');
-const orderRoutes = require('./routes/orders');
+const makeProjectRoutes = require('./routes/projects');
+const makeOrderRoutes = require('./routes/orders');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -320,6 +320,18 @@ const AGENTS = detectAgents();
 // this route; this is the crude global equivalent until it does.
 const RUNNING = new Set();
 const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
+
+// ONE question, ONE answer, whoever is asking. /api/run and the orders route
+// each used to count only their own pool, which made the real process limit
+// twice the configured number. Counting only the OTHER side's pool in one
+// direction closes half of that and leaves the other half open - an order
+// could still be admitted while /api/run held every slot - so both gates go
+// through here. RUNNING holds this route's SSE children (it needs the handles
+// for shutdown); dispatch owns the orders' claims because it owns the release.
+function agentsRunning() {
+  return RUNNING.size + dispatch.inFlightCount();
+}
+
 // Matches the design's orderTimeoutMs default (spec §8a), which calls it the
 // only thing standing between a stuck agent and an unbounded bill.
 const RUN_TIMEOUT_MS = Number(process.env.SKILLSPACE_RUN_TIMEOUT_MS) || 900000;
@@ -774,6 +786,27 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Constants bind once; only the four per-request values are rebuilt. A route
+// that needs a new capability now names it in one signature rather than
+// reaching into a shared bag that every module can see, and a key it forgot to
+// wire is a boot-time fault rather than a TypeError on the first request that
+// happens to need it.
+//
+// Constructed here rather than beside the requires at the top: SKILLSPACE_HOME,
+// AGENTS, MAX_CONCURRENT_RUNS, OVERSIZE and ABORTED are all `const`, so reading
+// them any earlier is a temporal-dead-zone throw at boot.
+const routeDeps = {
+  root: SKILLSPACE_HOME,
+  sendJson, readBody, OVERSIZE, ABORTED,
+  plainIdFrom, isTopLevelNavigation, denyNavigation,
+  AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS, agentsRunning,
+  // The credential allowlist and CHILD_PATH. /api/run has always used it;
+  // the orders path could not reach it, so it spawned with process.env.
+  childEnv,
+};
+const projectRoutes = makeProjectRoutes(routeDeps);
+const orderRoutes = makeOrderRoutes(routeDeps);
+
 async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
   if (p === '/app.js' || p === '/icons.js' || p === '/pure.js' || p === '/style.css') return serveStatic(res, p.slice(1));
@@ -784,21 +817,12 @@ async function route(req, res, u, p) {
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
   // Both modules answer or decline; neither overlaps any path below, so the
-  // order they are tried in and their position here are free. Everything they
-  // need is passed in - reaching back into this file from routes/ would make
-  // the dependency circular.
-  const ctx = {
-    req, res, u, p,
-    root: SKILLSPACE_HOME,
-    sendJson, readBody, OVERSIZE, ABORTED,
-    plainIdFrom, isTopLevelNavigation, denyNavigation,
-    AGENTS, maxConcurrentRuns: MAX_CONCURRENT_RUNS,
-    // The credential allowlist and CHILD_PATH. /api/run has always used it;
-    // the orders path could not reach it, so it spawned with process.env.
-    childEnv,
-  };
-  if (await projectRoutes(ctx)) return;
-  if (await orderRoutes(ctx)) return;
+  // order they are tried in and their position here are free. Their constants
+  // were bound once at construction (see routeDeps); only the four per-request
+  // values are rebuilt here.
+  const rq = { req, res, u, p };
+  if (await projectRoutes(rq)) return;
+  if (await orderRoutes(rq)) return;
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
@@ -954,7 +978,8 @@ async function route(req, res, u, p) {
     // Bounded because each spawn is a real billed invocation and nothing else
     // limits them. The design's per-project maxConcurrent (2 git / 1 dir) does
     // not reach this route, which predates it.
-    if (RUNNING.size >= MAX_CONCURRENT_RUNS) {
+    // The two routes share one ceiling; agentsRunning() is that one ceiling.
+    if (agentsRunning() >= MAX_CONCURRENT_RUNS) {
       res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end(`too many agents running (${MAX_CONCURRENT_RUNS})`);
     }
