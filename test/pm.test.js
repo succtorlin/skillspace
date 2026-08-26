@@ -60,7 +60,10 @@ test('no JSON at all is an error, not an empty plan', () => {
   assert.match(r.error, /no JSON plan/);
 });
 
-test('malformed JSON is an error naming the problem', () => {
+// Renamed from "...naming the problem": the assertion is that it is refused,
+// not that the syntax error is described. The parse error is deliberately not
+// surfaced - rawPlan carries the text a human needs.
+test('malformed JSON is refused, not treated as an empty plan', () => {
   const r = pm.extractPlan('[{"title":"a",]');
   assert.strictEqual(r.orders, null);
   assert.match(r.error, /no JSON plan/);
@@ -277,10 +280,15 @@ test('a ten-megabyte transcript is answered, not thrown', () => {
   assert.ok(Date.now() - started < 10000, `took ${Date.now() - started}ms`);
 });
 
-test('deeply nested brackets do not throw', () => {
+test('deeply nested brackets are refused by shape, not by a crash', () => {
+  // Named for what it actually checks. V8's JSON parser is iterative - 200,000
+  // levels parse without throwing, measured - so this never reaches a stack
+  // overflow; it is an array whose first element is an array, and it is
+  // refused as such. Asserting the exact string keeps it from passing on some
+  // other error that happens to be non-empty.
   const r = pm.extractPlan('['.repeat(20000) + ']'.repeat(20000));
   assert.strictEqual(r.orders, null);
-  assert.ok(typeof r.error === 'string' && r.error.length > 0);
+  assert.strictEqual(r.error, 'entry 0 is not an object');
 });
 
 test('a lone surrogate does not throw', () => {
@@ -356,4 +364,52 @@ test('a non-string acceptance is emptied, not stringified', () => {
     assert.strictEqual(r.error, null, bad);
     assert.strictEqual(r.orders[0].acceptance, '', bad);
   }
+});
+
+test('the prompt echoed back is refused, not executed as a plan', () => {
+  // A PM that cannot comply commonly repeats the format it was given. With a
+  // placeholder sentence in "prompt" that echo IS a valid plan: one plausible
+  // order, persisted, goal running, and the "order" is the instructions
+  // talking back.
+  const p = pm.buildPrompt({ text: 'g', projectPath: '/tmp/repo', maxOrders: 5 });
+  for (const echo of [p, 'Confirm the format:\n' + p.slice(p.indexOf('[\n')), p + '\n\nI cannot comply.']) {
+    const r = pm.extractPlan(echo);
+    assert.strictEqual(r.orders, null);
+    assert.match(r.error, /entry 0 has no prompt/);
+  }
+});
+
+test('the skeleton with its placeholders filled in is a plan', () => {
+  // The other half of the rule above: only the blank template is refused. A PM
+  // that used the shape and did the work is indistinguishable from one that
+  // wrote a plan freehand, and should be.
+  const p = pm.buildPrompt({ text: 'g', projectPath: '/tmp/repo', maxOrders: 5 });
+  const filled = p.replace('"prompt": ""', '"prompt": "port the parser"');
+  const r = pm.extractPlan(filled);
+  assert.strictEqual(r.error, null);
+  assert.strictEqual(r.orders[0].prompt, 'port the parser');
+});
+
+test('a non-string title is emptied, not stringified', () => {
+  // Cosmetic - a title is a board label, never judged - but lib/orders does
+  // not backstop it: optionalText rejects non-strings and passes a stringified
+  // one straight through.
+  for (const bad of ['42', '{"a":1}', 'true', '["x"]']) {
+    const r = pm.extractPlan(`[{"title":${bad},"prompt":"p"}]`);
+    assert.strictEqual(r.error, null, bad);
+    assert.strictEqual(r.orders[0].title, '', bad);
+  }
+});
+
+test('arraySpans finds balanced top-level spans and nothing else', () => {
+  // Exported for this test rather than for callers: it holds the subtle rules,
+  // and pinning it directly says which layer broke when extraction goes wrong.
+  assert.deepStrictEqual(pm.arraySpans('prose [1] more'), ['[1]']);
+  assert.deepStrictEqual(pm.arraySpans('["a ] b"]'), ['["a ] b"]']);
+  assert.deepStrictEqual(pm.arraySpans('["a [ b"]'), ['["a [ b"]']);
+  assert.deepStrictEqual(pm.arraySpans('[1] then [2]'), ['[1]', '[2]']);
+  assert.deepStrictEqual(pm.arraySpans('[[1],[2]]'), ['[[1],[2]]'], 'top level only');
+  assert.deepStrictEqual(pm.arraySpans('stray ] then [1]'), ['[1]'], 'recovers');
+  assert.deepStrictEqual(pm.arraySpans('[1 unclosed'), []);
+  assert.deepStrictEqual(pm.arraySpans(''), []);
 });
