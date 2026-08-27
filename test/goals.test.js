@@ -157,10 +157,12 @@ test('reconcile fails orphaned planning goals', () => {
   assert.strictEqual(goals.get(root, b.id).error, 'done already', 'settled goals are untouched');
 });
 
-test('reconcile still skips a goal with work outstanding', () => {
-  // `planned` and `running` both mean "orders exist that nothing has finished".
-  // Sweeping either on boot would fail goals whose orders are fine, and 'failed'
-  // is SETTLED, so nothing could correct it afterwards.
+test('reconcile sweeps the planning orphan and leaves the planned goal alone', () => {
+  // `planned` means orders exist that nothing has finished. Sweeping it on boot
+  // would fail a goal whose orders are fine, and 'failed' is SETTLED, so nothing
+  // could correct it afterwards. `running` is NOT skipped - it is demoted, which
+  // the next test covers; this one asserts over `planned` only, which is why the
+  // name no longer says "work outstanding".
   const root = tmpRoot();
   const a = goals.create(root, { projectId: 'p', text: 'a' });
   goals.planned(root, a.id, { orderIds: ['ord-a'], pmAgent: 'c', rawPlan: '[]' });
@@ -208,9 +210,15 @@ test('markRunning is observable: nothing between the write and the read collapse
   // The distinction this pins. The other candidate mechanism for the legacy
   // records above was translating `running` to `planned` inside get(), which
   // would have swallowed this write and made markRunning a silent no-op through
-  // the only reader there is. Both halves are needed: disk alone would still
-  // pass with a translating get(), and get() alone would still pass with a
-  // markRunning that wrote nothing.
+  // the only reader there is - and disk alone would still pass while get() lied.
+  //
+  // The on-disk half guards a DIFFERENT hazard, and an earlier version of this
+  // comment named the wrong one. It is NOT "a markRunning that wrote nothing":
+  // get() is store.readJson with no cache, so it re-reads the file and catches
+  // that unaided - measured, by deleting the disk assertion and running a
+  // non-persisting markRunning against what was left, which failed on "a read
+  // translated the write away". What disk catches that get() cannot is a get()
+  // that MEMOISES, handing back a record it never re-read.
   const root = tmpRoot();
   const g = goals.create(root, { projectId: 'p', text: 'x' });
   goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'c', rawPlan: '[]' });
