@@ -422,3 +422,95 @@ test('cleanup is safe to call twice', async () => {
   await worktrees.cleanup(wt); // must not throw
   assert.ok(!fs.existsSync(wt.cwd));
 });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('concurrent prepares on one repo do not race git', async () => {
+  // `git worktree add` on one repo fails probabilistically at any K>=2: one add
+  // enumerates .git/worktrees/*/commondir while another is mid-creation of its
+  // own, and reads a file that exists but is not yet written.
+  //   fatal: failed to read .git/worktrees/<id>/commondir: Undefined error: 0
+  // It fails closed, so the cost is a legitimate order failing spuriously.
+  //
+  // HONEST LIMIT OF THIS TEST: one run is one trial, and a trial catches the
+  // unmutexed bug ~6% of the time: run 100 times with the mutex removed it
+  // failed 6 times, and 0/100 with it. Nor is that rate improvable -
+  // 5/50 trials at N=8, 2/20 at N=16, 3/20 at N=32, 2/12 at N=64 - so it
+  // PLATEAUS and raising N does not buy a reliable test, it only buys runtime.
+  // Deliberate CPU load did not move it either (2/20 at N=8), and staggering
+  // the starts CLOSED the window entirely (0/20 at 5/15/40ms): the race needs
+  // simultaneous cold starts. N=8 is therefore the cheapest N that reproduces,
+  // and this test is a net that must be run repeatedly to be trusted - which
+  // is how the mutation check below scores it.
+  const root = tmpDir('skillspace-wthome-');
+  const repo = tmpGitRepo();
+  const project = { kind: 'git', path: repo };
+
+  const N = 8;
+  const results = await Promise.all(
+    Array.from({ length: N }, (_, i) =>
+      worktrees.prepare(root, project, `ord_mutex_${i}`).then(
+        (wt) => ({ ok: true, wt }),
+        (e) => ({ ok: false, message: e.message })
+      )
+    )
+  );
+
+  const failed = results.filter((r) => !r.ok);
+  assert.deepStrictEqual(failed.map((f) => f.message), [], 'a concurrent prepare failed');
+
+  // NOT `new Set(cwds).size === N`: cwd is path.join(root, 'worktrees', orderId),
+  // a pure function of the id, so distinct ids give distinct cwds by string
+  // construction and that assertion can never fail. Ask git instead - it is the
+  // one that has to survive the race.
+  for (const r of results) {
+    assert.ok(fs.existsSync(path.join(r.wt.cwd, 'file.txt')), `${r.wt.cwd} has no repo content`);
+  }
+  const listed = execSync('git worktree list --porcelain', { cwd: repo, encoding: 'utf8' })
+    .split('\n').filter((l) => l.startsWith('worktree ')).length;
+  assert.strictEqual(listed, N + 1, `git registered ${listed} worktrees, expected the main tree plus ${N}`);
+
+  for (const r of results) await worktrees.cleanup(r.wt);
+});
+
+test('the mutex is per repo, not global', async () => {
+  // A global lock would serialise unrelated projects, turning an isolation fix
+  // into a throughput bug.
+  //
+  // Asserting that both prepares COMPLETE would not pin this: a global lock
+  // completes both too, just serially. So make one repo's add genuinely slow -
+  // a post-checkout hook that sleeps, which `worktree add` runs - start it
+  // first, and let it get inside its add before the other begins. The fast
+  // repo must then finish FIRST. Under a global lock it cannot: it would be
+  // chained behind a holder that sleeps for a second.
+  const root = tmpDir('skillspace-wthome-');
+  const slowRepo = tmpGitRepo();
+  const fastRepo = tmpGitRepo();
+  fs.writeFileSync(
+    path.join(slowRepo, '.git', 'hooks', 'post-checkout'),
+    '#!/bin/sh\nsleep 1\nexit 0\n',
+    { mode: 0o755 }
+  );
+
+  const finished = [];
+  const slow = worktrees.prepare(root, { kind: 'git', path: slowRepo }, 'ord_repo_slow')
+    .then((wt) => { finished.push('slow'); return wt; });
+  // Long enough that `slow` is past its read-only inspection and inside the
+  // add (one rev-parse, tens of ms), short enough that its 1s hook is still
+  // running. Without this the two race for the lock and a global lock could
+  // pass by luck.
+  await sleep(250);
+  const fast = worktrees.prepare(root, { kind: 'git', path: fastRepo }, 'ord_repo_fast')
+    .then((wt) => { finished.push('fast'); return wt; });
+
+  const [ws, wf] = await Promise.all([slow, fast]);
+
+  assert.deepStrictEqual(
+    finished, ['fast', 'slow'],
+    'the fast repo waited behind an unrelated slow repo: the lock is global, not per repo'
+  );
+  assert.notStrictEqual(ws.cwd, wf.cwd);
+
+  await worktrees.cleanup(ws);
+  await worktrees.cleanup(wf);
+});
