@@ -351,8 +351,8 @@ test('POST /api/goals decomposes into queued orders', async () => {
   assert.strictEqual(r.body.goal.projectId, project.id);
 
   const after = await planned(r.body.goal.id);
-  assert.strictEqual(after.goal.status, 'running',
-    `the goal did not reach running: ${after.goal.error}`);
+  assert.strictEqual(after.goal.status, 'planned',
+    `the goal did not reach planned: ${after.goal.error}`);
   assert.strictEqual(after.goal.orderIds.length, 2);
   assert.strictEqual(after.orders.length, 2);
   after.orders.forEach((o, i) => {
@@ -669,7 +669,7 @@ test("planning is refused once the day's order budget is spent", async () => {
 
   // Under the cap: planning proceeds.
   const under = await json('POST', '/api/goals', { projectId: project.id, text: 'room left' });
-  assert.strictEqual((await planned(under.body.goal.id)).goal.status, 'running',
+  assert.strictEqual((await planned(under.body.goal.id)).goal.status, 'planned',
     'planning was refused while the day still had room');
 
   // That plan created 2 orders, which meets the cap of 2.
@@ -734,11 +734,12 @@ test('goals still planning are reconciled to failed on boot', async () => {
   // previous server died. It is never assumed to have produced a plan.
   const home = tmp('skillspace-goalreconcile-');
   const id = seedGoal(home, 'planning');
-  // A `running` goal is deliberately NOT reconciled - its orders are reconciled
-  // individually by lib/orders, and nothing here can say whether the goal as a
-  // whole finished. Seeded alongside so a reconcile that swept everything would
-  // be caught rather than pass.
-  const untouched = seedGoal(home, 'running');
+  // A `running` goal is NOT swept - its orders are reconciled individually by
+  // lib/orders, and nothing here can say whether the goal as a whole finished.
+  // It is DEMOTED to `planned` instead: on boot the claim `running` makes is
+  // false of every goal in the store, whichever plan wrote it. Seeded alongside
+  // so a reconcile that failed everything would be caught rather than pass.
+  const demoted = seedGoal(home, 'running');
 
   const s = await startServer(home);
   try {
@@ -752,9 +753,18 @@ test('goals still planning are reconciled to failed on boot', async () => {
     const raw = JSON.parse(fs.readFileSync(path.join(home, 'goals', id + '.json'), 'utf8'));
     assert.strictEqual(raw.status, 'failed');
 
-    const other = await json('GET', '/api/goals/' + untouched, undefined, s.base);
-    assert.strictEqual(other.body.goal.status, 'running',
-      'the reconcile swept a running goal it cannot judge');
+    // This is the plan-2b migration running through the real boot path: the
+    // record was seeded exactly as 2b's planned() wrote it, and one boot is
+    // what corrects the whole store.
+    const other = await json('GET', '/api/goals/' + demoted, undefined, s.base);
+    assert.strictEqual(other.body.goal.status, 'planned',
+      'a stale `running` goal survived a boot still claiming an agent');
+    assert.strictEqual(other.body.goal.error, null,
+      'the reconcile failed a running goal it cannot judge');
+    const demotedRaw = JSON.parse(
+      fs.readFileSync(path.join(home, 'goals', demoted + '.json'), 'utf8')
+    );
+    assert.strictEqual(demotedRaw.status, 'planned', 'the demotion never reached disk');
   } finally {
     await stopServer(s.child);
   }
@@ -903,7 +913,7 @@ test('a planned order can actually be dispatched, and only the one asked for', a
   })).body.goal;
 
   const done = await planned(g.id);
-  assert.strictEqual(done.goal.status, 'running', `the goal did not plan: ${done.goal.error}`);
+  assert.strictEqual(done.goal.status, 'planned', `the goal did not plan: ${done.goal.error}`);
   assert.strictEqual(done.orders.length, 2);
   assert.ok(done.orders.every((o) => o.status === 'queued'),
     'the plan did not leave its orders queued, so approval is not what is being tested');

@@ -69,7 +69,7 @@ test('list returns goals newest first, filterable by project', () => {
   assert.strictEqual(goals.list(root, { projectId: 'p1' }).length, 1);
 });
 
-test('planned records the orders and moves the goal to running', () => {
+test('planned records the orders and moves the goal to planned', () => {
   const root = tmpRoot();
   const g = goals.create(root, { projectId: 'p', text: 'x' });
   const mine = ['ord-a', 'ord-b'];
@@ -78,7 +78,7 @@ test('planned records the orders and moves the goal to running', () => {
     pmAgent: 'claude',
     rawPlan: '[{"title":"a"},{"title":"b"}]',
   });
-  assert.strictEqual(done.status, 'running');
+  assert.strictEqual(done.status, 'planned');
   assert.deepStrictEqual(done.orderIds, ['ord-a', 'ord-b']);
   assert.strictEqual(done.pmAgent, 'claude');
   assert.match(done.rawPlan, /title/);
@@ -157,18 +157,112 @@ test('reconcile fails orphaned planning goals', () => {
   assert.strictEqual(goals.get(root, b.id).error, 'done already', 'settled goals are untouched');
 });
 
-test('reconcile leaves a goal whose orders are already dispatched alone', () => {
-  // Only `planning` is orphaned by a restart. `running` means the orders exist
-  // and lib/orders reconciles them one at a time; sweeping the goal as well
-  // would stamp a goal whose work is underway "interrupted while planning" on
-  // every boot, and it is settled after that so nothing can correct it.
+test('reconcile still skips a goal with work outstanding', () => {
+  // `planned` and `running` both mean "orders exist that nothing has finished".
+  // Sweeping either on boot would fail goals whose orders are fine, and 'failed'
+  // is SETTLED, so nothing could correct it afterwards.
+  const root = tmpRoot();
+  const a = goals.create(root, { projectId: 'p', text: 'a' });
+  goals.planned(root, a.id, { orderIds: ['ord-a'], pmAgent: 'c', rawPlan: '[]' });
+  const b = goals.create(root, { projectId: 'p', text: 'b' });  // still `planning`
+
+  assert.strictEqual(goals.reconcile(root), 1, 'only the planning goal is swept');
+  assert.strictEqual(goals.get(root, a.id).status, 'planned');
+  assert.strictEqual(goals.get(root, a.id).error, null, 'the survivor was stamped anyway');
+  assert.strictEqual(goals.get(root, b.id).status, 'failed');
+});
+
+test('a planned goal is `planned`, not `running`', () => {
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  const done = goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'claude', rawPlan: '[]' });
+  assert.strictEqual(done.status, 'planned', 'a plan on disk is not work in progress');
+});
+
+test('a goal persisted as `running` is demoted to `planned` on boot', () => {
+  // The old value is on disk in every store that ran plan 2b, which wrote
+  // `running` at plan-persist time for what is now `planned`. reconcile() is
+  // the migration: it is the boot path, it already walks every goal and already
+  // writes, and on boot NOTHING is in flight - lib/orders settled this goal's
+  // orders to `interrupted` a moment earlier. So a 2b record and a 2c record
+  // whose agents really did die need the SAME correction, and no flag has to
+  // tell them apart. It runs once per store rather than on every read forever.
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  const file = path.join(root, 'goals', `${g.id}.json`);
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...raw, status: 'running', orderIds: ['ord-a'] }));
+
+  assert.strictEqual(goals.reconcile(root), 0, 'a demotion is not a sweep and must not be counted');
+  assert.strictEqual(goals.get(root, g.id).status, 'planned', 'a legacy record was not demoted');
+  assert.deepStrictEqual(goals.get(root, g.id).orderIds, ['ord-a'], 'the plan did not survive the demotion');
+  assert.strictEqual(goals.get(root, g.id).finishedAt, null, 'a demotion is not a finish');
+  // On disk, which is the whole point: the next reader sees it without help.
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(after.status, 'planned', 'the demotion was returned but never written');
+});
+
+test('markRunning is observable: nothing between the write and the read collapses it', () => {
+  // The distinction this pins. The other candidate mechanism for the legacy
+  // records above was translating `running` to `planned` inside get(), which
+  // would have swallowed this write and made markRunning a silent no-op through
+  // the only reader there is. Both halves are needed: disk alone would still
+  // pass with a translating get(), and get() alone would still pass with a
+  // markRunning that wrote nothing.
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'c', rawPlan: '[]' });
+  goals.markRunning(root, g.id);
+
+  const onDisk = JSON.parse(fs.readFileSync(path.join(root, 'goals', `${g.id}.json`), 'utf8'));
+  assert.strictEqual(onDisk.status, 'running', 'markRunning never reached disk');
+  assert.strictEqual(goals.get(root, g.id).status, 'running', 'a read translated the write away');
+});
+
+test('running means at least one of its orders is in flight', () => {
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  goals.planned(root, g.id, { orderIds: ['ord-a', 'ord-b'], pmAgent: 'claude', rawPlan: '[]' });
+  const run = goals.markRunning(root, g.id);
+  assert.strictEqual(run.status, 'running');
+  // and it can go back: the last order settled, more remain queued
+  assert.strictEqual(goals.markPlanned(root, g.id).status, 'planned');
+});
+
+test('a goal is done when every order it names has settled', () => {
   const root = tmpRoot();
   const g = goals.create(root, { projectId: 'p', text: 'x' });
   goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'claude', rawPlan: '[]' });
+  const done = goals.markDone(root, g.id);
+  assert.strictEqual(done.status, 'done');
+  assert.ok(done.finishedAt, 'a settled goal records when');
+  // done is SETTLED, so nothing walks it back
+  assert.strictEqual(goals.markRunning(root, g.id).status, 'done');
+  // ...and the SETTLED rule ITSELF, through a writer that has no other guard.
+  // The line above does not pin it: moveLive() refuses anything outside
+  // HAS_ORDERS first, so it stays green with `done` deleted from SETTLED - a
+  // mutant that survived until this assertion was added. planned() goes through
+  // patch() alone, which is where the rule actually lives.
+  assert.strictEqual(
+    goals.planned(root, g.id, { orderIds: ['ord-b'] }).status, 'done',
+    'a settled goal was rewritten'
+  );
+  assert.deepStrictEqual(goals.get(root, g.id).orderIds, ['ord-a'], 'the settled plan was overwritten');
+});
 
-  assert.strictEqual(goals.reconcile(root), 0);
-  assert.strictEqual(goals.get(root, g.id).status, 'running');
-  assert.strictEqual(goals.get(root, g.id).error, null);
+test('a goal still planning cannot be marked running or done', () => {
+  // `planning` means the PM has produced no orders, so "one of its orders is in
+  // flight" is false and "every order it names has settled" is vacuously TRUE -
+  // the dangerous half. A vacuous markDone settles a goal that did nothing, and
+  // `done` is SETTLED, so nothing could ever correct it. This is the same zombie
+  // planned() refuses an empty plan to prevent, reached by the back door.
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  assert.strictEqual(goals.markRunning(root, g.id).status, 'planning',
+    'a goal with no orders was marked running');
+  assert.strictEqual(goals.markDone(root, g.id).status, 'planning',
+    'a goal with no orders was settled as done');
+  assert.strictEqual(goals.get(root, g.id).finishedAt, null, 'a vacuous done recorded a finish');
 });
 
 test('a nullish planning failure still records a diagnosis, never "undefined"', () => {
@@ -187,9 +281,11 @@ test('a nullish planning failure still records a diagnosis, never "undefined"', 
 });
 
 test('planned refuses an empty plan rather than creating an unreachable goal', () => {
-  // `running` with no orders is a zombie: reconcile() skips `running`, nothing
-  // moves it on, and it is not SETTLED - so it sits in list() forever as work
-  // in progress that does not exist. A caller with no orders wants failPlanning.
+  // `planned` with no orders is a zombie: reconcile() does not sweep it, it is
+  // not SETTLED, and nothing can honestly run or finish it - so it sits in
+  // list() forever as work outstanding that does not exist. Worse, markDone()
+  // would settle it on a vacuously true "every order it names has settled".
+  // A caller with no orders wants failPlanning.
   const root = tmpRoot();
   const g = goals.create(root, { projectId: 'p', text: 'x' });
   assert.throws(() => goals.planned(root, g.id, {}), /a plan with no orders is not a plan/);

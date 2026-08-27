@@ -103,7 +103,7 @@ test('the in-flight count does not drop before the goal is written', async () =>
   // Positive controls, both of them: a run that never sampled, or never
   // planned, would make the assertion below pass for free.
   assert.ok(samples > 20, `the probe only sampled ${samples} times`);
-  assert.strictEqual(result.status, 'running', 'the plan did not succeed, so this proves nothing');
+  assert.strictEqual(result.status, 'planned', 'the plan did not succeed, so this proves nothing');
   assert.deepStrictEqual(bad, [],
     'the in-flight count reached zero while the goal was still being written');
 });
@@ -118,7 +118,7 @@ test('a goal is decomposed into persisted orders', async () => {
     goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
   });
 
-  assert.strictEqual(result.status, 'running');
+  assert.strictEqual(result.status, 'planned');
   assert.strictEqual(result.orderIds.length, 2);
   const first = orders.get(root, result.orderIds[0]);
   assert.strictEqual(first.goalId, goal.id);
@@ -347,7 +347,7 @@ test('a plan wrapped in ANSI colour still extracts', async () => {
 
   const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
 
-  assert.strictEqual(result.status, 'running', `colour broke extraction: ${result.error}`);
+  assert.strictEqual(result.status, 'planned', `colour broke extraction: ${result.error}`);
   assert.strictEqual(result.orderIds.length, 1);
 });
 
@@ -475,7 +475,7 @@ test('a header line already in the log does not reach the extractor', async () =
     goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
   });
 
-  assert.strictEqual(result.status, 'running');
+  assert.strictEqual(result.status, 'planned');
   assert.strictEqual(result.orderIds.length, 2, 'a plan from the header leaked in');
   assert.strictEqual(orders.get(root, result.orderIds[0]).title, 'one');
   // The order-count assertions above CANNOT tell the two sources apart on this
@@ -607,7 +607,7 @@ test('two concurrent goals on one dir project do not both run in it', async () =
   ]);
 
   const statuses = [r1.status, r2.status].sort();
-  assert.deepStrictEqual(statuses, ['failed', 'running'], 'both PMs ran in the user\'s directory');
+  assert.deepStrictEqual(statuses, ['failed', 'planned'], 'both PMs ran in the user\'s directory');
   const refused = r1.status === 'failed' ? r1 : r2;
   assert.match(refused.error, /project busy/);
   // The interleaving is the property, not the count: "in in out out" is two
@@ -639,7 +639,7 @@ test('a dispatched order and a PM cannot both run in one dir project', async () 
   const ok = await plan.decompose(root, {
     goal: g2, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
   });
-  assert.strictEqual(ok.status, 'running', 'the PM claim leaked and locked the project');
+  assert.strictEqual(ok.status, 'planned', 'the PM claim leaked and locked the project');
   assert.strictEqual(dispatch.projectBusy(project.id), false, 'the claim was never released');
 });
 
@@ -776,7 +776,7 @@ test('a clean PM run leaves no branch behind; one that wrote files keeps it', as
   for (let i = 0; i < 3; i++) {
     const g = goals.create(root, { projectId: project.id, text: `clean ${i}` });
     const r = await plan.decompose(root, { goal: g, project, agent: shimAgent(PLAN_OK), childEnv: testEnv });
-    assert.strictEqual(r.status, 'running');
+    assert.strictEqual(r.status, 'planned');
   }
   assert.deepStrictEqual(branches(), [], 'a branch per goal accumulated in the user\'s repo');
 
@@ -785,7 +785,7 @@ test('a clean PM run leaves no branch behind; one that wrote files keeps it', as
     `#!/bin/sh\necho meddled > meddled.txt\n${PLAN_OK.split('\n').slice(1).join('\n')}`
   );
   const r = await plan.decompose(root, { goal: dirty, project, agent: writer, childEnv: testEnv });
-  assert.strictEqual(r.status, 'running');
+  assert.strictEqual(r.status, 'planned');
   assert.deepStrictEqual(
     branches(), [`skillspace/${dirty.id}`],
     'the PM modified files and the evidence was deleted'
@@ -893,7 +893,7 @@ test('a dir project plans in place and its files survive', async () => {
 
   const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
 
-  assert.strictEqual(result.status, 'running');
+  assert.strictEqual(result.status, 'planned');
   // "in place" was the name of this test and the one thing it never checked:
   // both assertions below hold just as well if the PM ran in a worktree.
   assert.strictEqual(
