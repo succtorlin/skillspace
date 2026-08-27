@@ -27,7 +27,17 @@ const orders = require('../lib/orders');
 // A SERVER PER TEST, unlike the sibling API files, and the scheduler is why. It
 // dispatches EVERY queued order in the store it can run, so two tests sharing
 // one SKILLSPACE_HOME would have each other's fixtures running under them. Only
-// the route-shape tests share one, because they seed nothing into it.
+// the route-shape tests and the two contention tests share one, because neither
+// pair leaves the other anything to dispatch.
+//
+// EACH TEST STOPS ITS OWN SERVER when it is done, rather than leaving them all
+// to after(). Left running, eight servers - each polling its store on a timer,
+// each holding a git worktree or two - stay alive for the whole file, and
+// `node --test` runs files in parallel. That sustained load is not free to the
+// rest of the suite: test/runner.test.js asserts wall-clock budgets (a ~2s
+// stdio grace against a 4s bound, a 5s liveness precondition), and it was those
+// budgets that went over when two full suites ran at once. after() still stops
+// everything, so a FAILING test cannot leak one.
 
 const created = [];
 const children = [];
@@ -263,6 +273,12 @@ function holdActiveRequest(port) {
 }
 
 let base, storeRoot;
+// A second shared server, at the SHIPPED cadence and with the loop on, for the
+// two tests that measure a human and the loop contending for the same order.
+// Shared because they run in order and each waits for its own order to settle,
+// and because a server per test is what this file's process load is already
+// made of.
+let schedBase, schedHome, schedProject;
 
 const REPO_EXPERTS = path.join(__dirname, '..', 'experts.json');
 let expertsBefore;
@@ -277,6 +293,21 @@ before(async () => {
   // other through it.
   const s = await startServer(storeRoot, { SKILLSPACE_SCHEDULER_INTERVAL_MS: '200' });
   base = s.base;
+
+  schedHome = tmp('sched-racehome-');
+  const r = await startServer(schedHome, {
+    // EMPTIED, not omitted. childEnvFor spreads process.env, so a developer who
+    // exported SKILLSPACE_SCHEDULER_INTERVAL_MS while debugging would otherwise
+    // hand this server a cadence that is not the shipped one - and the two
+    // tests below would then measure a race the product does not have. An empty
+    // string is Number('') === 0, which lib/scheduler reads as unconfigured and
+    // answers with its own default. The assertion on intervalMs is what makes
+    // that structural rather than hopeful.
+    SKILLSPACE_SCHEDULER_INTERVAL_MS: '',
+    SKILLSPACE_MAX_RUNS: '8',
+  });
+  schedBase = r.base;
+  schedProject = await makeGitProject(schedBase);
 });
 
 after(async () => {
@@ -535,6 +566,7 @@ test('a goal posted over HTTP runs to completion with nobody dispatching', async
       return st.started >= 2 ? st : false;
     }, 15000);
   assert.strictEqual(counted.errors, 0, `the scheduler logged errors: ${counted.lastError}`);
+  await stopServer(s.child);
 });
 
 // ------------------------------------------------------------------ ordering
@@ -584,6 +616,7 @@ test('the scheduler starts only after the boot reconciles', async () => {
   assert.strictEqual(g.body.goal.status, 'done',
     'the startup sweep ran against unreconciled records, so the goal stalled at planned');
   assert.strictEqual(readGoal(home, goalId).status, 'done');
+  await stopServer(s.child);
 });
 
 test('the scheduler is stopped before agents are reaped at SIGTERM', async () => {
@@ -821,4 +854,153 @@ test('the scheduler runs the agent an order names, and refuses one it cannot res
     assert.strictEqual(st.started, 1, `expected one start, got ${st.started}`);
     assert.strictEqual(st.offered, 1,
       `an unrunnable order was handed to runOrder anyway (offered=${st.offered})`);
+    await stopServer(s.child);
   });
+
+// ------------------------------------------- the switch, and the door it keeps
+
+test('SKILLSPACE_SCHEDULER=0 leaves the loop unstarted and the orders queued', async () => {
+  // THE SWITCH IS THE PREMISE OF TWO OTHER TEST FILES. test/orders-api.test.js
+  // and test/goals-api.test.js both set it, because both test the human
+  // dispatch door and a loop running underneath them would be racing their
+  // fixtures. Until this test existed, `if (process.env.SKILLSPACE_SCHEDULER
+  // === '0')` could be replaced with `if (false)` - the switch ignored, the
+  // scheduler always started - and all three files still passed: 27/27, 37/37
+  // and 8/8. The protection those two rigs claim was unverified.
+  //
+  // It is also a user-facing mode in its own right, and the argument for
+  // turning the loop on by default rests on it: the scheduler makes dispatching
+  // by hand optional rather than removing it, and this is where a user who
+  // wants to read each order before it runs gets that back.
+  //
+  // BOTH HALVES, because the flag readback alone is the weaker one: a build
+  // that reported `running: false` while quietly dispatching would pass it.
+  const home = tmp('sched-offhome-');
+  const s = await startServer(home, {
+    SKILLSPACE_SCHEDULER: '0',
+    // Honoured, the interval is never read. Ignored, this is what makes the
+    // mutant take the order in tens of milliseconds instead of one second.
+    SKILLSPACE_SCHEDULER_INTERVAL_MS: '50',
+  });
+  const project = await makeGitProject(s.base);
+
+  const off = await stats(s.base);
+  assert.strictEqual(off.running, false, 'the switch was ignored and the scheduler started');
+  assert.strictEqual(off.ticks, 0, 'the scheduler ticked with the switch off');
+  assert.strictEqual(off.startedAt, null, 'start() ran with the switch off');
+  assert.strictEqual(off.intervalMs, null, 'a cadence was configured with the switch off');
+
+  // And nothing runs. A queued order on a working project, left alone for
+  // thirty of the mutant's ticks.
+  const id = seedOrder(home, 'queued', { projectId: project.id, prompt: 'must not run itself' });
+  await new Promise((r) => setTimeout(r, 1500));
+  const rec = readOrder(home, id);
+  assert.strictEqual(rec.status, 'queued',
+    `something dispatched an order with the scheduler off: ${JSON.stringify(rec)}`);
+  assert.strictEqual(rec.startedAt, null, 'an agent ran with the scheduler off');
+
+  // The door itself is still open in this mode - that is the whole point of
+  // having one - so the same order dispatches by hand.
+  const d = await json('POST', `/api/orders/${id}/dispatch`, undefined, s.base);
+  assert.strictEqual(d.status, 200, JSON.stringify(d.body));
+  await waitFor('the hand-dispatched order to settle', async () =>
+    readOrder(home, id).status === 'succeeded');
+  await stopServer(s.child);
+});
+
+test('a human can still dispatch by id with the loop running', async () => {
+  // "The door is still open" was prose until this test. Every other test that
+  // touches POST /api/orders/:id/dispatch runs with SKILLSPACE_SCHEDULER=0, so
+  // the route had no coverage at all in the configuration users actually run.
+  //
+  // AT THE SHIPPED CADENCE, asserted rather than configured: no interval is
+  // passed, and intervalMs is checked to be lib/scheduler's own default. A test
+  // that quietly slowed the loop down would be measuring a race that does not
+  // exist in the product.
+  //
+  // WHICH AGENT DISCRIMINATES, which is why this file installs two shims. The
+  // route is asked for `codex`; agentFor reads the record's `agent`, which is
+  // null on a queued order, so the LOOP would run it on AGENTS[0] - `claude`.
+  // The agent on the settled record therefore says who dispatched it, with no
+  // need to prove a negative about the route.
+  //
+  // DETERMINISM COMES FROM TICK PHASE, not from hoping. The window between
+  // writing the record and the route's synchronous claim is a few milliseconds;
+  // the tick period is a thousand. Syncing to just after a tick leaves ~970ms
+  // of margin rather than an unknown slice of one. Measured without the sync:
+  // the route won 60 of 60 anyway, which is a 0.3% flake left on the table for
+  // no reason.
+  const cadenced = await stats(schedBase);
+  assert.strictEqual(cadenced.intervalMs, 1000,
+    'this server is not running at the shipped cadence, so the race it measures is not the real one');
+  assert.strictEqual(cadenced.running, true, 'the loop is not running, so the door is not being contested');
+
+  const before = await waitFor('a tick, so the next one is a full period away', async () => {
+    const now = await stats(schedBase);
+    return now.ticks > cadenced.ticks ? now : false;
+  }, 10000);
+
+  const id = seedOrder(schedHome, 'queued',
+    { projectId: schedProject.id, prompt: 'dispatched by a human' });
+  const d = await json('POST', `/api/orders/${id}/dispatch`, { agent: 'codex' }, schedBase);
+  assert.strictEqual(d.status, 200,
+    `the route refused a queued order with the loop running: ${JSON.stringify(d.body)}`);
+
+  const rec = await waitFor('the hand-dispatched order to settle', async () => {
+    const r = readOrder(schedHome, id);
+    return r.status === 'succeeded' ? r : false;
+  }, 30000);
+  assert.strictEqual(rec.agent, 'codex',
+    'the loop ran the order instead of the route, so the agent the request named was ignored');
+  assert.strictEqual(rec.exitCode, 0);
+
+  // And the loop did not also run it. `started` counts only the loop's starts,
+  // so an unchanged counter is the second half of the same claim.
+  const after = await stats(schedBase);
+  assert.strictEqual(after.started, before.started,
+    'the scheduler started an order the route had already claimed');
+});
+
+test('an order left queued is taken by the loop, and dispatch by id then refuses', async () => {
+  // THE OTHER HALF OF THE SAME RACE, and it is a product finding rather than a
+  // test that needed tuning. The test above wins because it dispatches within
+  // milliseconds of the record appearing. An order that has been SITTING queued
+  // - which is what every order a PM plans actually is - has been claimed by
+  // the loop within one tick, and by the time a human clicks anything the route
+  // can only refuse.
+  //
+  // Measured at the shipped 1000ms cadence, seeding and then waiting out one
+  // tick: 25 of 25 came back 409 "order is already succeeded", every one having
+  // run on AGENTS[0]. Not 0 of 25, not sometimes - the loop wins that one
+  // outright.
+  //
+  // WHAT IS AND IS NOT LOST. The order runs, exactly once, and the route
+  // refuses rather than putting a second agent on a record another dispatch
+  // owns - which is the invariant runOrder is built around and the only thing
+  // here that would be a bug. What IS unreachable is the route's `agent`
+  // OVERRIDE for a pre-existing queued order: with the loop on, choosing the
+  // agent for a planned order means winning a race a human cannot see. Worth
+  // knowing before the console grows a button for it; recorded here rather than
+  // asserted away.
+  const id = seedOrder(schedHome, 'queued',
+    { projectId: schedProject.id, prompt: 'left for the loop' });
+
+  const ran = await waitFor('the loop to run the order nobody dispatched', async () => {
+    const r = readOrder(schedHome, id);
+    return r.status === 'succeeded' ? r : false;
+  }, 30000);
+  assert.strictEqual(ran.agent, 'claude',
+    'the loop did not run it on AGENTS[0], so agentFor is reading something it should not');
+
+  const d = await json('POST', `/api/orders/${id}/dispatch`, { agent: 'codex' }, schedBase);
+  assert.strictEqual(d.status, 409,
+    `the route accepted an order the loop had already run: ${JSON.stringify(d.body)}`);
+  assert.match(d.body.error, /already (being dispatched|running|succeeded)/);
+
+  // Exactly once, and on the agent that actually ran it. A second dispatch that
+  // had gone through would have overwritten this.
+  const after = readOrder(schedHome, id);
+  assert.strictEqual(after.status, 'succeeded');
+  assert.strictEqual(after.agent, 'claude');
+  assert.strictEqual(after.exitCode, 0);
+});

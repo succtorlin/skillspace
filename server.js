@@ -1175,30 +1175,14 @@ try {
   console.warn('[server] could not reconcile goals:', e.message);
 }
 
-// AFTER BOTH RECONCILES ABOVE, and that ordering is load-bearing rather than
-// stylistic - but for ONE reason, not the two it is tempting to claim.
-//
-// start() runs a tick SYNCHRONOUSLY rather than waiting out the first interval,
-// so that tick is the startup sweep lib/goals asks for, and it happens before
-// this process ever accepts a request.
-//
-// THE REASON IS THE GOAL SWEEP. reconcileGoals derives "is anything in flight"
-// SOLELY from dispatch.isClaimed, never from a record reading `running` - so a
-// stale `running` order left by a killed process is claimed by nobody and
-// counts as neither settled nor in flight. Its goal is written back to
-// `planned`, and with nothing left to settle those orders it stalls there.
-// orders.reconcile() above is what turns them into `interrupted` first, which
-// the sweep can then read as settled and finish the goal.
-//
-// NOT the dispatch pass, and the plan this was built from said otherwise. A
-// tick running before the reconciles does not "dispatch against unreconciled
-// state": dispatchPass filters on `status === 'queued'`, so a record still
-// reading `running` is never a candidate at all, and a goal reading `running`
-// rather than the `planned` reconcile will demote it to is not settled and not
-// `planning` either way - the same orders are dispatched on both sides of the
-// swap. Pinned as the sweep's problem alone by 'the scheduler starts only after
-// the boot reconciles', which fixes the cadence at 30s so the first tick's
-// answer is the only one there is.
+// AFTER BOTH RECONCILES ABOVE. start() runs its first tick SYNCHRONOUSLY, and
+// that tick is the startup sweep - so it must not run until orders.reconcile()
+// has turned a killed process's `running` orders into `interrupted`, or the
+// sweep reads them as neither settled nor in flight and stalls their goal at
+// `planned`. The full reasoning, including which half of it is NOT true, is the
+// ordering entry in lib/scheduler.js's Known limits: it belongs with the module
+// that imposes the requirement rather than in a second copy here that can drift
+// from it. Pinned by 'the scheduler starts only after the boot reconciles'.
 //
 // The two callbacks are REQUIRED by start() and deliberately not defaulted,
 // and both defaults would be this file's to supply:
@@ -1270,31 +1254,18 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     if (shuttingDown) process.exit(130);   // a second ^C means "now"
     shuttingDown = true;
-    // BEFORE cancelAll(), and this is the ordering lib/scheduler's Known limits
-    // spell out. The drain below is not unref'd, so the loop stays alive while
-    // it waits - and the scheduler's timer, unref'd or not, keeps firing inside
-    // it. A tick landing there sees the orders just cancelled as settled, picks
-    // the next queued ones, and spawns FRESH credentialed agents after
-    // "cancelling N running agent(s)" has already printed. inFlightCount()
-    // climbs instead of falling, the drain never reaches zero, and the 6s hatch
-    // exits inside runOrder's await with those new worktrees still on disk.
+    // FIRST, because the drain below is not unref'd and the scheduler's timer
+    // keeps firing inside it: a tick landing there sees the just-cancelled
+    // orders as settled, takes the next queued ones, and spawns fresh
+    // credentialed agents after "cancelling N running agent(s)" has printed.
     //
-    // WHAT THIS LINE'S POSITION DOES AND DOES NOT BUY, stated precisely because
-    // the obvious reading over-claims and a mutation sweep measured the real
-    // boundary. cancelAll(), reapRunning() and plan.cancelAll() are all
-    // synchronous, so moving this call to the line BELOW them is
-    // indistinguishable - no tick can interleave between two statements - and
-    // that swap survives the sweep. Deferring it by a single timer turn
-    // survives too, for a different reason: the order being cancelled still
-    // holds its slot until runOrder's `finally`, which is after
-    // worktrees.cleanup, so every tick inside that window is refused by the
-    // ceiling anyway.
-    //
-    // What actually matters is that stop() happens before that slot is
-    // RELEASED, which is hundreds of milliseconds later and is where the free
-    // capacity a tick needs appears. Deleting the call is killed; so is
-    // deferring it by a second. Being first here is how there is no place left
-    // to put the await that would get there.
+    // Being FIRST rather than second is not itself what matters - the three
+    // reap calls below are synchronous, so no tick can interleave between them,
+    // and swapping the lines is an equivalent mutant. What matters is that
+    // stop() is called at all, and before anything that yields past the point
+    // where the cancelled order releases its slot. lib/scheduler.js's ordering
+    // entry carries the measurements; being first is simply how there is no
+    // place left to put the await that would get there.
     //
     // It does not cancel anything already in flight. It stops picking new work;
     // cancelAll() on the next line is what reaps what is running.
@@ -1314,14 +1285,32 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     // it left the order reading `running` for reconcile to guess at. That
     // measurement is the motivation; the ordering above is the guarantee, and
     // only the end state - the order reads `cancelled` - is pinned by a test.
-    // KNOWN LIMIT: server.close() does not close a client's idle keep-alive
-    // socket, so after an /api/run stream ends `closed` still lags by the
-    // keep-alive timeout - measured at ~4s from SIGTERM to exit with one SSE
-    // client attached, against ~270ms for an order. The agent is dead well
-    // before that (the reap above is synchronous), so this is exit latency
-    // rather than an escaped agent. closeIdleConnections() would cut it; left
-    // alone because it changes shutdown for every route at once and this
-    // follow-up is about the orphan.
+    // KNOWN LIMIT, CORRECTED ON NODE 24: this entry used to say "server.close()
+    // does not close a client's idle keep-alive socket", and on this runtime it
+    // does. Minimal repro, both against a bare http.Server: with one IDLE
+    // keep-alive connection held, the close() callback fires in 1ms; with one
+    // connection whose REQUEST IS STILL IN FLIGHT - headers sent, body short of
+    // its Content-Length, or a response never ended - it does not fire at all
+    // within 1500ms.
+    //
+    // So what holds `closed` false is an unfinished exchange, not an idle
+    // socket. For /api/run that is a stream still open: the reap above kills the
+    // child, the 'close' handler calls res.end(), and only then does the
+    // connection become idle and get dropped. The ~4s figure this note used to
+    // quote was measured with an SSE client attached and is not re-measured
+    // here; whatever its size now, its cause is the live response and not the
+    // keep-alive timeout.
+    //
+    // That also retires the remedy this note used to name:
+    // closeIdleConnections() would not have cut it, because the connection in
+    // question is not idle. closeAllConnections() is the one that would, and it
+    // would destroy a stream mid-write. Still left alone - the agent is dead
+    // well before this either way (the reap above is synchronous), so it is
+    // exit latency and not an escaped agent.
+    //
+    // test/scheduler-api.test.js depends on the in-flight half deliberately: it
+    // holds the shutdown drain open with an unfinished request, because that is
+    // the only thing that still does.
     let closed = false;
     server.close(() => { closed = true; });
     const drain = setInterval(() => {

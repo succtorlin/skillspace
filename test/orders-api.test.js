@@ -170,6 +170,16 @@ async function startServer(home, extraEnv) {
   assert.ok(cfg.agents.every((id) => id === 'claude'),
     `test rig did not isolate the agent: ${JSON.stringify(cfg.agents)}`);
 
+  // AND THE SCHEDULER IS OFF, checked for EVERY server this file starts rather
+  // than trusted to the env var arriving. This whole file's fixtures are queued
+  // orders it expects to STAY queued, so a loop running underneath would be
+  // racing them - and it would fail open, silently, exactly the way a rig that
+  // lost its agent isolation would. childEnvFor explains why the switch is set;
+  // this is what makes it true.
+  const sched = await (await fetch(`http://127.0.0.1:${port}/api/scheduler`)).json();
+  assert.strictEqual(sched.scheduler.running, false,
+    'the test rig did not disable the scheduler, so every queued fixture below is racing it');
+
   return { child: proc, port, base: `http://127.0.0.1:${port}`, stdout: () => out };
 }
 
