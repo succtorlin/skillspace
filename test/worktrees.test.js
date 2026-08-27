@@ -434,9 +434,12 @@ test('concurrent prepares on one repo do not race git', async () => {
   //
   // HONEST LIMIT OF THIS TEST: one run is one trial, and a trial catches the
   // unmutexed bug ~6% of the time: run 100 times with the mutex removed it
-  // failed 6 times, and 0/100 with it. Nor is that rate improvable -
-  // 5/50 trials at N=8, 2/20 at N=16, 3/20 at N=32, 2/12 at N=64 - so it
-  // PLATEAUS and raising N does not buy a reliable test, it only buys runtime.
+  // failed 6 times, and 0/100 with it. Raising N does not rescue that: the
+  // rate does climb with N (8/80 at N=8, 3/30 at N=16, 13/50 at N=32) but only
+  // to ~26% at roughly 4x the runtime, which is still nowhere near a gate.
+  // Batch-to-batch spread at one N is wide - 40% then 17% at N=32 - so none of
+  // these figures is precise enough to plan against, and an earlier version of
+  // this comment wrongly called them a plateau.
   // Deliberate CPU load did not move it either (2/20 at N=8), and staggering
   // the starts CLOSED the window entirely (0/20 at 5/15/40ms): the race needs
   // simultaneous cold starts. N=8 is therefore the cheapest N that reproduces,
