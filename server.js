@@ -21,9 +21,15 @@ const plan = require('./lib/plan');
 // -pid is NaN, process.kill throws, and the fallback child.kill() reaches a
 // libuv handle whose pid is 0 - which signals OUR OWN process group.
 const runner = require('./lib/runner');
+// The poll loop that dispatches a goal's orders without a human clicking each
+// one. Required here for start()/stop() only - the status route lives in
+// routes/scheduler.js, and everything the loop itself needs it takes as
+// arguments rather than reaching back into this file.
+const scheduler = require('./lib/scheduler');
 const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
 const makeGoalRoutes = require('./routes/goals');
+const makeSchedulerRoutes = require('./routes/scheduler');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -697,7 +703,10 @@ function readBody(req) {
 // needs the same predicate to screen the ids inside a goal's orderIds, and
 // three copies of "what an id may look like" is how one of them ends up
 // accepting a separator. The reason it exists is recorded there.
-const { isPlainId } = require('./routes/common');
+// resolveAgent comes from here for the same reason: agentFor below is a fourth
+// caller of "which agent did this ask for", and the three that already exist
+// agree only because they share this one implementation.
+const { isPlainId, resolveAgent } = require('./routes/common');
 
 // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
 // still carrying a separator into the store. A malformed escape like %ZZ is
@@ -850,6 +859,9 @@ const routeDeps = {
 const projectRoutes = makeProjectRoutes(routeDeps);
 const orderRoutes = makeOrderRoutes(routeDeps);
 const goalRoutes = makeGoalRoutes(routeDeps);
+// Takes the same deps object as the other three and uses one key of it. See
+// routes/scheduler.js for why the list is that short.
+const schedulerRoutes = makeSchedulerRoutes(routeDeps);
 
 async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
@@ -860,7 +872,7 @@ async function route(req, res, u, p) {
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
-  // Each module answers or declines; none of the three overlaps any path below
+  // Each module answers or declines; none of the four overlaps any path below
   // or each other, so the order they are tried in and their position here are
   // free. Their constants
   // were bound once at construction (see routeDeps); only the four per-request
@@ -869,6 +881,7 @@ async function route(req, res, u, p) {
   if (await projectRoutes(rq)) return;
   if (await orderRoutes(rq)) return;
   if (await goalRoutes(rq)) return;
+  if (await schedulerRoutes(rq)) return;
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
@@ -1162,6 +1175,91 @@ try {
   console.warn('[server] could not reconcile goals:', e.message);
 }
 
+// AFTER BOTH RECONCILES ABOVE, and that ordering is load-bearing rather than
+// stylistic - but for ONE reason, not the two it is tempting to claim.
+//
+// start() runs a tick SYNCHRONOUSLY rather than waiting out the first interval,
+// so that tick is the startup sweep lib/goals asks for, and it happens before
+// this process ever accepts a request.
+//
+// THE REASON IS THE GOAL SWEEP. reconcileGoals derives "is anything in flight"
+// SOLELY from dispatch.isClaimed, never from a record reading `running` - so a
+// stale `running` order left by a killed process is claimed by nobody and
+// counts as neither settled nor in flight. Its goal is written back to
+// `planned`, and with nothing left to settle those orders it stalls there.
+// orders.reconcile() above is what turns them into `interrupted` first, which
+// the sweep can then read as settled and finish the goal.
+//
+// NOT the dispatch pass, and the plan this was built from said otherwise. A
+// tick running before the reconciles does not "dispatch against unreconciled
+// state": dispatchPass filters on `status === 'queued'`, so a record still
+// reading `running` is never a candidate at all, and a goal reading `running`
+// rather than the `planned` reconcile will demote it to is not settled and not
+// `planning` either way - the same orders are dispatched on both sides of the
+// swap. Pinned as the sweep's problem alone by 'the scheduler starts only after
+// the boot reconciles', which fixes the cadence at 30s so the first tick's
+// answer is the only one there is.
+//
+// The two callbacks are REQUIRED by start() and deliberately not defaulted,
+// and both defaults would be this file's to supply:
+//
+//   childEnv  the credential allowlist. Its only plausible default is
+//             process.env, which is every AWS, GitHub and npm token on the
+//             machine handed to an agent that needs its own provider key -
+//             the exact leak the allowlist exists to prevent. lib/dispatch
+//             refuses per order and lib/plan per goal; this refuses at boot.
+//   agentFor  which agent runs an order. Picking one would run a human's
+//             prompt through a tool they did not choose.
+//
+// A throw from start() is therefore NOT caught the way the two reconciles above
+// are. Both are configuration faults in this file, and a console that booted
+// happily with no scheduler would look identical to a working one right up
+// until nothing ever ran.
+//
+// SKILLSPACE_SCHEDULER=0 LEAVES IT UNSTARTED, and this is a real product mode
+// rather than a test hook: plan 2b shipped approving one planned order at a
+// time through POST /api/orders/:id/dispatch, and that door is still open - the
+// scheduler is what makes it optional, not what removes it. A user who wants to
+// read each order before it runs turns the loop off and keeps the door.
+//
+// Compared as an EXACT STRING, matching SKILLSPACE_ENV_PASSTHROUGH above rather
+// than inventing a second truthiness convention in one file. Any other value -
+// including 'false' or 'off' - leaves the scheduler ON, which is the direction
+// that fails toward the documented default rather than silently disabling the
+// feature; GET /api/scheduler reports `running`, so which way it actually went
+// is observable rather than guessed.
+const schedulerIntervalMs = Number(process.env.SKILLSPACE_SCHEDULER_INTERVAL_MS) || 0;
+if (process.env.SKILLSPACE_SCHEDULER === '0') {
+  console.log('  scheduler: off (SKILLSPACE_SCHEDULER=0) — orders wait to be dispatched by hand');
+} else {
+  scheduler.start(SKILLSPACE_HOME, {
+    // 0 here is "unconfigured": lib/scheduler treats anything below its floor as
+    // absent and takes its own default rather than honouring a cadence nobody
+    // chose. Passing the raw value through keeps that decision in one place.
+    intervalMs: schedulerIntervalMs,
+    childEnv,
+    // WHICH AGENT AN ORDER GETS, resolved through the same function both
+    // agent-spawning routes use, with the order record standing in for the
+    // request body - the field is `agent` on both. That is not a coincidence
+    // worth exploiting cheaply: it is the only way this stays in step with the
+    // routes, and routes/common.js records what a hand-copy of this rule costs.
+    // Specifically inherited: {"agent": 5} is REFUSED rather than read as absent
+    // and silently handed AGENTS[0]. An order record is a file on disk a human
+    // can edit, so that shape is reachable here too.
+    //
+    // Returns undefined when there is no answer - no agent installed, or a name
+    // that is not one - which is lib/scheduler's documented "not now". It leaves
+    // the order `queued` for a later tick instead of settling it `failed`, which
+    // is what runOrder would do with an absent agent and what would burn a whole
+    // backlog the first time an agent binary went missing.
+    //
+    // It does not throw, and that is the point of routing through resolveAgent
+    // rather than indexing AGENTS here: a throwing agentFor costs a warnOnce and
+    // a skipped candidate on every tick, forever.
+    agentFor: (order) => resolveAgent(AGENTS, order).agent,
+  });
+}
+
 // The timeout that bounds a stuck agent is a setTimeout inside THIS process,
 // and agents run detached so they never see the signal sent to our group.
 // Without this, killing the console leaves credentialed agents running with no
@@ -1172,6 +1270,35 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     if (shuttingDown) process.exit(130);   // a second ^C means "now"
     shuttingDown = true;
+    // BEFORE cancelAll(), and this is the ordering lib/scheduler's Known limits
+    // spell out. The drain below is not unref'd, so the loop stays alive while
+    // it waits - and the scheduler's timer, unref'd or not, keeps firing inside
+    // it. A tick landing there sees the orders just cancelled as settled, picks
+    // the next queued ones, and spawns FRESH credentialed agents after
+    // "cancelling N running agent(s)" has already printed. inFlightCount()
+    // climbs instead of falling, the drain never reaches zero, and the 6s hatch
+    // exits inside runOrder's await with those new worktrees still on disk.
+    //
+    // WHAT THIS LINE'S POSITION DOES AND DOES NOT BUY, stated precisely because
+    // the obvious reading over-claims and a mutation sweep measured the real
+    // boundary. cancelAll(), reapRunning() and plan.cancelAll() are all
+    // synchronous, so moving this call to the line BELOW them is
+    // indistinguishable - no tick can interleave between two statements - and
+    // that swap survives the sweep. Deferring it by a single timer turn
+    // survives too, for a different reason: the order being cancelled still
+    // holds its slot until runOrder's `finally`, which is after
+    // worktrees.cleanup, so every tick inside that window is refused by the
+    // ceiling anyway.
+    //
+    // What actually matters is that stop() happens before that slot is
+    // RELEASED, which is hundreds of milliseconds later and is where the free
+    // capacity a tick needs appears. Deleting the call is killed; so is
+    // deferring it by a second. Being first here is how there is no place left
+    // to put the await that would get there.
+    //
+    // It does not cancel anything already in flight. It stops picking new work;
+    // cancelAll() on the next line is what reaps what is running.
+    scheduler.stop();
     const n = dispatch.cancelAll() + reapRunning('SIGTERM') + plan.cancelAll();
     if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
     // Exit once the socket is closed AND every cancelled order has recorded

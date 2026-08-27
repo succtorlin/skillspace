@@ -84,6 +84,18 @@ function childEnvFor(home) {
     // without this the suite rewrites the developer's own experts.json - the
     // last path by which running the tests damaged their install.
     SKILLSPACE_EXPERTS_FILE: path.join(home, 'experts.json'),
+    // THE SCHEDULER OFF, for every server this file starts. This file tests the
+    // HUMAN door - create, dispatch by id, cancel, refuse - and almost every
+    // test here seeds a `queued` order on a real project and then asserts it is
+    // still queued. A poll loop dispatching them is not a flake to be waited
+    // out, it is the loop doing its job, and the assertions would be racing it
+    // rather than testing anything. Demonstrated rather than assumed: with
+    // SKILLSPACE_SCHEDULER_INTERVAL_MS=15 this file fails on the navigation
+    // guard's own order coming back `running`.
+    //
+    // The wired scheduler is covered by test/scheduler-api.test.js, which is
+    // where the loop is the thing under test.
+    SKILLSPACE_SCHEDULER: '0',
   };
 }
 

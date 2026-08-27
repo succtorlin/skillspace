@@ -117,6 +117,20 @@ function childEnvFor(home) {
     // EXPERTS_FILE is rooted at __dirname and ignores SKILLSPACE_HOME, so
     // without this the suite rewrites the developer's own experts.json.
     SKILLSPACE_EXPERTS_FILE: path.join(home, 'experts.json'),
+    // THE SCHEDULER OFF, for every server this file starts. What this file
+    // pins about a PLANNED goal is that a human approves its orders ONE AT A
+    // TIME - 'a planned order can actually be dispatched, and only the one
+    // asked for' asserts the second order is still `queued` after the first has
+    // run. That guarantee is only meaningful with nothing else dispatching, and
+    // it is exactly the guarantee the scheduler exists to make optional. Not a
+    // flake to be waited out: a loop that ran the second order would be doing
+    // its job, and the assertion would be racing it rather than testing
+    // anything. It failed for that reason the first time the scheduler was
+    // wired in.
+    //
+    // The wired scheduler is covered by test/scheduler-api.test.js, which is
+    // where the loop is the thing under test.
+    SKILLSPACE_SCHEDULER: '0',
   };
 }
 
