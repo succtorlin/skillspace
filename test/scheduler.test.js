@@ -1386,3 +1386,198 @@ test('one order that starts clears a run of failures to start', async () => {
     await drain();
   }
 });
+
+test('an agent binary that will not spawn pauses the project instead of draining it', async () => {
+  // THE FIFTH INSTANCE, and the shape this suite never sampled: every other
+  // fixture builds its agent with shimAgent(), which writes a real file and
+  // chmods it. "Valid agent object, unspawnable binary" - a renamed binary, an
+  // `npm i -g` window, a PATH change, an uninstall - was never put in front of
+  // the loop, in either direction.
+  //
+  // It defeated the brake built for a failing prepare, because the fault
+  // arrives one line LATER than the field that detects it: dispatch wrote
+  // markRunning above the spawn, so the order settled `failed` WITH a
+  // startedAt, which this module reads as "an agent existed". Every failure
+  // therefore counted as a successful start and CLEARED the project's failure
+  // count. Measured before the fix: twelve orders drained in two seconds,
+  // pausedProjects 0, and the goal reading `done`.
+  //
+  // Mutant: lib/dispatch calls markFinished for a spawn that never happened.
+  // Mutant: lib/runner stops reporting whether a process existed.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 1 });
+  const { goal, made } = plannedGoal(root, project, ['a', 'b', 'c', 'd', 'e']);
+  // A VALID agent object in every respect except that the binary is not there.
+  // Nothing about this is refused by the no-agent gate - it is an object with
+  // an id, a bin and buildArgs - so it reaches the spawn, which is the point.
+  const ghost = {
+    id: 'ghost',
+    bin: path.join(tmpDir('skillspace-ghost-'), 'uninstalled-agent'),
+    buildArgs: (p) => ['-p', p],
+  };
+  assert.ok(!fs.existsSync(ghost.bin));
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => ghost });
+    await waitFor('the project to be paused', () => scheduler.stats().pausedProjects === 1);
+    await ticksPass(10, 15);
+
+    const failed = made.filter((o) => orders.get(root, o.id).status === 'failed');
+    assert.strictEqual(failed.length, 3,
+      `${failed.length} orders were burned by a binary that never ran`);
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 2,
+      'the rest of the backlog was not left recoverable');
+
+    // The classification, which is what actually broke.
+    assert.strictEqual(scheduler.stats().failedToStart, 3);
+    assert.strictEqual(scheduler.stats().started, 0,
+      'a spawn that never happened was counted as a start');
+
+    for (const o of failed) {
+      const rec = orders.get(root, o.id);
+      assert.strictEqual(rec.startedAt, null,
+        'the record claims an agent ran; lib/orders says a non-null startedAt means exactly that');
+      assert.match(rec.error, /uninstalled-agent/, 'the failure does not name the binary');
+    }
+    // And the goal must not claim the work is done over five orders, three of
+    // which never ran and two of which never started.
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned');
+  } finally {
+    await drain();
+  }
+});
+
+test('stats() shows agents that are alive, not only ones that have finished', async () => {
+  // Mutant: the inFlight gauge removed, or not maintained in the finally.
+  //
+  // `started` is incremented when runOrder RESOLVES - after worktrees.cleanup -
+  // so it reads 0 for the entire life of every agent. At the default 15-minute
+  // orderTimeoutMs a panel can show offered:4 started:0 with four agents
+  // running. routes/scheduler.js renamed `dispatched` to `offered` precisely so
+  // a panel would stop labelling attempts as starts; this is the same lie in
+  // the other direction, and the rest of this suite never sees it because the
+  // counter tests all wait for inFlightCount() === 0 first - the one moment the
+  // field is honest.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  orders.create(root, { projectId: project.id, prompt: 'a long one' });
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => tallyShim(tally, 30),
+    });
+    await waitFor('the agent to record itself', () => pidsIn(tally).length >= 1);
+
+    const s = scheduler.stats();
+    assert.strictEqual(s.inFlight, 1, 'a live agent was invisible in stats()');
+    assert.strictEqual(s.offered, 1);
+    // The lie this exists beside, asserted so the relationship is pinned rather
+    // than described: the agent IS running and `started` still reads zero.
+    assert.strictEqual(s.started, 0);
+    assert.strictEqual(aliveCount(pidsIn(tally)), 1);
+  } finally {
+    await drain();
+  }
+  // And it comes back down, or the gauge is a leak rather than a gauge.
+  assert.strictEqual(scheduler.stats().inFlight, 0);
+});
+
+test('a scheduler deliberately doing nothing says so', async () => {
+  // Mutant: blocked() never called on the daily-cap path.
+  //
+  // Twelve queued orders against a reached cap produced running:true and every
+  // counter at zero, with nothing in the log - warnOnce covers unreadable
+  // records, not caps - so a correctly-idle scheduler was indistinguishable
+  // from a broken one. The two skips that are PERMANENT, the daily cap and the
+  // per-goal budget, were the two with no observable at all.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, {
+    path: tmpGitRepo(),
+    budget: { maxOrdersPerDay: 1 },
+  });
+  const made = ['a', 'b', 'c'].map((p) => orders.create(root, { projectId: project.id, prompt: p }));
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await ticksPass(4, 15);
+
+    for (const o of made) {
+      assert.strictEqual(orders.get(root, o.id).status, 'queued');
+    }
+    const s = scheduler.stats();
+    assert.strictEqual(s.offered, 0);
+    assert.ok(s.skipped > 0, 'nothing recorded that the loop was passing work over');
+    assert.match(s.lastSkip.reason, /daily/i);
+    assert.ok(made.some((o) => o.id === s.lastSkip.orderId), 'lastSkip names no real order');
+    assert.ok(!Number.isNaN(Date.parse(s.lastSkip.at)), 'lastSkip carries no timestamp');
+  } finally {
+    await drain();
+  }
+});
+
+test('a deferred candidate is not counted as a blocked one', async () => {
+  // The other half, and what keeps `skipped` worth reading: a busy project, a
+  // full ceiling and an order already in flight all resolve themselves within a
+  // tick or two. Counting those would put thousands on the counter during
+  // ordinary healthy operation and bury the two skips that never resolve.
+  //
+  // Mutant: blocked() called on the projectBusy or concurrency path too.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const made = ['a', 'b', 'c'].map((p) => orders.create(root, { projectId: project.id, prompt: p }));
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => tallyShim(tally, 30),
+    });
+    await waitFor('the agent to record itself', () => pidsIn(tally).length >= 1);
+    await ticksPass(8, 15);
+
+    // Two orders passed over on every one of those ticks, all healthy.
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 2);
+    assert.strictEqual(scheduler.stats().skipped, 0,
+      `an unisolated project waiting its turn was reported as blocked work: `
+      + `${JSON.stringify(scheduler.stats().lastSkip)}`);
+    assert.strictEqual(scheduler.stats().lastSkip, null);
+  } finally {
+    await drain();
+  }
+});
+
+test('a goal with a malformed orderIds does not have its orders run', async () => {
+  // Mutant: the Array.isArray guard in the dispatch pass removed.
+  //
+  // A goal's orderIds is stored unvalidated - lib/goals says so - and this loop
+  // reduces over it to bound the goal's spend. Without the guard the reduce
+  // throws, which the per-candidate catch turns into a skip: the order stays
+  // queued and nothing is dispatched, so the two obvious assertions pass on a
+  // loop that is failing on every tick forever. That is the third time this
+  // exact shape has hidden a missing guard here, so this one leads with the
+  // errors assertion rather than adding it as an afterthought.
+  //
+  // The record is written straight through store.js because goals.planned
+  // refuses a non-array - which is also the only way it arises in life, a
+  // hand-edited or half-written file.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const goal = goals.create(root, { projectId: project.id, text: 'bad plan' });
+  const order = orders.create(root, { projectId: project.id, prompt: 'attached to nonsense' });
+  orders.attachToGoal(root, order.id, goal.id, 0);
+  store.writeJson(root, `goals/${goal.id}.json`,
+    { ...goals.get(root, goal.id), status: 'planned', orderIds: 'not-an-array' });
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await ticksPass(4, 15);
+    assert.strictEqual(scheduler.stats().errors, 0,
+      `the tick threw instead of skipping the order: ${scheduler.stats().lastError}`);
+    assert.strictEqual(scheduler.stats().offered, 0,
+      'an order was run for a goal whose plan cannot be read as a list');
+    assert.strictEqual(orders.get(root, order.id).status, 'queued');
+    assert.match(scheduler.stats().lastSkip.reason, /orderIds/);
+  } finally {
+    await drain();
+  }
+});
