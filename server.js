@@ -9,9 +9,11 @@ const path = require('path');
 const os = require('os');
 const { spawn, execSync, execFile } = require('child_process');
 const { URL } = require('url');
-// orders and dispatch are required here for the boot reconciliation and the
-// shutdown path only; the routes that use them live in routes/.
+// orders, goals, dispatch and plan are required here for the boot
+// reconciliations, the agent count and the shutdown path only; the routes that
+// use them live in routes/.
 const orders = require('./lib/orders');
+const goals = require('./lib/goals');
 const dispatch = require('./lib/dispatch');
 const plan = require('./lib/plan');
 // For reap() only. It carries the pid guard this file's own inline version
@@ -21,6 +23,7 @@ const plan = require('./lib/plan');
 const runner = require('./lib/runner');
 const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
+const makeGoalRoutes = require('./routes/goals');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -845,6 +848,7 @@ const routeDeps = {
 };
 const projectRoutes = makeProjectRoutes(routeDeps);
 const orderRoutes = makeOrderRoutes(routeDeps);
+const goalRoutes = makeGoalRoutes(routeDeps);
 
 async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
@@ -862,6 +866,7 @@ async function route(req, res, u, p) {
   const rq = { req, res, u, p };
   if (await projectRoutes(rq)) return;
   if (await orderRoutes(rq)) return;
+  if (await goalRoutes(rq)) return;
 
   if (p === '/api/config') {
     return sendJson(res, 200, {
@@ -1137,6 +1142,17 @@ try {
   if (n) console.log(`  reconciled ${n} interrupted order(s)`);
 } catch (e) {
   console.warn('[server] could not reconcile orders:', e.message);
+}
+
+// And any goal still marked planning lost the PM that was decomposing it. Only
+// `planning` is orphaned by a restart: a `running` goal's orders are reconciled
+// individually above, and nothing here can say whether the goal as a whole
+// finished - so lib/goals deliberately leaves those alone.
+try {
+  const n = goals.reconcile(SKILLSPACE_HOME);
+  if (n) console.log(`  reconciled ${n} interrupted goal(s)`);
+} catch (e) {
+  console.warn('[server] could not reconcile goals:', e.message);
 }
 
 // The timeout that bounds a stuck agent is a setTimeout inside THIS process,
