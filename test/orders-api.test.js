@@ -351,6 +351,34 @@ test('POST /api/orders refuses an unrecognised agent instead of substituting', a
   assert.deepStrictEqual(listed, [], 'a refused agent still created an order');
 });
 
+test('a present but non-string agent is refused, not read as absent', async () => {
+  // `typeof body.agent === 'string' ? body.agent : ''` read {"agent": 5} as
+  // ABSENT and dispatched AGENTS[0] with a 200, while {"agent":"5"} got a 400 -
+  // the same silent substitution this route's refusal exists to prevent, one
+  // type away, and runOrder writes the resolved id onto the record. The rule
+  // now lives in routes/common.js and is shared with the goals route; the
+  // obvious patch (`body.agent || ''`) is only partial, which is why 0 and
+  // false are here.
+  const project = await makeProject();
+  for (const agent of [5, 0, false, true, {}, []]) {
+    const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'x', agent });
+    assert.strictEqual(r.status, 400,
+      `agent ${JSON.stringify(agent)} was accepted with ${r.status}`);
+  }
+  assert.deepStrictEqual((await json('GET', `/api/orders?project=${project.id}`)).body.orders, [],
+    'a refused agent still created an order');
+
+  // null and '' are ABSENT, deliberately - null is how a JSON client
+  // serialises a field it does not have, '' is a cleared form field.
+  for (const agent of [null, '']) {
+    const ok = await json('POST', '/api/orders', {
+      projectId: (await makeProject()).id, prompt: 'x', agent,
+    });
+    assert.strictEqual(ok.status, 200,
+      `agent ${JSON.stringify(agent)} should read as absent: ${JSON.stringify(ok.body)}`);
+  }
+});
+
 test('POST /api/orders defaults the agent when none is named', async () => {
   const project = await makeProject();
   const r = await json('POST', '/api/orders', { projectId: project.id, prompt: 'no agent named' });
@@ -929,4 +957,18 @@ test('a route factory refuses to construct without every dependency it needs', a
   // route needs and it does not must NOT be required of it.
   const { childEnv: _c, AGENTS: _a, ...lean } = full;
   assert.strictEqual(typeof makeProjectRoutes(lean), 'function');
+
+  // The list is now shared with routes/goals.js (routes/common.js), so the two
+  // agent-spawning routes cannot drift apart on what they require. Pinned here
+  // because a shared list silently narrowed would weaken BOTH boot checks at
+  // once, which is worse than the duplication it replaced.
+  const makeGoalRoutes = require('../routes/goals');
+  const { RUN_ROUTE_REQUIRED } = require('../routes/common');
+  assert.deepStrictEqual([...RUN_ROUTE_REQUIRED].sort(), Object.keys(full).sort(),
+    'the shared required list and this fixture have drifted apart');
+  for (const key of Object.keys(full)) {
+    const { [key]: _omitted, ...rest } = full;
+    assert.throws(() => makeGoalRoutes(rest), (e) => e instanceof TypeError && e.message.includes(key),
+      `omitting ${key} constructed the goals route anyway`);
+  }
 });

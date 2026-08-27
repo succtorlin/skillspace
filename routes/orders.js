@@ -3,13 +3,9 @@ const projects = require('../lib/projects');
 const orders = require('../lib/orders');
 const dispatch = require('../lib/dispatch');
 const requireDeps = require('./deps');
-
-// Must stay in step with the destructure below; see the Known limits note.
-const REQUIRED = [
-  'root', 'sendJson', 'readBody', 'OVERSIZE', 'ABORTED',
-  'plainIdFrom', 'isTopLevelNavigation', 'denyNavigation',
-  'AGENTS', 'maxConcurrentRuns', 'childEnv',
-];
+const {
+  RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent,
+} = require('./common');
 
 // The order routes. Same contract as routes/projects.js: a factory taking the
 // server's dependencies once and returning a handler that answers true when it
@@ -36,6 +32,10 @@ const REQUIRED = [
 //   breaking. A Proxy that threw on any undefined read would remove the
 //   duplication and was rejected: it would also forbid a genuinely optional
 //   dependency, which the three modules coming next are likely to want.
+//   NARROWED: the list itself now lives in routes/common.js as
+//   RUN_ROUTE_REQUIRED, shared with routes/goals.js, so it is one place to edit
+//   rather than one per agent-spawning route. It still has to match the
+//   destructure.
 // - `?project=` WITH AN EMPTY VALUE lists every order rather than none. No
 //   consumer today, but the board in plan 3 builds exactly this query and a
 //   cleared filter is the obvious way to produce it.
@@ -65,7 +65,7 @@ const REQUIRED = [
 // the scheduler.
 
 module.exports = (deps) => {
-  requireDeps('routes/orders', deps, REQUIRED);
+  requireDeps('routes/orders', deps, RUN_ROUTE_REQUIRED);
   const {
     root, sendJson, readBody, OVERSIZE, ABORTED,
     plainIdFrom, isTopLevelNavigation, denyNavigation, AGENTS, maxConcurrentRuns,
@@ -107,16 +107,18 @@ module.exports = (deps) => {
       // order record persists `agent` as though it were what the caller asked
       // for. Caller-input faults are checked before the capacity bound below, so
       // a bad id is not masked by a transient 429 the client would retry.
-      const requested = typeof body.agent === 'string' ? body.agent : '';
-      const agent = requested ? AGENTS.find((a) => a.id === requested) : AGENTS[0];
-      if (!agent) {
-        sendJson(res, 400, {
-          error: requested
-            ? `未知的 agent：${requested}（可用：${AGENTS.map((a) => a.id).join(', ') || '无'}）`
-            : '没有检测到可用的 agent',
-        });
+      //
+      // The rule moved to routes/common.js, shared with the goals route, and
+      // gained one case while it moved: a PRESENT BUT NON-STRING agent is now
+      // refused rather than read as absent. {"agent": 5} used to get AGENTS[0]
+      // and a 200 while {"agent":"5"} got a 400 - the same silent substitution
+      // this refusal exists to prevent, one type away.
+      const picked = resolveAgent(AGENTS, body);
+      if (picked.error) {
+        sendJson(res, 400, { error: picked.error });
         return true;
       }
+      const agent = picked.agent;
 
       // An unisolated project runs one order at a time - two agents in one plain
       // directory corrupt each other's edits. dispatch enforces that regardless;
@@ -159,23 +161,11 @@ module.exports = (deps) => {
           acceptance: body.acceptance,
         });
       } catch (e) {
-        // orders.create emits its own caller-fault shapes; anything else is ours.
-        //
-        // Anchored at the START, like routes/projects.js. lib/orders throws
-        // "prompt is too long (100001 > 100000)", so a trailing anchor matched
-        // the alternation and then failed - sending 500 for an input the user
-        // must shorten. Mutation testing cannot catch that: deleting the dead
-        // alternative is behaviourally identical to keeping it, which is why it
-        // took a boundary test.
-        //
-        // Matching on prose is the real weakness here. The intended fix is for
-        // lib/orders to tag its caller faults - e.code = 'EINVAL' - so this
-        // becomes a field check rather than a regex over a message anyone might
-        // reword. Deferred because lib/orders.js is closed; do it when that file
-        // is next opened.
-        const msg = String((e && e.message) || e);
-        const clientFault = /^\w+ (is required|is too long)/.test(msg);
-        sendJson(res, clientFault ? 400 : 500, { error: msg });
+        // orders.create emits its own caller-fault shapes; anything else is
+        // ours. The predicate, its anchoring and the e.code deferral all moved
+        // to routes/common.js, shared with the goals route - the end-anchored
+        // version of this regex is the proof that a hand-copied guard drifts.
+        sendJson(res, clientFault(e) ? 400 : 500, { error: errorMessage(e) });
         return true;
       }
 
@@ -196,8 +186,13 @@ module.exports = (deps) => {
           // "a dispatch that rejects is recorded on the order" in
           // test/orders-api.test.js. Without markFailed the order sits at queued
           // forever and the reason exists only on a console nobody is reading.
-          console.error('[server] order %s failed to dispatch:', order.id, e.message);
-          try { orders.markFailed(root, order.id, `dispatch: ${e.message}`); } catch (_) {}
+          //
+          // errorMessage(), not e.message: a thrown string or a non-Error
+          // rejection has no .message, and reading one off a nullish rejection
+          // throws INSIDE the catch that exists to prevent an unhandled one.
+          const why = errorMessage(e);
+          console.error('[server] order %s failed to dispatch:', order.id, why);
+          try { orders.markFailed(root, order.id, `dispatch: ${why}`); } catch (_) {}
         });
 
       // `queued` is what was ACCEPTED, not what is current: runOrder runs up to

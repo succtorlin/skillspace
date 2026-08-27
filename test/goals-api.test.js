@@ -9,6 +9,7 @@ const net = require('net');
 
 const store = require('../lib/store');
 const goals = require('../lib/goals');
+const orders = require('../lib/orders');
 
 const created = [];
 const children = [];
@@ -83,16 +84,26 @@ JSON
 exit 0
 `;
 
+// TWO shims, not one. With a single agent installed, a route that validates the
+// requested agent and then quietly runs AGENTS[0] passes every test in this
+// file - verified as a surviving mutant - because the two are the same binary.
+// The goal record persists pmAgent, which is the entire reason the refusal
+// exists, so the suite has to be able to tell them apart.
+const RIG_AGENTS = ['claude', 'codex'];
+
 function rigAgent() {
   fakeBin = tmp('skillspace-bin-');           // kept empty: a decoy that must NOT resolve
   fakeHome = tmp('skillspace-fakehome-');
-  // Where Claude Code actually installs, and the only place the shim exists.
+  // Where Claude Code actually installs, and the only place the shims exist.
   const localBin = path.join(fakeHome, '.local', 'bin');
   fs.mkdirSync(localBin, { recursive: true });
-  const shim = path.join(localBin, 'claude');
-  // agent.buildArgs for claude is (p) => ['-p', p], so the prompt is $2.
-  fs.writeFileSync(shim, PM_SHIM);
-  fs.chmodSync(shim, 0o755);
+  for (const id of RIG_AGENTS) {
+    // buildArgs is (p) => ['-p', p] for claude and (p) => ['exec', p] for
+    // codex, so the prompt is $2 either way and one script serves both.
+    const shim = path.join(localBin, id);
+    fs.writeFileSync(shim, PM_SHIM);
+    fs.chmodSync(shim, 0o755);
+  }
 }
 
 function childEnvFor(home) {
@@ -156,7 +167,7 @@ async function startServer(home, extraEnv) {
   // directory. Every agent this server can see must be the shim. (The empty
   // set is legitimate - one test starts a server with no agent installed.)
   const cfg = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
-  assert.ok(cfg.agents.every((id) => id === 'claude'),
+  assert.ok(cfg.agents.every((id) => RIG_AGENTS.includes(id)),
     `test rig did not isolate the agent: ${JSON.stringify(cfg.agents)}`);
 
   return {
@@ -200,7 +211,7 @@ before(async () => {
   // included. Assert the positive case once here too: the shim must actually
   // be FOUND, or every goal would fail to plan and the suite would still pass.
   const cfg = await (await fetch(base + '/api/config')).json();
-  assert.deepStrictEqual(cfg.agents, ['claude'], 'the shim was not detected');
+  assert.deepStrictEqual(cfg.agents, RIG_AGENTS, 'the shims were not detected');
 });
 
 after(async () => {
@@ -221,6 +232,28 @@ const json = async (method, p, body, at) => {
   try { parsed = JSON.parse(text); } catch (_) { parsed = { raw: text }; }
   return { status: r.status, body: parsed };
 };
+
+// A real git repository, so worktrees.prepare does real work - a rev-parse and
+// a `worktree add`, tens of milliseconds. That await is the window the ceiling
+// burst below exists to measure; a dir project does not have one.
+function gitRepoDir() {
+  const d = tmp('skillspace-goalrepo-');
+  execSync('git init -q', { cwd: d });
+  fs.writeFileSync(path.join(d, 'file.txt'), 'original\n');
+  execSync('git add -A', { cwd: d });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m init', { cwd: d });
+  return d;
+}
+
+async function makeGitProject(at) {
+  const r = await json('POST', '/api/projects', { name: 'GoalsGit', path: gitRepoDir() }, at);
+  assert.strictEqual(r.status, 200, 'git project fixture failed: ' + JSON.stringify(r.body));
+  // The positive control for the burst test: kind is DETECTED, and a fixture
+  // that came back `dir` would be testing the shape that cannot fail.
+  assert.strictEqual(r.body.project.kind, 'git',
+    'the fixture is not a git project, so a burst against it proves nothing');
+  return r.body.project;
+}
 
 async function makeProject(extra, at) {
   const dir = tmp('skillspace-goalwork-');
@@ -283,6 +316,19 @@ function seedGoal(root, status, extra) {
     createdAt: new Date().toISOString(),
     finishedAt: null,
     ...(extra || {}),
+  });
+  return id;
+}
+
+// An order that counts toward the day without running an agent. countToday
+// reads the records, so seeding is both faster and steadier than dispatching.
+function seedOrderFor(root, projectId) {
+  const id = orders.newId();
+  store.writeJson(root, `orders/${id}.json`, {
+    id, projectId, goalId: null, seq: null, title: '', prompt: 'seeded',
+    acceptance: '', agent: null, cwd: null, status: 'succeeded', exitCode: 0,
+    verdict: null, error: null, supersedes: null,
+    createdAt: new Date().toISOString(), startedAt: null, finishedAt: null,
   });
   return id;
 }
@@ -483,6 +529,20 @@ test('a malformed or dangling goal record reads as no orders, not a 500', async 
   const d = await json('GET', '/api/goals/' + dangling);
   assert.strictEqual(d.status, 200, JSON.stringify(d.body));
   assert.deepStrictEqual(d.body.orders, [], 'a missing order came back as null');
+
+  // The ELEMENTS, not just the array. lib/goals says orderIds are "stored, not
+  // validated", and store.abs() THROWS on a separator rather than reading -
+  // so an unscreened element reached the server's catch-all and made the goal
+  // permanently unreadable through this route with a bare 500. Array.isArray
+  // does not cover this; every one of these was a 200 except the first, which
+  // was the 500.
+  for (const bad of ['../../../../../../etc/hosts', 'a/b', 5, {}, null, '']) {
+    const g = seedGoal(storeRoot, 'running', { orderIds: [bad] });
+    const got = await json('GET', '/api/goals/' + g);
+    assert.strictEqual(got.status, 200,
+      `orderIds element ${JSON.stringify(bad)} gave ${got.status}: ${JSON.stringify(got.body)}`);
+    assert.deepStrictEqual(got.body.orders, []);
+  }
 });
 
 test('POST /api/goals/:id is not a route this module owns', async () => {
@@ -541,6 +601,78 @@ test('POST /api/goals refuses an unrecognised agent instead of substituting', as
     'a refused agent still created a goal');
 });
 
+test('the agent the caller named is the agent that plans', async () => {
+  // With one shim installed, a route that validates `agent` and then runs
+  // AGENTS[0] anyway is indistinguishable from one that honours it - verified
+  // as a mutant that survived the whole file. The rig installs two, and the
+  // goal record persists pmAgent, which is the fact the refusal exists to
+  // protect.
+  const project = await makeProject();
+  const r = await json('POST', '/api/goals', {
+    projectId: project.id, text: 'plan with the second agent', agent: 'codex',
+  });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  const after = await planned(r.body.goal.id);
+  assert.strictEqual(after.goal.pmAgent, 'codex',
+    'the route validated the named agent and then ran the default');
+  // The control: the default really is the other one, so the assertion above
+  // is not passing because codex happens to be first.
+  const other = await makeProject();
+  const d = await json('POST', '/api/goals', { projectId: other.id, text: 'default agent' });
+  assert.strictEqual((await planned(d.body.goal.id)).goal.pmAgent, 'claude');
+});
+
+test('a present but non-string agent is refused, not read as absent', async () => {
+  // `typeof body.agent === 'string' ? body.agent : ''` reads {"agent": 5} as
+  // ABSENT and hands back AGENTS[0] with a 200, while {"agent":"5"} gets a 400 -
+  // the same silent substitution one type away, and the record then says the
+  // caller asked for something they did not. Found by mutation; the obvious
+  // patch (`body.agent || ''`) is only partial, which is why 0 and false are
+  // here too.
+  const project = await makeProject();
+  for (const agent of [5, 0, false, true, {}, []]) {
+    const r = await json('POST', '/api/goals', { projectId: project.id, text: 'x', agent });
+    assert.strictEqual(r.status, 400,
+      `agent ${JSON.stringify(agent)} was accepted with ${r.status}`);
+  }
+  assert.deepStrictEqual((await json('GET', `/api/goals?project=${project.id}`)).body.goals, [],
+    'a refused agent still created a goal');
+
+  // null and an empty string are ABSENT, deliberately: null is how a JSON
+  // client serialises a field it does not have, and '' is a cleared form field.
+  // Refusing those would break a legitimate request to make a point.
+  for (const agent of [null, '']) {
+    const ok = await makeProject();
+    const r = await json('POST', '/api/goals', { projectId: ok.id, text: 'x', agent });
+    assert.strictEqual(r.status, 200,
+      `agent ${JSON.stringify(agent)} should read as absent: ${JSON.stringify(r.body)}`);
+  }
+});
+
+test("planning is refused once the day's order budget is spent", async () => {
+  // dispatch.runOrder checks maxOrdersPerDay; decompose checked the agent, the
+  // env policy, the per-goal budget and the project claim - never the daily
+  // count. So a project capped at N accepted unlimited goals and ran unlimited
+  // fifteen-minute credentialed agents, none of which could produce a
+  // dispatchable order.
+  const project = await makeProject({ budget: { maxOrdersPerDay: 2 } });
+  assert.strictEqual(project.budget.maxOrdersPerDay, 2, 'the fixture budget was not applied');
+
+  // Under the cap: planning proceeds.
+  const under = await json('POST', '/api/goals', { projectId: project.id, text: 'room left' });
+  assert.strictEqual((await planned(under.body.goal.id)).goal.status, 'running',
+    'planning was refused while the day still had room');
+
+  // That plan created 2 orders, which meets the cap of 2.
+  seedOrderFor(storeRoot, project.id);
+  const over = await json('POST', '/api/goals', { projectId: project.id, text: 'no room' });
+  assert.strictEqual(over.status, 200, JSON.stringify(over.body));
+  const after = await planned(over.body.goal.id);
+  assert.strictEqual(after.goal.status, 'failed');
+  assert.match(after.goal.error, /daily limit reached \(2 orders\)/);
+  assert.deepStrictEqual(after.orders, [], 'a refused plan created orders anyway');
+});
+
 test('POST /api/goals refuses when no agent is installed at all', async () => {
   // Same branch as the unrecognised id, other half: with nothing installed the
   // PM would be spawned as null and lib/plan would spend a goal record to say
@@ -559,6 +691,11 @@ test('POST /api/goals refuses when no agent is installed at all', async () => {
     const project = await makeProject(undefined, s.base);
     const r = await json('POST', '/api/goals', { projectId: project.id, text: 'x' }, s.base);
     assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+    // WHICH 400. The setup pins the branch, so this is not the masking shape -
+    // but without it the message is free to say anything, including something
+    // about the text the caller did supply.
+    assert.match(r.body.error, /没有检测到可用的 agent/,
+      `the refusal must say no agent is installed: ${r.body.error}`);
     assert.deepStrictEqual((await json('GET', '/api/goals', undefined, s.base)).body.goals, []);
   } finally {
     await stopServer(s.child);
@@ -649,6 +786,20 @@ test('a rejection from the planner is reported rather than swallowed', async () 
     }
     assert.match(s.stderr(), new RegExp(`goal ${r.body.goal.id} failed to plan`),
       'the rejection did not name the goal it belonged to');
+
+    // THE HALF THAT MATTERS, and the half asserting the console line alone
+    // missed. goals.planned() used to sit outside every try in lib/plan, so the
+    // throw landed AFTER the orders were created and attached: two `queued`
+    // orders carrying the goalId of a goal that names none of them - the exact
+    // invisible work the rollback exists to prevent, reached from the one path
+    // outside it. It is now inside the same try, so the rollback covers it.
+    const left = (await json('GET', `/api/orders?project=${project.id}`, undefined, s.base)).body.orders;
+    assert.ok(left.length > 0,
+      'the plan created no orders, so this proves nothing about stranding');
+    assert.ok(left.every((o) => o.status === 'cancelled'),
+      `the rejection stranded orders a scheduler could still run: ${left.map((o) => o.status).join(',')}`);
+    assert.ok(left.every((o) => o.goalId === r.body.goal.id),
+      'the stranded-order check was reading orders from another goal');
     // And the server is still serving - an unhandled rejection would have taken
     // it down instead.
     assert.strictEqual((await json('GET', '/api/goals', undefined, s.base)).status, 200,
@@ -718,6 +869,62 @@ test('a PM started over HTTP occupies a slot in the process-wide agent ceiling',
     assert.strictEqual(bad.status, 400,
       `a full ceiling masked a caller fault: ${bad.status} ${JSON.stringify(bad.body)}`);
     assert.match(bad.body.error, /totally-bogus/);
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('a burst of goals on git projects cannot outrun the ceiling', async () => {
+  // THE TEST THAT WOULD HAVE CAUGHT H1. The route's gate is only a bound
+  // because lib/plan claims its slot in the same synchronous run as the check.
+  // Before that fix decompose registered only after `await worktrees.prepare`,
+  // so every POST in a concurrent burst read inFlightCount() as 0 and every one
+  // passed: measured at eight 200s and eight live PMs against a ceiling of one,
+  // where the same burst through /api/orders gave 200,429,429,... and one PM.
+  //
+  // Three clauses, none droppable:
+  //   GIT projects - a dir project's prepare await is a single microtask, and
+  //     dispatch.projectBusy serialises the same directory anyway, so the dir
+  //     burst passes with or without the bug. That is the shape the first
+  //     version of this suite tested, sequentially, and it is why the bug
+  //     survived two reviews.
+  //   CONCURRENT - sequential POSTs never share the window.
+  //   ps - the ceiling is a bound on PROCESSES. Statuses alone would pass
+  //     against a route that answered 429 and spawned anyway.
+  const home = tmp('skillspace-goalburst-');
+  const s = await startServer(home, { SKILLSPACE_MAX_RUNS: '1' });
+  try {
+    const mark = `PM-BURST-${process.pid}-${Date.now()}`;
+    const alive = () => {
+      try { return Number(execSync(`pgrep -f ${mark} | wc -l`).toString().trim()); } catch (_) { return 0; }
+    };
+    const N = 6;
+    const projects = [];
+    for (let i = 0; i < N; i++) projects.push(await makeGitProject(s.base));
+
+    const results = await Promise.all(projects.map((p) => json('POST', '/api/goals', {
+      projectId: p.id, text: `${SLOW_MARK} ${mark}`,
+    }, s.base)));
+    const statuses = results.map((r) => r.status);
+    assert.strictEqual(statuses.filter((x) => x === 200).length, 1,
+      `the ceiling admitted more than one goal: ${statuses.join(',')}`);
+    assert.strictEqual(statuses.filter((x) => x === 429).length, N - 1,
+      `unexpected statuses in the burst: ${statuses.join(',')}`);
+
+    // Positive control before the real assertion: a peak of 1 means nothing if
+    // no PM ever started.
+    await waitFor('the admitted PM to start', async () => alive() > 0);
+    let peak = 0;
+    for (let i = 0; i < 20; i++) {
+      peak = Math.max(peak, alive());
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.strictEqual(peak, 1, `${peak} PMs ran concurrently at a ceiling of 1`);
+
+    // And the refusals left nothing behind for a scheduler to find later.
+    const listed = (await json('GET', '/api/goals', undefined, s.base)).body.goals;
+    assert.strictEqual(listed.length, 1,
+      `a refused goal was recorded anyway: ${listed.length} goals for 1 acceptance`);
   } finally {
     await stopServer(s.child);
   }

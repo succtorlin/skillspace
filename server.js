@@ -693,10 +693,11 @@ function readBody(req) {
     });
   });
 }
-// Ids reach the store as path segments. store.abs() guarantees containment
-// within the store root but NOT within the intended collection, so an id of
-// "../projects" would resolve inside the root and reach another namespace.
-const isPlainId = (s) => /^[A-Za-z0-9_-]+$/.test(s);
+// Taken from routes/common.js rather than defined again here: routes/goals.js
+// needs the same predicate to screen the ids inside a goal's orderIds, and
+// three copies of "what an id may look like" is how one of them ends up
+// accepting a separator. The reason it exists is recorded there.
+const { isPlainId } = require('./routes/common');
 
 // Decode BEFORE validating, or "a%2Fb" would pass the plain-id test while
 // still carrying a separator into the store. A malformed escape like %ZZ is
@@ -859,8 +860,9 @@ async function route(req, res, u, p) {
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
-  // Both modules answer or decline; neither overlaps any path below, so the
-  // order they are tried in and their position here are free. Their constants
+  // Each module answers or declines; none of the three overlaps any path below
+  // or each other, so the order they are tried in and their position here are
+  // free. Their constants
   // were bound once at construction (see routeDeps); only the four per-request
   // values are rebuilt here.
   const rq = { req, res, u, p };

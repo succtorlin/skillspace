@@ -70,6 +70,44 @@ printf ']\\n'
 exit 0
 `;
 
+test('the in-flight count does not drop before the goal is written', async () => {
+  // What server.js's shutdown drain rests on: it exits when agentsRunning()
+  // reaches 0, so a count that drops while the record is still `planning`
+  // lets the process exit over a goal mid-write - the same class as the
+  // orphan-at-SIGTERM bug, reached through the record instead of the process.
+  //
+  // The delete used to live in planWithClaim's inner `finally`, which runs
+  // BEFORE the extraction, the orders.create loop and goals.planned - and the
+  // worktree cleanup inside it awaits `git worktree remove`, so the window is
+  // tens of milliseconds wide on a git project, not a theoretical microtask.
+  // The delete is now decompose's, whose finally really does run last.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'watch the count' });
+
+  // Sample both facts together, as fast as the loop allows, for the whole run.
+  const bad = [];
+  let samples = 0;
+  const probe = setInterval(() => {
+    samples++;
+    const g = goals.get(root, goal.id);
+    if (plan.inFlightCount() === 0 && g && g.status === 'planning') bad.push(g.status);
+  }, 1);
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+  clearInterval(probe);
+
+  // Positive controls, both of them: a run that never sampled, or never
+  // planned, would make the assertion below pass for free.
+  assert.ok(samples > 20, `the probe only sampled ${samples} times`);
+  assert.strictEqual(result.status, 'running', 'the plan did not succeed, so this proves nothing');
+  assert.deepStrictEqual(bad, [],
+    'the in-flight count reached zero while the goal was still being written');
+});
+
 test('a goal is decomposed into persisted orders', async () => {
   const root = tmpDir('skillspace-home-');
   const repo = tmpGitRepo();
