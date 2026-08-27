@@ -427,12 +427,20 @@ test('a tick that throws does not kill the loop', async () => {
 test('per-goal spend is bounded', async () => {
   // Mutant: the withinBudget check removed - all three orders run.
   const root = tmpDir('skillspace-home-');
+  // concurrency 3 on a git project, so all three orders could run at once and
+  // the per-goal cap is the ONLY thing that can stop the second and third.
+  // Without that the project bound does the work and the budget check is never
+  // reached - the shape that hid a stale `spent` until a reviewer narrowed
+  // projectBusy and got "3 orders ran under a per-goal cap of 1".
   const project = projects.create(root, {
     path: tmpGitRepo(),
+    concurrency: 3,
     budget: { maxOrdersPerGoal: 1 },
   });
   assert.strictEqual(project.budget.maxOrdersPerGoal, 1,
     'projects.safeBudget did not keep the cap this test depends on');
+  assert.strictEqual(project.concurrency, 3,
+    'projects.safeConcurrency did not keep the concurrency this test depends on');
   const { goal, made } = plannedGoal(root, project, ['one', 'two', 'three']);
   const agent = shimAgent(OK);
 
@@ -589,8 +597,15 @@ test('a goal goes back to planned when nothing of it is in flight', async () => 
   // moved one state to the right. It is reachable whenever an order settles and
   // the next is blocked, which the capacity predicate here makes deterministic
   // instead of waiting for a real ceiling.
+  // A DIR project, deliberately: it is serialised to one order at a time, so
+  // settling the running one leaves the goal with genuinely nothing in flight.
+  // On a git project this fixture no longer reaches the demotion at all - both
+  // orders start together under project.concurrency, so cancelling one leaves
+  // the other running and the goal correctly stays `running`. That is the shape
+  // that stopped being reachable when the concurrency bound landed.
   const root = tmpDir('skillspace-home-');
-  const project = projects.create(root, { path: tmpGitRepo() });
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  assert.strictEqual(project.kind, 'dir');
   const { goal, made } = plannedGoal(root, project, ['first', 'second']);
   const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
   const agent = tallyShim(tally, 60);
@@ -801,8 +816,12 @@ test('a tick that changes nothing does not rewrite the goal record', async () =>
   //
   // mtimeMs is the observable. store.js writes to a temp file and renames, so a
   // rewrite always moves mtime even when the bytes are identical.
+  // A DIR project so the goal parks in a genuinely stable state: one order
+  // running, one queued behind it, nothing changing tick to tick. A git project
+  // would start both and the second's settlement would move the goal for real,
+  // which measures nothing about no-op writes.
   const root = tmpDir('skillspace-home-');
-  const project = projects.create(root, { path: tmpGitRepo() });
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
   const { goal, made } = plannedGoal(root, project, ['long one', 'the other']);
   const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
   const agent = tallyShim(tally, 60);
@@ -880,6 +899,149 @@ test('an interval below the floor is not honoured literally', async () => {
     // A 1ms interval would give hundreds; the 1000ms default gives none or one.
     assert.ok(elapsed <= 20,
       `${elapsed} ticks in ${WINDOW_MS}ms: a sub-floor interval was taken literally`);
+  } finally {
+    await drain();
+  }
+});
+
+test('a git project runs up to its configured concurrency, and no more', async () => {
+  // The knob lib/dispatch's header says this loop is for, and that the plan
+  // promised in three places while prescribing a Step 3 that could not keep it.
+  //
+  // EQUALITY, not an upper bound, and that is the point: `>= 999` (no bound)
+  // gives four agents and fails, and reverting to the projectBusy question -
+  // which is what this file shipped first - gives ONE and fails too. A `<= 2`
+  // assertion would have passed the serialised version and pinned nothing.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 2 });
+  assert.strictEqual(project.kind, 'git');
+  assert.strictEqual(project.concurrency, 2);
+  const made = ['a', 'b', 'c', 'd'].map((p) =>
+    orders.create(root, { projectId: project.id, prompt: p }));
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = tallyShim(tally, 30);
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    // Both slots filled, then hold still long enough for a third to appear if
+    // the bound were not there. `git worktree add` is serialised per repo, so
+    // the second agent trails the first by a prepare rather than starting with
+    // it - waiting on the pid count is what makes this deterministic.
+    await waitFor('two agents to record themselves', () => pidsIn(tally).length >= 2);
+    await ticksPass(8, 15);
+
+    const alive = aliveCount(pidsIn(tally));
+    assert.strictEqual(alive, 2,
+      `${alive} agents alive on a project configured for 2`);
+    assert.strictEqual(scheduler.stats().dispatched, 2);
+    assert.strictEqual(scheduler.stats().refused, 0);
+    const queued = made.filter((o) => orders.get(root, o.id).status === 'queued').length;
+    assert.strictEqual(queued, 2, 'the other two orders were not left queued');
+  } finally {
+    await drain();
+  }
+});
+
+test('an order naming a project that cannot be read is left queued', async () => {
+  // Mutant: the missing-project guard removed. Reachable without anyone
+  // deleting anything - projects.get() returns null for an id it does not know,
+  // and projects.json is a single file the store can quarantine whole.
+  //
+  // The errors assertion is the half that matters, and the sibling missing-goal
+  // test learned it the hard way: without the guard, `project.id` throws a
+  // TypeError, which ALSO leaves the order queued and dispatches nothing. The
+  // two obvious assertions pass just as happily on a loop that crashes on every
+  // tick forever, so this is what tells a handled skip from a dead scheduler.
+  const root = tmpDir('skillspace-home-');
+  const order = orders.create(root, { projectId: 'proj-never-existed', prompt: 'homeless' });
+  assert.strictEqual(projects.get(root, 'proj-never-existed'), null);
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await ticksPass(4, 15);
+    assert.strictEqual(orders.get(root, order.id).status, 'queued');
+    assert.strictEqual(scheduler.stats().dispatched, 0);
+    assert.strictEqual(scheduler.stats().errors, 0,
+      `the tick threw instead of skipping the order: ${scheduler.stats().lastError}`);
+  } finally {
+    await drain();
+  }
+});
+
+test('a hand-edited concurrency of 0 means one, not unlimited and not none', async () => {
+  // The failure shape the standing questions name outright: `maxOrdersPerGoal:
+  // 0` once read as unlimited. A concurrency of 0 has BOTH ways to be wrong,
+  // and this pins the middle - the mutant that reads 0 as no limit runs two
+  // agents, and the mutant that compares against 0 literally runs none and
+  // wedges the project forever.
+  //
+  // projects.create clamps this on the way in, so the record is written
+  // directly: projects.get returns a stored record verbatim when the detected
+  // kind matches, which is what makes a hand-edited projects.json reachable.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 2 });
+  const listed = store.readJson(root, 'projects.json', []);
+  store.writeJson(root, 'projects.json',
+    listed.map((p) => (p.id === project.id ? { ...p, concurrency: 0 } : p)));
+  const reread = projects.get(root, project.id);
+  assert.strictEqual(reread.concurrency, 0, 'the corrupt value did not survive the read');
+  assert.strictEqual(reread.kind, 'git');
+
+  const made = ['a', 'b'].map((p) => orders.create(root, { projectId: project.id, prompt: p }));
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = tallyShim(tally, 30);
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    await waitFor('an agent to record itself', () => pidsIn(tally).length >= 1);
+    await ticksPass(8, 15);
+    assert.strictEqual(aliveCount(pidsIn(tally)), 1,
+      'a concurrency of 0 was read as no limit at all');
+    assert.strictEqual(scheduler.stats().dispatched, 1);
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 1);
+  } finally {
+    await drain();
+  }
+});
+
+test('a goal whose plan names a vanished order does not overspend its budget', async () => {
+  // Mutant: `spent` ignores an id with no record in the snapshot, and the cap
+  // admits one more order than it should.
+  //
+  // FAIL CLOSED, deliberately. A missing id may be an order that ran and whose
+  // file store.js has since quarantined, so counting it as unspent is a cap
+  // that stops being a cap exactly when the store is damaged. The cost is the
+  // other direction - a goal that stalls short of its cap - which is visible in
+  // the record and is the same direction reconcileGoals takes on a missing
+  // order when it refuses to call such a goal `done`.
+  const root = tmpDir('skillspace-home-');
+  // Cap 1 against a plan of two, one of which has vanished. The arithmetic is
+  // the test: counting the vanished one makes spent 1, so the survivor would be
+  // the second spend and is refused; ignoring it makes spent 0 and the survivor
+  // runs. A cap of 2 leaves room either way and would have pinned nothing -
+  // this fixture failed that way first.
+  const project = projects.create(root, {
+    path: tmpGitRepo(),
+    concurrency: 3,
+    budget: { maxOrdersPerGoal: 1 },
+  });
+  const goal = goals.create(root, { projectId: project.id, text: 'one of mine is gone' });
+  const order = orders.create(root, { projectId: project.id, prompt: 'the survivor' });
+  orders.attachToGoal(root, order.id, goal.id, 1);
+  // A plan of two whose first order is no longer on disk. goals.planned stores
+  // orderIds without checking that each names anything - lib/goals says so.
+  goals.planned(root, goal.id, {
+    orderIds: ['ord-00000000000000-0000-vanished', order.id],
+    pmAgent: 'fake',
+  });
+
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    assert.strictEqual(scheduler.stats().dispatched, 0,
+      'the vanished order was treated as unspent and the cap admitted one too many');
+    assert.strictEqual(orders.get(root, order.id).status, 'queued');
+    assert.strictEqual(scheduler.stats().errors, 0,
+      `the tick threw rather than skipping: ${scheduler.stats().lastError}`);
   } finally {
     await drain();
   }
