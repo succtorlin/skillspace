@@ -544,16 +544,25 @@ test('two orders on a dir project do not run at once', async () => {
 
   const refused = await dispatch.runOrder(root, { childEnv: testEnv, order: second, project, agent });
 
-  // The primary property, and the deterministic one: the guard refuses. The
-  // agent count below corroborates it but cannot be the main assertion, since
-  // zero agents is a SAFE outcome and only two is a failure.
-  assert.strictEqual(refused.refused, 'project busy',
-    'a second order was allowed into the user\'s own directory');
-  assert.strictEqual(orders.get(root, second.id).status, 'queued',
-    'a refusal must not settle the order - it can run once the first finishes');
-
-  dispatch.cancel(first.id);
-  await running;
+  // CLEANUP IN A FINALLY, because dispatch's in-flight map is a process-wide
+  // singleton shared by every test in this file. With the cancel sitting after
+  // the assertions, one failure here left `first` in flight forever and the
+  // later 'a caller that never asks about capacity' test then read
+  // inFlightCount() as 1 where it expects 0 - so a single red test manufactured
+  // a second one and buried its own message. A failing test must not be able to
+  // damage the ones after it.
+  try {
+    // The primary property, and the deterministic one: the guard refuses. The
+    // agent count below corroborates it but cannot be the main assertion, since
+    // zero agents is a SAFE outcome and only two is a failure.
+    assert.strictEqual(refused.refused, 'project busy',
+      'a second order was allowed into the user\'s own directory');
+    assert.strictEqual(orders.get(root, second.id).status, 'queued',
+      'a refusal must not settle the order - it can run once the first finishes');
+  } finally {
+    dispatch.cancel(first.id);
+    await running;
+  }
 
   const pids = pidsIn(tally);
   assert.ok(pids.length <= 1, `${pids.length} agents ran in one unisolated directory`);

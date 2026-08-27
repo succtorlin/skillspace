@@ -270,6 +270,15 @@ const planned = (id, at) => waitFor(`goal ${id} to finish planning`, async () =>
   return r.body.goal.status !== 'planning' ? r.body : false;
 });
 
+// Settled = the dispatch is over. Reading the record is the only observable the
+// HTTP surface offers for that.
+const settledOrder = (id, at) => waitFor(`order ${id} to settle`, async () => {
+  const r = await json('GET', '/api/orders/' + id, undefined, at);
+  if (r.status !== 200) return false;
+  const st = r.body.order.status;
+  return st !== 'queued' && st !== 'running' ? st : false;
+});
+
 // undici rewrites Sec-Fetch-Mode on its own requests, so a fetch-based version
 // of the navigation test passes for the wrong reason. Raw socket, real bytes.
 function rawRequest(method, pathname, extraHeaders, body, at) {
@@ -872,6 +881,61 @@ test('a PM started over HTTP occupies a slot in the process-wide agent ceiling',
   } finally {
     await stopServer(s.child);
   }
+});
+
+test('a planned order can actually be dispatched, and only the one asked for', async () => {
+  // THE DELIVERABLE, end to end, and the test whose absence let the branch ship
+  // with its headline feature unreachable: state a goal, let the PM decompose
+  // it, then APPROVE one of the orders it planned and watch that order run.
+  //
+  // Until POST /api/orders/:id/dispatch existed there was no way to do the last
+  // step. The order-mutating surface was create-and-dispatch plus cancel, so
+  // the only way to run a planned order was to re-POST its prompt - which
+  // created a third order with goalId null and left the original queued
+  // forever. Three documents said otherwise.
+  //
+  // A GIT project deliberately: the order must get its own worktree, which is
+  // also how "it really ran somewhere isolated" becomes observable on the
+  // record rather than asserted.
+  const project = await makeGitProject();
+  const g = (await json('POST', '/api/goals', {
+    projectId: project.id, text: 'ship the thing',
+  })).body.goal;
+
+  const done = await planned(g.id);
+  assert.strictEqual(done.goal.status, 'running', `the goal did not plan: ${done.goal.error}`);
+  assert.strictEqual(done.orders.length, 2);
+  assert.ok(done.orders.every((o) => o.status === 'queued'),
+    'the plan did not leave its orders queued, so approval is not what is being tested');
+
+  const [first, second] = done.orders;
+  const d = await json('POST', `/api/orders/${first.id}/dispatch`);
+  assert.strictEqual(d.status, 200, JSON.stringify(d.body));
+
+  const status = await settledOrder(first.id);
+  assert.strictEqual(status, 'succeeded',
+    `a planned order could not be run: ${JSON.stringify((await json('GET', '/api/orders/' + first.id)).body.order)}`);
+
+  // Read it back the way a human would - through the goal, which is where the
+  // orders live - so this pins the reader's view and not just the order record.
+  const after = await json('GET', '/api/goals/' + g.id);
+  const byId = Object.fromEntries(after.body.orders.map((o) => [o.id, o]));
+  assert.strictEqual(byId[first.id].status, 'succeeded');
+  assert.strictEqual(byId[second.id].status, 'queued',
+    'approving one order ran the other as well, which is not approval');
+
+  // It ran in its OWN worktree, not the user's tree: that is what makes
+  // dispatching a planned order safe to do more than once.
+  assert.ok(byId[first.id].cwd, 'the order records no working directory');
+  assert.notStrictEqual(byId[first.id].cwd, project.path, "the agent ran in the user's own tree");
+  assert.match(byId[first.id].cwd, /worktrees/);
+  assert.strictEqual(byId[first.id].goalId, g.id, 'the dispatched order lost its goal');
+  assert.strictEqual(byId[first.id].seq, 0);
+
+  // And the second is still approvable - the point of approving one at a time.
+  const d2 = await json('POST', `/api/orders/${second.id}/dispatch`);
+  assert.strictEqual(d2.status, 200, JSON.stringify(d2.body));
+  assert.strictEqual(await settledOrder(second.id), 'succeeded');
 });
 
 test('a burst of goals on git projects cannot outrun the ceiling', async () => {

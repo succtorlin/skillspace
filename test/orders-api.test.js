@@ -605,7 +605,12 @@ test('POST /api/orders refuses a top-level navigation', async () => {
 // A queued order has no runner handle, so dispatch.cancel cannot reach it.
 // Writing the record directly is how that state is held still: a dispatched
 // order races to 'running' within a microtask of the POST returning.
-function seedOrder(root, status) {
+//
+// `extra` overrides fields - a real projectId, a prompt the shim reacts to -
+// which is what makes a QUEUED order that nothing has dispatched reachable at
+// all: POST /api/orders creates and dispatches in one step, so there is no
+// other way to hold one still for the dispatch route to act on.
+function seedOrder(root, status, extra) {
   const id = orders.newId();
   store.writeJson(root, `orders/${id}.json`, {
     id,
@@ -625,6 +630,7 @@ function seedOrder(root, status) {
     createdAt: new Date().toISOString(),
     startedAt: null,
     finishedAt: null,
+    ...(extra || {}),
   });
   return id;
 }
@@ -654,6 +660,151 @@ test('cancel of an unknown order is 404, of a settled order is 409', async () =>
     const r = await json('POST', `/api/orders/${id}/cancel`);
     assert.strictEqual(r.status, 409, `cancelling a ${settled} order got ${r.status}`);
     assert.match(r.body.error, new RegExp(settled));
+  }
+});
+
+test('POST /api/orders/:id/dispatch runs an order that already exists', async () => {
+  // THE APPROVAL GATE. Before this route, the entire order-mutating surface was
+  // create-and-dispatch plus cancel - so a queued order could never be run, and
+  // the only workaround was to re-POST its prompt, which created a THIRD order
+  // with goalId null and left the original queued forever.
+  const project = await makeProject();
+  const id = seedOrder(storeRoot, 'queued', { projectId: project.id, prompt: 'run me' });
+
+  const r = await json('POST', `/api/orders/${id}/dispatch`);
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  assert.strictEqual(r.body.order.id, id);
+
+  const status = await settled(id);
+  assert.strictEqual(status, 'succeeded', 'the dispatched order did not run');
+  const after = (await json('GET', '/api/orders/' + id)).body.order;
+  assert.strictEqual(after.agent, 'claude', 'the record does not say what ran it');
+  assert.ok(after.startedAt, 'the order never started');
+});
+
+test('dispatch refuses an order that is not queued', async () => {
+  // Re-dispatching a RUNNING order puts two agents on one record - the second
+  // overwrites the first's handle in dispatch's map, so cancel() reaches
+  // neither - and re-dispatching a settled one runs work already accounted for.
+  for (const state of ['running', 'succeeded', 'failed', 'cancelled', 'interrupted']) {
+    const id = seedOrder(storeRoot, state);
+    const r = await json('POST', `/api/orders/${id}/dispatch`);
+    assert.strictEqual(r.status, 409, `dispatching a ${state} order got ${r.status}`);
+    assert.match(r.body.error, new RegExp(state));
+    // The record comes back with the refusal, so a caller sees WHY rather than
+    // having to make a second request to find out.
+    assert.strictEqual(r.body.order && r.body.order.status, state);
+  }
+});
+
+test('dispatch of an unknown order is 404, and of a bad id 400', async () => {
+  const missing = await json('POST', '/api/orders/ord-not-a-real-order/dispatch');
+  assert.strictEqual(missing.status, 404, JSON.stringify(missing.body));
+  for (const bad of ['a%2Fb', '%ZZ', 'a.b']) {
+    const r = await fetch(`${base}/api/orders/${bad}/dispatch`, { method: 'POST' });
+    assert.strictEqual(r.status, 400, `id ${JSON.stringify(bad)} got ${r.status}`);
+  }
+
+  // POST ONLY. A GET that spawns a credentialed agent is the shape <img src>
+  // reaches, and it is the reason /api/run carries a navigation guard at all -
+  // a route that answers any method has that door open by construction, whether
+  // or not today's header checks happen to cover it.
+  const project = await makeProject();
+  const queued = seedOrder(storeRoot, 'queued', { projectId: project.id, prompt: 'GET must not run me' });
+  const got = await fetch(`${base}/api/orders/${queued}/dispatch`);
+  assert.strictEqual(got.status, 404, `GET on the dispatch route got ${got.status}`);
+  assert.strictEqual((await json('GET', '/api/orders/' + queued)).body.order.status, 'queued',
+    'a GET dispatched an order');
+});
+
+test("dispatch of an order whose project is gone is 409, not a 500", async () => {
+  // DELETE /api/projects/:id succeeds with orders still pointing at it, so this
+  // is reachable without any corruption. The request named a real order; it is
+  // the stored state that cannot be acted on.
+  const id = seedOrder(storeRoot, 'queued');   // projectId 'prj-seeded', which exists nowhere
+  const r = await json('POST', `/api/orders/${id}/dispatch`);
+  assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+  assert.match(r.body.error, /project no longer exists/);
+  assert.strictEqual((await json('GET', '/api/orders/' + id)).body.order.status, 'queued',
+    'a refused dispatch settled the order');
+});
+
+test('POST /api/orders/:id/dispatch refuses a top-level navigation', async () => {
+  // It spawns exactly the same credentialed agent the create path does, so it
+  // carries exactly the same guard. RAW SOCKET: undici rewrites Sec-Fetch-Mode
+  // on its own requests, so a fetch-based version of this passes for the wrong
+  // reason.
+  const project = await makeProject();
+  const id = seedOrder(storeRoot, 'queued', { projectId: project.id, prompt: 'navigated in' });
+  const shapes = [
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Dest': 'document' },
+  ];
+  for (const h of shapes) {
+    const res = await rawRequest('POST', `/api/orders/${id}/dispatch`, h, '');
+    assert.match(res, /^HTTP\/1\.1 403 /,
+      `navigation shape ${JSON.stringify(h)} was allowed: ${res.slice(0, 40)}`);
+  }
+  // and none of them started anything
+  assert.strictEqual((await json('GET', '/api/orders/' + id)).body.order.status, 'queued',
+    'a navigation dispatched an order');
+
+  // The shape the console actually uses must still work, or this would pass
+  // just as well against a route that refuses everything.
+  const ok = await rawRequest('POST', `/api/orders/${id}/dispatch`, {
+    'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty',
+  }, '');
+  assert.match(ok, /^HTTP\/1\.1 200 /, `the console's own shape must be served: ${ok.slice(0, 40)}`);
+  await settled(id);
+});
+
+test('dispatch returns immediately, without waiting for the agent', async () => {
+  // runOrder resolves only when the agent EXITS - up to orderTimeoutMs, fifteen
+  // minutes by default. The shim sleeps on this prompt, so an awaiting route
+  // cannot answer in time and this is about the route, not a fast agent.
+  const project = await makeProject();
+  const id = seedOrder(storeRoot, 'queued', {
+    projectId: project.id, prompt: `${SLOW_MARK} dispatched by id`,
+  });
+  const t0 = Date.now();
+  const r = await json('POST', `/api/orders/${id}/dispatch`);
+  const elapsed = Date.now() - t0;
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  assert.ok(elapsed < 2000,
+    `dispatch took ${elapsed}ms - the route waited for the agent (shim sleeps ${SLOW_SECONDS}s)`);
+  await json('POST', `/api/orders/${id}/cancel`);
+});
+
+test('dispatch is refused at the ceiling, leaving the order queued', async () => {
+  // The order already exists, so unlike the create path there is no record to
+  // avoid leaving behind - the property is that a refused dispatch leaves it
+  // QUEUED, which is the honest state for one that was never started and which
+  // a later dispatch can still act on. runOrder enforces the same predicate, so
+  // this gate is not the guard; it is what turns the refusal into a 429.
+  const home = tmp('skillspace-dispatchceiling-');
+  const { child: kid, base: b } = await startServer(home, { SKILLSPACE_MAX_RUNS: '1' });
+  try {
+    const holder = await makeProjectOn(b);
+    const held = await json('POST', '/api/orders', {
+      projectId: holder.id, prompt: `${SLOW_MARK} holds the only slot`,
+    }, b);
+    assert.strictEqual(held.status, 200, JSON.stringify(held.body));
+    // Vacuous-pass guard: a 429 below means nothing unless the slot is really
+    // held. dispatch claims before its first await, so the claim is already
+    // made by the time that POST was answered - read it back to be sure.
+    const live = (await json('GET', '/api/orders', undefined, b)).body.orders
+      .filter((o) => o.status === 'queued' || o.status === 'running');
+    assert.strictEqual(live.length, 1, `the holding order was not in flight: ${live.length}`);
+
+    const other = await makeProjectOn(b);
+    const id = seedOrder(home, 'queued', { projectId: other.id, prompt: 'wants in' });
+    const r = await json('POST', `/api/orders/${id}/dispatch`, undefined, b);
+    assert.strictEqual(r.status, 429, `the dispatch route has its own pool: ${JSON.stringify(r.body)}`);
+    assert.strictEqual((await json('GET', '/api/orders/' + id, undefined, b)).body.order.status,
+      'queued', 'a refused dispatch did not leave the order queued');
+  } finally {
+    await stopServer(kid);
   }
 });
 

@@ -87,6 +87,32 @@ async function waitForFile(file, deadlineMs) {
 // KILL_GRACE_MS in lib/runner.js is 5s; this is that plus room to observe.
 const AFTER_ESCALATION_MS = 6500;
 
+// PRECONDITION BOUNDS, and what they are actually protecting - read this before
+// tightening them back.
+//
+// Several tests below assert that NOTHING survived a reap. "Nothing survived"
+// is also trivially true of a grandchild that never started, so each one first
+// waits for evidence that the chain really came up. That wait is a bound on
+// PROCESS SPAWN LATENCY, which is not a function of CPU load alone: measured
+// failures came from running two full suites concurrently - doubled process
+// count - where a chain two shells deep took over 1500ms to appear. Single-suite
+// runs at 24 CPU hogs never reproduced it. So the bound has to cover a machine
+// that is busy with PROCESSES, not merely busy.
+//
+// Two constants because the two kinds of evidence have different constraints:
+//
+// LIVE_PRECONDITION_MS polls for a live process, so it is racing the reap it is
+// setting up - once the run's timeoutMs fires, the process is gone and no
+// further waiting can ever succeed. It must therefore stay BELOW the timeoutMs
+// of any run it guards, and that run's timeoutMs is what really sets the
+// headroom. Raising this without raising that timeout buys nothing.
+//
+// FILE_PRECONDITION_MS waits for a marker the shim wrote, which is durable - it
+// survives the reap - so it is free to be generous and is not bounded by the
+// run's timeout at all.
+const LIVE_PRECONDITION_MS = 5000;
+const FILE_PRECONDITION_MS = 15000;
+
 function countByToken(token) {
   try {
     return execSync(`pgrep -f ${token} | wc -l`, { encoding: 'utf8' }).trim();
@@ -159,11 +185,17 @@ test('a timeout reaps the whole process group, not just the direct child', async
   const before = countByToken(sleeper.token);
   const handle = runner.start({
     agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
-    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 2000,
+    // Generous on purpose: the precondition below polls for a LIVE process, so
+    // it is racing this timeout, and the grandchild has to be observed alive
+    // before the reap it is setting up. At 2000ms with the poll at 1500ms this
+    // was the branch's only recurring flake - 1 in 349, and only ever with two
+    // suites running at once. The run still ends when the timeout fires, so
+    // this costs wall time and buys the headroom.
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 6000,
   });
   // Without this, "after === before" is also satisfied by a grandchild that
   // never started, and the test would pass while proving nothing.
-  assert.ok(await waitForGrandchild(sleeper.token, before, 1500),
+  assert.ok(await waitForGrandchild(sleeper.token, before, LIVE_PRECONDITION_MS),
     'the grandchild never started, so this test proves nothing');
   await handle.done;
   await new Promise((r) => setTimeout(r, 1500));
@@ -181,7 +213,9 @@ test('cancel reaps the whole process group, not just the direct child', async ()
     agent: shimAgent(`#!/bin/sh\n"${sleeper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
     logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
   });
-  assert.ok(await waitForGrandchild(sleeper.token, before, 3000),
+  // Not racing anything: the run's timeoutMs is 60s and the cancel below is what
+  // ends it, so this bound only has to cover spawn latency.
+  assert.ok(await waitForGrandchild(sleeper.token, before, FILE_PRECONDITION_MS),
     'the grandchild never started, so this test proves nothing');
   handle.cancel();
   await handle.done;
@@ -386,7 +420,7 @@ test('a grandchild that ignores SIGTERM is escalated to SIGKILL on cancel', asyn
     agent: shimAgent(`#!/bin/sh\n"${trapper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
     logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 60000,
   });
-  assert.ok(await waitForFile(trapper.armed, 3000),
+  assert.ok(await waitForFile(trapper.armed, FILE_PRECONDITION_MS),
     'the trap never armed, so this test proves nothing');
   handle.cancel();
   await handle.done;
@@ -401,9 +435,14 @@ test('a grandchild that ignores SIGTERM is escalated to SIGKILL on timeout', asy
   const before = countByToken(trapper.token);
   const handle = runner.start({
     agent: shimAgent(`#!/bin/sh\n"${trapper.bin}" &\nwait\n`), prompt: 'x', cwd: tmpDir(),
-    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 1200,
+    // The marker below is durable, so the WAIT does not race this timeout - but
+    // the trap still has to ARM before it, or the shim is reaped before it can
+    // write the marker and the precondition fails honestly but pointlessly.
+    // 1200ms was ~24x the typical arming time and still inside the range where
+    // a machine busy with processes misses it.
+    logFile: path.join(tmpDir(), 'run.log'), timeoutMs: 4000,
   });
-  assert.ok(await waitForFile(trapper.armed, 3000),
+  assert.ok(await waitForFile(trapper.armed, FILE_PRECONDITION_MS),
     'the trap never armed, so this test proves nothing');
   await handle.done;
   await new Promise((r) => setTimeout(r, AFTER_ESCALATION_MS));
