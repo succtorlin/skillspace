@@ -301,13 +301,35 @@ test('a throw while starting the agent settles the order, never leaves it runnin
   const result = await dispatch.runOrder(root, { childEnv: testEnv, order, project, agent: shimAgent(OK) });
 
   assert.strictEqual(result.status, 'failed');
-  assert.match(orders.get(root, order.id).error, /dispatch:/);
-  assert.notStrictEqual(orders.get(root, order.id).status, 'running',
+  const stored = orders.get(root, order.id);
+  assert.match(stored.error, /dispatch:/);
+  assert.notStrictEqual(stored.status, 'running',
     'a throw left the order live with no process behind it');
-  // markFailed would force startedAt back to null, erasing that this order got
-  // as far as being marked running. markFinished is the correct verb.
-  assert.ok(orders.get(root, order.id).startedAt,
-    'startedAt was erased; this order did start');
+
+  // startedAt IS NULL, and this assertion is the reverse of what it used to be.
+  // It read `assert.ok(stored.startedAt)` on the reasoning that the order "got
+  // as far as being marked running, so markFinished is the correct verb". That
+  // is a claim about which line dispatch reached, not about whether an agent
+  // ran, and lib/orders owns the field and means the latter: test/orders.test.js
+  // pins that markFailed must NULL an existing startedAt because "the board
+  // reads a non-null startedAt as 'this actually ran'". The two files disagreed
+  // in the open, and this one was wrong.
+  //
+  // It was also harmful rather than merely untidy. runner.start throws BEFORE
+  // any spawn, so no process existed - and lib/scheduler decides whether a
+  // project can still start orders by reading exactly this field. A `logs/`
+  // that cannot be written made every order fail while resetting the breaker
+  // meant to stop the bleeding, which is the same bug the ENOENT path had until
+  // it was fixed one door away.
+  assert.strictEqual(stored.startedAt, null,
+    'the record claims an agent ran, and none was ever spawned');
+
+  // What was actually kept, so the correction is not mistaken for a loss:
+  // markFailed rewrites status, error, startedAt and finishedAt only. cwd and
+  // agent are written by markRunning and survive, so "this order reached
+  // markRunning" is still legible on the record.
+  assert.ok(stored.cwd, 'the evidence that this order reached markRunning was erased');
+  assert.strictEqual(stored.agent, 'fake');
 });
 
 test('a second dispatch of the same order is refused', async () => {

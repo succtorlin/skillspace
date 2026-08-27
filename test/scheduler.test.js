@@ -1581,3 +1581,52 @@ test('a goal with a malformed orderIds does not have its orders run', async () =
     await drain();
   }
 });
+
+test('a store that cannot hold logs pauses the project too', async () => {
+  // THE SECOND DOOR into the same hazard, and the one that stayed open longest
+  // because a test was holding it. runner.start throws SYNCHRONOUSLY when it
+  // cannot create logs/ - dispatch answered that with markFinished, which KEEPS
+  // the startedAt that markRunning wrote one line earlier, so every failure
+  // read as a successful start and CLEARED the breaker. Identical to the ENOENT
+  // bug, by a different route, while the first route was already fixed.
+  //
+  // Mutant: lib/dispatch reverts to markFinished on that throw.
+  //
+  // Broader than the spawn case, which is why it matters: logs/ lives in the
+  // store root, so a single unwritable path takes down every project at once.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 1 });
+  const made = ['a', 'b', 'c', 'd', 'e'].map((p) =>
+    orders.create(root, { projectId: project.id, prompt: p }));
+  // logs/ as a regular file, exactly as test/dispatch.test.js does it:
+  // runner.start's mkdirSync throws EEXIST before any process is spawned.
+  fs.writeFileSync(path.join(root, 'logs'), 'not a directory');
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await waitFor('the project to be paused', () => scheduler.stats().pausedProjects === 1);
+    await ticksPass(10, 15);
+
+    const failed = made.filter((o) => orders.get(root, o.id).status === 'failed');
+    assert.strictEqual(failed.length, 3,
+      `${failed.length} orders were burned by a store that could not hold a log`);
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 2,
+      'the rest of the backlog was not left recoverable');
+    assert.strictEqual(scheduler.stats().failedToStart, 3);
+    assert.strictEqual(scheduler.stats().started, 0,
+      'a dispatch that never spawned anything was counted as a start');
+
+    for (const o of failed) {
+      const rec = orders.get(root, o.id);
+      assert.strictEqual(rec.startedAt, null,
+        'the record claims an agent ran; runner.start threw before spawning one');
+      assert.match(rec.error, /dispatch:/);
+      // The evidence that dispatch got as far as markRunning is still on the
+      // record - markFailed does not touch cwd - which is what makes nulling
+      // startedAt a correction rather than a loss.
+      assert.ok(rec.cwd, 'the order lost every trace of having reached markRunning');
+    }
+  } finally {
+    await drain();
+  }
+});
