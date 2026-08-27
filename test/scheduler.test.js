@@ -150,7 +150,7 @@ test('a goal\'s queued orders run without anyone dispatching them', async () => 
     assert.strictEqual(a.status, 'succeeded', `first order: ${a.status} ${a.error}`);
     assert.strictEqual(b.status, 'succeeded', `second order: ${b.status} ${b.error}`);
     assert.strictEqual(a.agent, 'fake');
-    assert.strictEqual(scheduler.stats().dispatched, 2);
+    assert.strictEqual(scheduler.stats().offered, 2);
     // The advisory checks were not merely harmless, they were RIGHT: nothing
     // was picked that runOrder then refused.
     assert.strictEqual(scheduler.stats().refused, 0);
@@ -200,7 +200,7 @@ test('the scheduler never exceeds the global ceiling', async () => {
     assert.strictEqual(peak, 1, `${peak} agents were alive at once under a ceiling of 1`);
     assert.strictEqual(scheduler.stats().refused, 0,
       'the scheduler dispatched past the ceiling and runOrder had to refuse it');
-    assert.strictEqual(scheduler.stats().dispatched, 1);
+    assert.strictEqual(scheduler.stats().offered, 1);
     // Guards a vacuous pass: five orders must still be waiting, not settled.
     const queued = made.filter((o) => orders.get(root, o.id).status === 'queued').length;
     assert.strictEqual(queued, 5, 'the other five orders were not left queued');
@@ -232,7 +232,7 @@ test('a dir project gets one order at a time', async () => {
 
     assert.strictEqual(scheduler.stats().refused, 0,
       'the scheduler kept offering orders runOrder had to refuse as project busy');
-    assert.strictEqual(scheduler.stats().dispatched, 1);
+    assert.strictEqual(scheduler.stats().offered, 1);
     assert.strictEqual(aliveCount(pidsIn(tally)), 1,
       'more than one agent was alive in the user\'s own directory');
     // OLDEST FIRST, and this is the only place it is observable: a project that
@@ -283,7 +283,7 @@ test('a project claimed by a planning PM is not dispatched into', async () => {
     await ticksPass(6, 15);
 
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
-    assert.strictEqual(scheduler.stats().dispatched, 0,
+    assert.strictEqual(scheduler.stats().offered, 0,
       'the scheduler dispatched into a project a PM was holding');
     assert.strictEqual(scheduler.stats().refused, 0);
     assert.strictEqual(pidsIn(tally).length, 0, 'an agent ran in a directory a PM was in');
@@ -317,7 +317,15 @@ test('an order already claimed is not dispatched again', async () => {
   const hook = path.join(repo, '.git', 'hooks', 'post-checkout');
   fs.writeFileSync(hook, '#!/bin/sh\nsleep 1\nexit 0\n');
   fs.chmodSync(hook, 0o755);
-  const project = projects.create(root, { path: repo });
+  // concurrency 2 ASSERTED, not inherited. This is the only fixture whose kill
+  // power depends on the project having a spare slot: at concurrency 1 the git
+  // bound refuses the second offer before isClaimed is ever consulted, and
+  // deleting the isClaimed check passes. It survived on safeConcurrency's
+  // default until someone changed the default - which is one edit away from
+  // shadowing the very check this test exists for.
+  const project = projects.create(root, { path: repo, concurrency: 2 });
+  assert.strictEqual(project.concurrency, 2,
+    'this test needs a spare slot, or the project bound shadows isClaimed');
   const order = orders.create(root, { projectId: project.id, prompt: 'slow to prepare' });
   const agent = shimAgent(OK);
 
@@ -334,7 +342,7 @@ test('an order already claimed is not dispatched again', async () => {
     assert.ok(dispatch.isClaimed(order.id),
       'the window closed before the loop could tick inside it');
 
-    assert.strictEqual(scheduler.stats().dispatched, 1,
+    assert.strictEqual(scheduler.stats().offered, 1,
       'the same order was dispatched more than once while it was still queued');
     assert.strictEqual(scheduler.stats().refused, 0,
       'runOrder had to refuse a duplicate the scheduler should not have offered');
@@ -453,7 +461,7 @@ test('per-goal spend is bounded', async () => {
 
     const settled = made.filter((o) => orders.SETTLED.has(orders.get(root, o.id).status));
     assert.strictEqual(settled.length, 1, `${settled.length} orders ran under a per-goal cap of 1`);
-    assert.strictEqual(scheduler.stats().dispatched, 1);
+    assert.strictEqual(scheduler.stats().offered, 1);
     assert.strictEqual(orders.get(root, made[1].id).status, 'queued');
     assert.strictEqual(orders.get(root, made[2].id).status, 'queued');
     // The documented cost of bounding it here: the goal never reaches `done`,
@@ -495,7 +503,7 @@ test('a goal whose orders all settled during boot is finished by the first tick'
       'the goal still claimed outstanding work after the scheduler started');
     assert.ok(after.finishedAt, 'markDone did not stamp finishedAt');
     assert.strictEqual(scheduler.stats().ticks, 1);
-    assert.strictEqual(scheduler.stats().dispatched, 0);
+    assert.strictEqual(scheduler.stats().offered, 0);
   } finally {
     await drain();
   }
@@ -529,7 +537,7 @@ test('an order attached to a goal still being planned is not dispatched', async 
   try {
     scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
     await ticksPass(6, 15);
-    assert.strictEqual(scheduler.stats().dispatched, 0,
+    assert.strictEqual(scheduler.stats().offered, 0,
       'an order was dispatched while its goal was still being decomposed');
     assert.strictEqual(pidsIn(tally).length, 0, 'an agent ran for a plan that does not exist yet');
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
@@ -674,7 +682,7 @@ test('the scheduler does not burn a backlog against a reached daily cap', async 
       assert.strictEqual(rec.status, 'queued',
         `order ${o.id} was ${rec.status} (${rec.error}) instead of left for tomorrow`);
     }
-    assert.strictEqual(scheduler.stats().dispatched, 0);
+    assert.strictEqual(scheduler.stats().offered, 0);
   } finally {
     await drain();
   }
@@ -693,7 +701,7 @@ test('an order with no agent available is left queued, not failed', async () => 
     await ticksPass(4, 15);
     assert.strictEqual(orders.get(root, order.id).status, 'queued',
       'a missing agent settled the order instead of leaving it for later');
-    assert.strictEqual(scheduler.stats().dispatched, 0);
+    assert.strictEqual(scheduler.stats().offered, 0);
   } finally {
     await drain();
   }
@@ -761,7 +769,7 @@ test('a goal the PM could not plan does not have its orders run', async () => {
     // A long interval so only the startup tick can run: the assertion is
     // synchronous and cannot be a race.
     scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
-    assert.strictEqual(scheduler.stats().dispatched, 0,
+    assert.strictEqual(scheduler.stats().offered, 0,
       'an order belonging to a failed goal was dispatched');
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
     assert.strictEqual(scheduler.stats().errors, 0,
@@ -788,7 +796,7 @@ test('an order naming a goal that cannot be read is left queued', async () => {
 
   try {
     scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
-    assert.strictEqual(scheduler.stats().dispatched, 0,
+    assert.strictEqual(scheduler.stats().offered, 0,
       'an order was run for a goal whose record could not be read');
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
     // NOT BY CRASHING. Without the guard the null record falls through to
@@ -933,7 +941,7 @@ test('a git project runs up to its configured concurrency, and no more', async (
     const alive = aliveCount(pidsIn(tally));
     assert.strictEqual(alive, 2,
       `${alive} agents alive on a project configured for 2`);
-    assert.strictEqual(scheduler.stats().dispatched, 2);
+    assert.strictEqual(scheduler.stats().offered, 2);
     assert.strictEqual(scheduler.stats().refused, 0);
     const queued = made.filter((o) => orders.get(root, o.id).status === 'queued').length;
     assert.strictEqual(queued, 2, 'the other two orders were not left queued');
@@ -960,7 +968,7 @@ test('an order naming a project that cannot be read is left queued', async () =>
     scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
     await ticksPass(4, 15);
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
-    assert.strictEqual(scheduler.stats().dispatched, 0);
+    assert.strictEqual(scheduler.stats().offered, 0);
     assert.strictEqual(scheduler.stats().errors, 0,
       `the tick threw instead of skipping the order: ${scheduler.stats().lastError}`);
   } finally {
@@ -997,7 +1005,7 @@ test('a hand-edited concurrency of 0 means one, not unlimited and not none', asy
     await ticksPass(8, 15);
     assert.strictEqual(aliveCount(pidsIn(tally)), 1,
       'a concurrency of 0 was read as no limit at all');
-    assert.strictEqual(scheduler.stats().dispatched, 1);
+    assert.strictEqual(scheduler.stats().offered, 1);
     assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 1);
   } finally {
     await drain();
@@ -1037,11 +1045,343 @@ test('a goal whose plan names a vanished order does not overspend its budget', a
 
   try {
     scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
-    assert.strictEqual(scheduler.stats().dispatched, 0,
+    assert.strictEqual(scheduler.stats().offered, 0,
       'the vanished order was treated as unspent and the cap admitted one too many');
     assert.strictEqual(orders.get(root, order.id).status, 'queued');
     assert.strictEqual(scheduler.stats().errors, 0,
       `the tick threw rather than skipping: ${scheduler.stats().lastError}`);
+  } finally {
+    await drain();
+  }
+});
+
+test('a project that cannot produce a worktree is paused, not drained', async () => {
+  // The fourth instance of the class: runOrder answers a thrown
+  // worktrees.prepare with markFailed, which is right for one request and
+  // ruinous for a loop. Five queued orders went from `queued` to permanently
+  // `failed` in about 100ms with stats() reporting perfect health, because a
+  // settle is not a refusal and nothing was counting it.
+  //
+  // Mutant: the pause check removed - all five burn.
+  // Mutant: noteOutcome never called - same, and failedToStart stays 0.
+  //
+  // concurrency 1 makes the arithmetic exact: one offer per tick, so the third
+  // failure arms the pause before a fourth can be offered.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 1 });
+  const made = ['a', 'b', 'c', 'd', 'e'].map((p) =>
+    orders.create(root, { projectId: project.id, prompt: p }));
+  // A file where the worktrees directory has to go. Any systemic fault does
+  // this - a full disk, a vanished project.branch, git missing - and this one
+  // is deterministic: mkdirSync throws EEXIST on a path that is a file.
+  fs.writeFileSync(path.join(root, 'worktrees'), 'not a directory\n');
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await waitFor('the project to be paused', () => scheduler.stats().pausedProjects === 1);
+    await ticksPass(10, 15);
+
+    const failed = made.filter((o) => orders.get(root, o.id).status === 'failed');
+    const queued = made.filter((o) => orders.get(root, o.id).status === 'queued');
+    assert.strictEqual(failed.length, 3,
+      `${failed.length} orders were burned before the project was paused`);
+    assert.strictEqual(queued.length, 2, 'the rest were not left recoverable');
+    assert.strictEqual(scheduler.stats().failedToStart, 3);
+    assert.strictEqual(scheduler.stats().started, 0);
+    // The half that made this invisible: a settle is not a refusal, so the
+    // counter three tests rely on cannot see this class at all.
+    assert.strictEqual(scheduler.stats().refused, 0);
+    assert.match(orders.get(root, failed[0].id).error, /EEXIST|ENOTDIR|not a directory/i);
+  } finally {
+    await drain();
+  }
+});
+
+test('one poisoned candidate does not starve the queue behind it', async () => {
+  // Mutant: the per-candidate try/catch removed.
+  //
+  // agentFor is caller-supplied - Task 5 writes it, out of server.js's agent
+  // registry - and its documented contract says required, synchronous, may
+  // return nothing. It does not say "must not throw", and it cannot: this
+  // module does not own it. Without the guard, one throw abandons the whole
+  // tick, and since the queue is oldest-first the poisoned order is at its head
+  // on every tick forever - every healthy order in the store, on every project,
+  // starved indefinitely.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 3 });
+  const poison = orders.create(root, { projectId: project.id, prompt: 'poison' });
+  const healthy = ['b', 'c'].map((p) => orders.create(root, { projectId: project.id, prompt: p }));
+  const agent = shimAgent(OK);
+
+  try {
+    scheduler.start(root, {
+      intervalMs: 15,
+      childEnv: testEnv,
+      agentFor: (o) => {
+        if (o.id === poison.id) throw new Error('the agent registry blew up');
+        return agent;
+      },
+    });
+    await waitFor('the healthy orders to settle', () =>
+      healthy.every((o) => orders.SETTLED.has(orders.get(root, o.id).status)));
+
+    for (const o of healthy) {
+      assert.strictEqual(orders.get(root, o.id).status, 'succeeded');
+    }
+    // The poisoned one is left where it was - not settled, not lost, and not
+    // able to take anything else down with it.
+    assert.strictEqual(orders.get(root, poison.id).status, 'queued');
+    assert.ok(scheduler.stats().errors > 0, 'the throw was swallowed silently');
+    assert.match(scheduler.stats().lastError, /agent registry blew up/);
+    assert.ok(scheduler.stats().lastErrorAt, 'the error carries no timestamp');
+  } finally {
+    await drain();
+  }
+});
+
+test('a dispatch-side fault does not cost the goal sweep', async () => {
+  // Mutant: dispatchPass and reconcileGoals share one try again.
+  //
+  // The sweep is the one thing only this module can do - it is why lib/goals
+  // grew three movers - and it ran second, inside the same try as the dispatch
+  // pass. Any throw from dispatch therefore skipped it, including for goals on
+  // projects that had nothing to do with the fault.
+  //
+  // atCapacity is thrown from deliberately: it sits at the top of the candidate
+  // loop, OUTSIDE the per-candidate guard, so it is a whole-pass fault rather
+  // than one candidate's.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made } = plannedGoal(root, project, ['one', 'two']);
+  orders.markFinished(root, made[0].id, { exitCode: 0 });
+  orders.markFinished(root, made[1].id, { exitCode: 0 });
+  // A queued order so the candidate loop actually enters its body.
+  orders.create(root, { projectId: project.id, prompt: 'never mind me' });
+  assert.strictEqual(goals.get(root, goal.id).status, 'planned');
+
+  const realAtCapacity = dispatch.atCapacity;
+  dispatch.atCapacity = () => { throw new Error('capacity oracle exploded'); };
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    assert.strictEqual(goals.get(root, goal.id).status, 'done',
+      'the goal sweep was lost to a fault on the dispatch side');
+    assert.strictEqual(scheduler.stats().errors, 1);
+    assert.match(scheduler.stats().lastError, /capacity oracle exploded/);
+  } finally {
+    dispatch.atCapacity = realAtCapacity;
+    await drain();
+  }
+});
+
+test('the refusal counter actually counts refusals', async () => {
+  // CALIBRATION, and without it three other tests are reading a dead gauge.
+  //
+  // The dir-project, global-ceiling and already-claimed tests all pin their
+  // advisory check by asserting `refused === 0` - correctly, because with the
+  // check gone runOrder still refuses and an agent count cannot tell the two
+  // apart. But every assertion in the suite is `=== 0`, so nothing ever
+  // observed the counter move: replacing `if (r && r.refused)` with
+  // `if (false)` left the suite green. A silent instrument that three tests
+  // depend on is worse than no instrument.
+  //
+  // So: disable the scheduler's own guard and let runOrder's refuse for real.
+  // projectBusy is patched on the module object rather than runOrder's own
+  // gate, which inlines its walk of projectOf and is therefore untouched - the
+  // refusal below is genuinely dispatch's.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  assert.strictEqual(project.kind, 'dir');
+  const made = ['a', 'b'].map((p) => orders.create(root, { projectId: project.id, prompt: p }));
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = tallyShim(tally, 30);
+
+  const realProjectBusy = dispatch.projectBusy;
+  dispatch.projectBusy = () => false;
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    await waitFor('runOrder to refuse the second order', () => scheduler.stats().refused >= 1);
+    // The agent is a SLOWER observable than the refusal - the refusal resolves
+    // in a microtask, the spawn takes a few hundred milliseconds - so it gets
+    // its own wait. Asserting it straight after the refusal read zero agents
+    // and blamed the wrong thing.
+    await waitFor('the first agent to record itself', () => pidsIn(tally).length >= 1);
+
+    assert.ok(scheduler.stats().offered >= 2, 'only one order was ever offered');
+    // And it keeps refusing, every tick, for as long as the first order runs -
+    // 23 refusals in 360ms when measured. That is precisely the pointless work
+    // the projectBusy check exists to avoid, here made visible by removing it.
+    assert.ok(scheduler.stats().refused >= 1);
+    // A refusal must not settle the order: it can still run once the first ends.
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 1);
+    // And still exactly one agent in the unisolated directory, because
+    // runOrder - not this module - is the authority that guarantees it.
+    assert.strictEqual(aliveCount(pidsIn(tally)), 1);
+  } finally {
+    dispatch.projectBusy = realProjectBusy;
+    await drain();
+  }
+});
+
+test('a hand-edited concurrency above the ceiling is clamped to it', async () => {
+  // Mutant: the Math.min removed. lib/projects states the rule this follows -
+  // "Ceilings, not just floors: an orderTimeoutMs of 1e15 disables the
+  // stuck-agent guard exactly as effectively as 0 does" - and exports the
+  // ceiling. The same hand-edited projects.json that can write a 0, which the
+  // sibling test proves survives projects.get verbatim, can write 500.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 2 });
+  const listed = store.readJson(root, 'projects.json', []);
+  store.writeJson(root, 'projects.json',
+    listed.map((p) => (p.id === project.id ? { ...p, concurrency: 500 } : p)));
+  assert.strictEqual(projects.get(root, project.id).concurrency, 500);
+  const max = projects.MAX_CONCURRENCY;
+  assert.strictEqual(max, 8);
+
+  const made = Array.from({ length: max + 3 }, (_, i) =>
+    orders.create(root, { projectId: project.id, prompt: `order ${i}` }));
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = tallyShim(tally, 30);
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    // Wait on the RECORDS, not on the offer count. All eight are offered in the
+    // first tick - runOrder claims synchronously - but each one only reads
+    // `running` after its own `git worktree add`, and those are serialised per
+    // repo. Asserting on the offer count left eight orders still reading
+    // `queued` and made this look like a ceiling of one.
+    const running = () => made.filter((o) => orders.get(root, o.id).status === 'running').length;
+    await waitFor('the ceiling to fill', () => running() >= max);
+    await ticksPass(6, 15);
+    assert.strictEqual(scheduler.stats().offered, max,
+      `${scheduler.stats().offered} orders offered against a ceiling of ${max}`);
+    assert.strictEqual(running(), max, 'more agents than the ceiling allows');
+    assert.strictEqual(made.filter((o) => orders.get(root, o.id).status === 'queued').length, 3);
+  } finally {
+    await drain();
+  }
+});
+
+test('stats() answers what a panel has to render', async () => {
+  // stats() is what Task 5 polls from a browser, so its shape is a contract:
+  // O(1), no store reads, and enough to tell a healthy idle loop from a stopped
+  // one, from one that errored an hour ago. `offered` is deliberately not
+  // called `dispatched` - it counts attempts, and a probe once read five
+  // "dispatched" while all five orders were already failed.
+  const root = tmpDir('skillspace-home-');
+  const before = scheduler.stats();
+  assert.strictEqual(before.running, false);
+  assert.strictEqual(before.intervalMs, null);
+
+  try {
+    scheduler.start(root, { intervalMs: 50, childEnv: testEnv, agentFor: () => null });
+    const s = scheduler.stats();
+    assert.strictEqual(s.running, true);
+    assert.strictEqual(s.intervalMs, 50);
+    assert.ok(s.startedAt && !Number.isNaN(Date.parse(s.startedAt)), 'startedAt is not a time');
+    assert.ok(s.lastTickAt && !Number.isNaN(Date.parse(s.lastTickAt)), 'lastTickAt is not a time');
+    assert.strictEqual(s.lastError, null);
+    assert.strictEqual(s.lastErrorAt, null);
+    assert.strictEqual(s.pausedProjects, 0);
+    for (const k of ['ticks', 'offered', 'started', 'refused', 'failedToStart', 'errors']) {
+      assert.strictEqual(typeof s[k], 'number', `${k} is missing from stats()`);
+    }
+    // A fresh object each call, so a caller holding one cannot mutate the
+    // counters underneath the loop.
+    assert.notStrictEqual(scheduler.stats(), s);
+  } finally {
+    await drain();
+  }
+  assert.strictEqual(scheduler.stats().running, false);
+});
+
+test('an agent that runs and fails is not a broken project', async () => {
+  // Mutant: neverRan() drops its startedAt test and matches any `failed`.
+  //
+  // The breaker exists for faults that stop an order before it ever runs - a
+  // worktree that cannot be created. An agent that started and exited non-zero
+  // is the system working: the order failed, the project is fine, and pausing
+  // it would turn a run of ordinary red builds into a scheduler that stops
+  // scheduling. lib/orders draws exactly this line and this leans on it -
+  // markFailed nulls startedAt, markFinished keeps whatever markRunning wrote.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 1 });
+  const made = ['a', 'b', 'c', 'd'].map((p) =>
+    orders.create(root, { projectId: project.id, prompt: p }));
+  const agent = shimAgent('#!/bin/sh\necho "broke"\nexit 4\n');
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    await waitFor('all four to settle', () =>
+      made.every((o) => orders.SETTLED.has(orders.get(root, o.id).status)));
+    // The RECORD settles before the promise does - markFinished is runOrder's
+    // return expression and the cleanup finally runs after it - so the counters
+    // lag the store by a cleanup. Wait for dispatch to be empty before reading
+    // them, or `started` is short by however many are still tidying up.
+    await waitFor('dispatch to finish accounting', () => dispatch.inFlightCount() === 0);
+
+    for (const o of made) {
+      const rec = orders.get(root, o.id);
+      assert.strictEqual(rec.status, 'failed');
+      assert.strictEqual(rec.exitCode, 4);
+      assert.ok(rec.startedAt, 'the order never recorded a start, so this proves nothing');
+    }
+    assert.strictEqual(scheduler.stats().failedToStart, 0,
+      'four ordinary red builds were counted as a project that cannot start orders');
+    assert.strictEqual(scheduler.stats().pausedProjects, 0,
+      'the project was paused for running the agents it was asked to run');
+    assert.strictEqual(scheduler.stats().started, 4);
+  } finally {
+    await drain();
+  }
+});
+
+test('one order that starts clears a run of failures to start', async () => {
+  // Mutant: a started order no longer resets the breaker's counter.
+  //
+  // Without the reset the count is cumulative rather than CONSECUTIVE, so a
+  // project that fails twice, works, then fails twice more is paused despite
+  // never having been broken three times running - and since only a start
+  // clears it, that pause outlives the fault entirely.
+  //
+  // SABOTAGED PER ORDER, not globally, and that is the whole fixture. An
+  // earlier version flipped one shared fault on and off while the loop ran, and
+  // it flaked 2 runs in 6 under concurrent pairs: the interval landed between
+  // observing the second failure and clearing the fault, so a third failure in
+  // a row armed the pause and the test hung on a state it had ruled out. There
+  // is nothing to race here - which order fails is decided before start().
+  //
+  // worktrees.prepare refuses a dest that already exists and is not empty,
+  // because its contents may be the only copy of a crashed agent's work. That
+  // makes a per-order never-ran failure available without touching the repo.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), concurrency: 1 });
+  const made = ['a', 'b', 'c', 'd', 'e'].map((p) =>
+    orders.create(root, { projectId: project.id, prompt: p }));
+  // Oldest first at concurrency 1, so this is the sequence: fail, fail, START,
+  // fail, fail. Four failures, never three consecutively.
+  for (const i of [0, 1, 3, 4]) {
+    const dest = path.join(root, 'worktrees', made[i].id);
+    fs.mkdirSync(dest, { recursive: true });
+    fs.writeFileSync(path.join(dest, 'left-behind.txt'), 'a previous run crashed here\n');
+  }
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    await waitFor('all five to settle', () =>
+      made.every((o) => orders.SETTLED.has(orders.get(root, o.id).status)));
+    await waitFor('dispatch to finish accounting', () => dispatch.inFlightCount() === 0);
+
+    assert.strictEqual(orders.get(root, made[2].id).status, 'succeeded',
+      'the middle order did not run, so nothing ever cleared the count');
+    for (const i of [0, 1, 3, 4]) {
+      assert.strictEqual(orders.get(root, made[i].id).status, 'failed');
+      assert.strictEqual(orders.get(root, made[i].id).startedAt, null);
+    }
+    assert.strictEqual(scheduler.stats().failedToStart, 4);
+    assert.strictEqual(scheduler.stats().started, 1);
+    assert.strictEqual(scheduler.stats().pausedProjects, 0,
+      'four failures with a success in the middle paused a project that was '
+      + 'never broken three times in a row');
   } finally {
     await drain();
   }
