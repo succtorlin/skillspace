@@ -183,10 +183,12 @@ test('a goal persisted as `running` is demoted to `planned` on boot', () => {
   // The old value is on disk in every store that ran plan 2b, which wrote
   // `running` at plan-persist time for what is now `planned`. reconcile() is
   // the migration: it is the boot path, it already walks every goal and already
-  // writes, and on boot NOTHING is in flight - lib/orders settled this goal's
-  // orders to `interrupted` a moment earlier. So a 2b record and a 2c record
-  // whose agents really did die need the SAME correction, and no flag has to
-  // tell them apart. It runs once per store rather than on every read forever.
+  // writes, and after a restart no `running` claim can be honoured. Not because
+  // nothing is executing - agents are detached and one can outlive the process -
+  // but because nothing that could observe, record or reap it survived. So a 2b
+  // record and a 2c record whose agents really did die need the SAME
+  // correction, and no flag has to tell them apart. It runs once per store
+  // rather than on every read forever.
   const root = tmpRoot();
   const g = goals.create(root, { projectId: 'p', text: 'x' });
   const file = path.join(root, 'goals', `${g.id}.json`);
@@ -198,8 +200,8 @@ test('a goal persisted as `running` is demoted to `planned` on boot', () => {
   assert.deepStrictEqual(goals.get(root, g.id).orderIds, ['ord-a'], 'the plan did not survive the demotion');
   assert.strictEqual(goals.get(root, g.id).finishedAt, null, 'a demotion is not a finish');
   // On disk, which is the whole point: the next reader sees it without help.
-  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.strictEqual(after.status, 'planned', 'the demotion was returned but never written');
+  const reread = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(reread.status, 'planned', 'the demotion was returned but never written');
 });
 
 test('markRunning is observable: nothing between the write and the read collapses it', () => {

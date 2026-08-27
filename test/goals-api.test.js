@@ -753,9 +753,11 @@ test('goals still planning are reconciled to failed on boot', async () => {
     const raw = JSON.parse(fs.readFileSync(path.join(home, 'goals', id + '.json'), 'utf8'));
     assert.strictEqual(raw.status, 'failed');
 
-    // This is the plan-2b migration running through the real boot path: the
-    // record was seeded exactly as 2b's planned() wrote it, and one boot is
-    // what corrects the whole store.
+    // The plan-2b migration running through the real boot path. The STATUS is
+    // what this exercises: seedGoal leaves orderIds empty, which 2b's planned()
+    // would itself have refused, so this is not a faithful 2b record - the
+    // realistic shape is covered by the unit test in test/goals.test.js. What
+    // it does prove is that one real boot corrects the store.
     const other = await json('GET', '/api/goals/' + demoted, undefined, s.base);
     assert.strictEqual(other.body.goal.status, 'planned',
       'a stale `running` goal survived a boot still claiming an agent');

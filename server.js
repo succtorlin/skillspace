@@ -1146,10 +1146,15 @@ try {
   console.warn('[server] could not reconcile orders:', e.message);
 }
 
-// And any goal still marked planning lost the PM that was decomposing it. Only
-// `planning` is orphaned by a restart: a `running` goal's orders are reconciled
-// individually above, and nothing here can say whether the goal as a whole
-// finished - so lib/goals deliberately leaves those alone.
+// And any goal still marked planning lost the PM that was decomposing it, while
+// any goal still marked running lost everything that could observe the agents
+// its claim rested on. The two are corrected differently: `planning` is FAILED,
+// `running` is DEMOTED to `planned` - its orders are reconciled individually
+// above, and nothing here can say whether the goal as a whole finished, so the
+// goal keeps its plan rather than being judged.
+//
+// Only the failures are counted, so this can legitimately print nothing on a
+// boot that corrected a great many goals. lib/goals says why.
 try {
   const n = goals.reconcile(SKILLSPACE_HOME);
   if (n) console.log(`  reconciled ${n} interrupted goal(s)`);
