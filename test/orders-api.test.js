@@ -1166,3 +1166,53 @@ test('dispatching an order twice tells the second caller it was refused', async 
   // this file shares this server.
   await json('POST', `/api/orders/${id}/cancel`);
 });
+
+test('a double dispatch is refused as already dispatched, not blamed on the ceiling', async () => {
+  // ORDERING, not the refusal itself. isClaimed sits BEFORE the project-busy
+  // and capacity gates, matching runOrder's own precedence - lib/dispatch.js:
+  // "After the duplicate check, so re-dispatching one order still says 'already
+  // dispatched' rather than blaming the project." Moved below them, this route
+  // answers 429 for an order whose only problem is that it is already running,
+  // and the caller retries forever against a ceiling that was never the issue.
+  //
+  // A GIT project at a ceiling of one is the fixture that can tell the two
+  // apart. Git skips the project-busy gate entirely, so capacity is the only
+  // rival gate; and `worktree add` is what holds the record at `queued` long
+  // enough for the second request to land inside the claim window. On a DIR
+  // project this cannot be tested at all - prepare returns with no I/O, so the
+  // record reads `running` and the status check answers before isClaimed is
+  // ever consulted. That half of the ordering is unpinned; see Known limits.
+  const home = tmp('skillspace-claimorder-');
+  const { child: kid, base: b } = await startServer(home, { SKILLSPACE_MAX_RUNS: '1' });
+  try {
+    const project = await makeGitProject(b);
+    assert.strictEqual(project.kind, 'git', 'a dir project would answer project-busy first');
+    const id = seedOrder(home, 'queued', {
+      projectId: project.id, prompt: `${SLOW_MARK} claimed before the ceiling`,
+    });
+
+    const [a, c] = await Promise.all([
+      json('POST', `/api/orders/${id}/dispatch`, undefined, b),
+      json('POST', `/api/orders/${id}/dispatch`, undefined, b),
+    ]);
+    assert.deepStrictEqual([a.status, c.status].sort(), [200, 409],
+      `both callers got ${[a.status, c.status]}`);
+    const refused = a.status === 409 ? a : c;
+    assert.match(refused.body.error, /already being dispatched/,
+      'the second caller was blamed for something other than the duplicate');
+
+    // VACUOUS-PASS GUARD, and the whole point of the ceiling of one: prove the
+    // capacity gate really would have fired. A DIFFERENT order on a DIFFERENT
+    // project gets the 429 - so the 409 above was a choice of precedence, not
+    // an absence of anything to compete with.
+    const other = await makeGitProject(b);
+    const otherId = seedOrder(home, 'queued', { projectId: other.id, prompt: 'x' });
+    const full = await json('POST', `/api/orders/${otherId}/dispatch`, undefined, b);
+    assert.strictEqual(full.status, 429,
+      `the ceiling was not actually full, so the 409 proved nothing: ${JSON.stringify(full.body)}`);
+
+    await json('POST', `/api/orders/${id}/cancel`, undefined, b);
+  } finally {
+    await stopServer(kid);
+  }
+});

@@ -62,6 +62,16 @@ const {
 //   callers and nothing else. A caller reaching runOrder directly - the
 //   scheduler's shape - is still refused inside runOrder, which is where the
 //   actual protection has always lived.
+// - THE isClaimed GATE'S PRECEDENCE OVER PROJECT-BUSY IS UNPINNED. It sits
+//   before both rival gates so a re-dispatch is not blamed on the project or
+//   the ceiling, matching runOrder's own ordering. The CEILING half is pinned
+//   ("a double dispatch is refused as already dispatched, not blamed on the
+//   ceiling"). The PROJECT-BUSY half cannot be tested through HTTP: it needs a
+//   dir project, and a dir project's worktrees.prepare returns with no I/O, so
+//   the record already reads `running` by the time a second request lands and
+//   the status check answers before isClaimed is consulted. Moving isClaimed
+//   below project-busy only would therefore pass every test here. Whoever
+//   writes the scheduler exercises this path directly and can pin it there.
 
 // The GLOBAL ceiling on concurrent agents is one predicate, set on dispatch at
 // boot in server.js and spanning both pools - this route's orders and

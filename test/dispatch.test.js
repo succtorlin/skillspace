@@ -726,12 +726,12 @@ test('isClaimed reports whether an id holds a slot right now', async () => {
 
 test('isClaimed is false for an id that does not exist', () => {
   assert.strictEqual(dispatch.isClaimed('ord-nope'), false);
-  // The typeof guard these two exercise is NOT what makes them pass - a Map
-  // keyed by string ids has no null or undefined key either way, so dropping
-  // the guard leaves them green. That mutant is equivalent for the map's
-  // CONTENTS, and it is argued in lib/dispatch.js rather than chased with a
-  // test that cannot tell the two apart. What these pin is the RETURN TYPE: a
-  // caller must get false, never undefined, for a junk id.
+  // These two pin the BOUNDARY ANSWER and nothing more: isClaimed is exported,
+  // a scheduler may hand it whatever it is holding, and a junk id must come
+  // back false rather than throw. Nothing in isClaimed stands behind that -
+  // Map.has already answers false for any key it never saw, of any type - so
+  // there is no guard here to credit for it, and no mutant these can kill. Said
+  // plainly because the opposite was written here first.
   assert.strictEqual(dispatch.isClaimed(null), false);
   assert.strictEqual(dispatch.isClaimed(undefined), false);
 });
