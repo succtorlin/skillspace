@@ -413,3 +413,16 @@ test('arraySpans finds balanced top-level spans and nothing else', () => {
   assert.deepStrictEqual(pm.arraySpans('[1 unclosed'), []);
   assert.deepStrictEqual(pm.arraySpans(''), []);
 });
+
+test('extractPlan does NOT strip ANSI - that is plan.js\'s job, and only its job', () => {
+  // The split is deliberate and both halves need pinning. Without this, pm.js
+  // could start stripping, after which removing lib/plan's stripAnsi leaves
+  // every test green while goal.rawPlan silently carries escape codes - the
+  // evidence a human reads when a plan goes wrong. If this test ever fails,
+  // the fix is to decide which layer owns stripping, not to make both do it.
+  const coloured = '\u001B[32mHere is the plan:\u001B[0m\n'
+    + '[{"title":"one","prompt":"do one","acceptance":"a"}]';
+  const { orders, error } = pm.extractPlan(coloured);
+  assert.strictEqual(orders, null);
+  assert.match(error, /no JSON plan/, 'pm.js has started stripping ANSI itself');
+});

@@ -410,3 +410,87 @@ test('a grandchild that ignores SIGTERM is escalated to SIGKILL on timeout', asy
   assert.strictEqual(countByToken(trapper.token), before,
     'a grandchild that ignored SIGTERM was never escalated to SIGKILL');
 });
+
+test('a character split across two pipe reads is not corrupted', async () => {
+  // A pipe read ends wherever 64KB lands. Decoding each Buffer independently
+  // turns the two halves of one character into replacement characters, and it
+  // fails silently: U+FFFD is legal in JSON, so a plan carrying one still
+  // parses and the corrupted text reaches a persisted order prompt. The same
+  // bug was fixed on the HTTP body path in server.js; this is the runner's.
+  const dir = tmpDir('skillspace-mb-');
+  const shim = path.join(dir, 'shim.js');
+  const HEAD = 'PREFIX:';
+  // First byte of U+4F60 at offset 65535, so its three bytes straddle 65536.
+  fs.writeFileSync(shim,
+    `const pad = 'a'.repeat(65535 - ${Buffer.byteLength(HEAD)});\n`
+    + `process.stdout.write(${JSON.stringify(HEAD)} + pad + '\\u4f60\\u597d' + ':SUFFIX');\n`);
+  const agent = shimAgent(`#!/bin/sh\nexec node ${shim}\n`);
+
+  let seen = '';
+  const logFile = path.join(dir, 'run.log');
+  const result = await runner.run({
+    agent, prompt: 'x', cwd: dir, logFile, timeoutMs: 30000,
+    env: { ...process.env }, onChunk: (c) => { seen += c; },
+  });
+
+  assert.strictEqual(result.exitCode, 0);
+  assert.ok(!seen.includes('�'), 'onChunk carried replacement characters');
+  assert.match(seen, /a你好:SUFFIX$/, 'the split character was not rejoined');
+  // The log is the durable record and takes the same decoded text.
+  const logged = fs.readFileSync(logFile, 'utf8');
+  assert.ok(!logged.includes('�'), 'the log file carried replacement characters');
+  assert.match(logged, /a你好:SUFFIX/);
+});
+
+test('bytes still held by the decoder when a child dies are not dropped', async () => {
+  // A child killed mid-character leaves an incomplete sequence in the decoder.
+  // Dropping it loses real output; flushing renders it as U+FFFD, which is the
+  // honest reading of bytes that are genuinely not a character.
+  const dir = tmpDir('skillspace-mb-');
+  const shim = path.join(dir, 'shim.js');
+  // Write a lone lead byte of a 3-byte sequence, then exit.
+  fs.writeFileSync(shim, "process.stdout.write(Buffer.from([0x41, 0x42, 0xE4]));\n");
+  const agent = shimAgent(`#!/bin/sh\nexec node ${shim}\n`);
+
+  let seen = '';
+  const result = await runner.run({
+    agent, prompt: 'x', cwd: dir, logFile: path.join(dir, 'run.log'), timeoutMs: 30000,
+    env: { ...process.env }, onChunk: (c) => { seen += c; },
+  });
+
+  assert.strictEqual(result.exitCode, 0);
+  assert.strictEqual(seen, 'AB�', 'the truncated trailing byte was dropped instead of flushed');
+});
+
+test('stdout and stderr are decoded independently', async () => {
+  // They are separate byte streams. A character split across two stdout reads
+  // must be rejoined with the NEXT STDOUT read - not with whatever stderr
+  // happened to say in between, which one shared decoder would splice into the
+  // middle of it. Agent CLIs write progress to stderr while writing content to
+  // stdout, so the interleaving is the normal case.
+  const dir = tmpDir('skillspace-mb-');
+  const shim = path.join(dir, 'shim.js');
+  fs.writeFileSync(shim, [
+    "process.stdout.write(Buffer.from([0x41]));",              // 'A'
+    "process.stdout.write(Buffer.from([0xE4, 0xBD]));",        // first 2 of 3 bytes of U+4F60
+    "setTimeout(() => {",
+    "  process.stderr.write('ERR');",                           // arrives mid-character
+    "  setTimeout(() => {",
+    "    process.stdout.write(Buffer.from([0xA0]));",           // completes U+4F60
+    "    process.stdout.write('!');",
+    "  }, 120);",
+    "}, 120);",
+  ].join('\n'));
+  const agent = shimAgent(`#!/bin/sh\nexec node ${shim}\n`);
+
+  let seen = '';
+  const result = await runner.run({
+    agent, prompt: 'x', cwd: dir, logFile: path.join(dir, 'run.log'), timeoutMs: 30000,
+    env: { ...process.env }, onChunk: (c) => { seen += c; },
+  });
+
+  assert.strictEqual(result.exitCode, 0);
+  assert.ok(!seen.includes('�'), `a shared decoder spliced the streams: ${JSON.stringify(seen)}`);
+  assert.ok(seen.includes('你'), 'the stdout character was not rejoined across the stderr write');
+  assert.ok(seen.includes('ERR'), 'the stderr text was lost');
+});

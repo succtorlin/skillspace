@@ -10,6 +10,7 @@ const plan = require('../lib/plan');
 const goals = require('../lib/goals');
 const orders = require('../lib/orders');
 const projects = require('../lib/projects');
+const dispatch = require('../lib/dispatch');
 
 const created = [];
 function tmpDir(prefix) {
@@ -160,7 +161,9 @@ test('a plan over maxOrdersPerGoal fails the goal whole and dispatches nothing',
   });
 
   assert.strictEqual(result.status, 'failed');
-  assert.match(result.error, /30.*12|too many/);
+  // Was /30.*12|too many/. "too many" appears nowhere in the code, and a dead
+  // alternative only weakens the assertion.
+  assert.match(result.error, /30 orders, over the limit of 12/);
   assert.match(result.rawPlan, /title/, 'the plan must be retained so it can be narrowed');
   assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
 });
@@ -370,6 +373,39 @@ test('an order created but not yet attached is still rolled back', async () => {
   }
 });
 
+test('a rollback that cannot cancel says so on the goal', async () => {
+  // If the store is refusing writes, the rollback leaves orders `queued` with a
+  // goalId pointing at a goal about to be marked failed - the exact invisible
+  // work the rollback exists to prevent. The goal's error is the only place a
+  // human would ever see it, so an empty catch there is a silent data problem.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const realCreate = orders.create;
+  const realCancel = orders.markCancelled;
+  let n = 0;
+  orders.create = (...a) => {
+    if (++n === 2) throw new Error('prompt is too long (100001 > 100000)');
+    return realCreate(...a);
+  };
+  orders.markCancelled = () => { throw new Error('EROFS: read-only file system'); };
+  try {
+    const result = await plan.decompose(root, {
+      goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /could not persist the plan/);
+    assert.match(
+      result.error, /1 order\(s\) could not be cancelled and are still queued/,
+      'the rollback failed silently and the goal says nothing about it'
+    );
+  } finally {
+    orders.create = realCreate;
+    orders.markCancelled = realCancel;
+  }
+});
+
 test('a caller-supplied onChunk still receives the output', async () => {
   // Capturing internally must not steal the stream plan 3's live log needs.
   const root = tmpDir('skillspace-home-');
@@ -509,6 +545,215 @@ test('the PM is asked not to colour its output', async () => {
   assert.strictEqual(fs.readFileSync(out, 'utf8').trim(), 'NO_COLOR=1 TERM=dumb');
 });
 
+test('two concurrent goals on one dir project do not both run in it', async () => {
+  // worktrees.prepare states this in the imperative and names the incident:
+  // "a caller that skips that check gets two agents in the user's own tree,
+  // which is what happened while this comment claimed the caller already
+  // handled it." A dir project has no isolation mechanism at all.
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');
+  const project = projects.create(root, { path: work });
+  assert.strictEqual(project.kind, 'dir');
+  const marks = path.join(root, 'concurrent.txt');
+  // Records its own entry and exit, so overlap is visible in the file order.
+  const agent = shimAgent(
+    `#!/bin/sh\necho in >> "${marks}"\nsleep 1\necho out >> "${marks}"\n`
+    + `${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+  const g1 = goals.create(root, { projectId: project.id, text: 'one' });
+  const g2 = goals.create(root, { projectId: project.id, text: 'two' });
+
+  const [r1, r2] = await Promise.all([
+    plan.decompose(root, { goal: g1, project, agent, childEnv: testEnv }),
+    plan.decompose(root, { goal: g2, project, agent, childEnv: testEnv }),
+  ]);
+
+  const statuses = [r1.status, r2.status].sort();
+  assert.deepStrictEqual(statuses, ['failed', 'running'], 'both PMs ran in the user\'s directory');
+  const refused = r1.status === 'failed' ? r1 : r2;
+  assert.match(refused.error, /project busy/);
+  // The interleaving is the property, not the count: "in in out out" is two
+  // agents in one directory at one moment.
+  assert.deepStrictEqual(fs.readFileSync(marks, 'utf8').trim().split('\n'), ['in', 'out']);
+});
+
+test('a dispatched order and a PM cannot both run in one dir project', async () => {
+  // One pool, not two: lib/plan claims from dispatch's registry, so each spawn
+  // path can see the other. A second registry would have left this exact gap.
+  const root = tmpDir('skillspace-home-');
+  const work = tmpDir('skillspace-work-');
+  const project = projects.create(root, { path: work });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  // Stand in for a dispatched order holding the claim.
+  dispatch.claimProject('ord-standin', project.id);
+  try {
+    const result = await plan.decompose(root, {
+      goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+    });
+    assert.strictEqual(result.status, 'failed');
+    assert.match(result.error, /project busy/);
+  } finally {
+    dispatch.releaseProject('ord-standin');
+  }
+  // And the claim is released again, so the next goal is not locked out.
+  const g2 = goals.create(root, { projectId: project.id, text: 'y' });
+  const ok = await plan.decompose(root, {
+    goal: g2, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+  assert.strictEqual(ok.status, 'running', 'the PM claim leaked and locked the project');
+  assert.strictEqual(dispatch.projectBusy(project.id), false, 'the claim was never released');
+});
+
+test('a running PM is visible to shutdown and can be cancelled', async () => {
+  // The fourth spawn path. Agents run detached, so a signal to the server's
+  // group never reaches them, and the timeout that bounds them is a setTimeout
+  // in the server process that dies with it. A PM missing from the registry is
+  // a credentialed agent reparented to init with no bound at all.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const started = path.join(root, 'pm-started.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${started}"\nsleep 60\n`);
+
+  assert.strictEqual(plan.inFlightCount(), 0);
+  const running = plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+
+  // Wait for the child to actually exist before asserting on the pool.
+  for (let i = 0; i < 200 && !fs.existsSync(started); i++) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(fs.existsSync(started), 'the PM never started');
+  assert.strictEqual(plan.inFlightCount(), 1, 'a live PM is invisible to shutdown');
+
+  assert.strictEqual(plan.cancelAll(), 1, 'cancelAll did not reach the PM');
+  const result = await running;
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /cancelled/);
+  // Counted to zero only once the goal is on disk, so a shutdown drain waiting
+  // on this waits for the record, not merely for the child to exit.
+  assert.strictEqual(plan.inFlightCount(), 0);
+});
+
+test('a goal that vanished mid-run persists no orders and returns null', async () => {
+  // store.js quarantines a record it cannot parse, and a delete route is the
+  // obvious next thing to exist. Fifteen minutes pass inside a real run.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(
+    `#!/bin/sh\nrm -f "${path.join(root, 'goals', `${'$'}{0##*/}`)}"\n`
+    + `${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+  // Delete it out from under the run, which is what a quarantine does.
+  const gone = shimAgent(
+    `#!/bin/sh\nrm -f "${path.join(root, 'goals', goal.id + '.json')}"\n`
+    + `${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+  void agent;
+
+  const result = await plan.decompose(root, { goal, project, agent: gone, childEnv: testEnv });
+
+  assert.strictEqual(result, null, 'a caller doing result.status here gets a TypeError');
+  assert.strictEqual(
+    orders.list(root, { projectId: project.id }).length, 0,
+    'orders were attached to a goal that no longer exists'
+  );
+});
+
+test('a goal settled mid-run is not overwritten and gains no orders', async () => {
+  // goals.patch silently no-ops on a settled record, so goals.planned would
+  // report success while writing nothing - leaving queued orders carrying the
+  // goalId of a goal that already failed.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const agent = shimAgent(
+    `#!/bin/sh\nsleep 0.2\n${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+
+  const running = plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+  await new Promise((r) => setTimeout(r, 60));
+  goals.failPlanning(root, goal.id, 'cancelled by the human', null);
+
+  const result = await running;
+
+  assert.strictEqual(result.status, 'failed', 'a settled goal was reported as planned');
+  assert.strictEqual(result.error, 'cancelled by the human', 'the settled record was overwritten');
+  assert.strictEqual(
+    orders.list(root, { projectId: project.id }).length, 0,
+    'orders were persisted for a goal that had already settled'
+  );
+});
+
+test('a PM whose log cannot be opened fails the goal instead of rejecting', async () => {
+  // runner.start throws SYNCHRONOUSLY on an unwritable log directory. dispatch
+  // catches exactly this. Without it the goal is left `planning`, which only
+  // reconcile() at the next boot clears.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  // A FILE where the logs directory has to go.
+  fs.writeFileSync(path.join(root, 'logs'), 'not a directory');
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
+  });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /pm could not start/);
+  assert.strictEqual(goals.get(root, goal.id).status, 'failed', 'the goal was left in planning');
+});
+
+test('a childEnv that throws fails the goal instead of rejecting', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+
+  const result = await plan.decompose(root, {
+    goal, project, agent: shimAgent(PLAN_OK),
+    childEnv: () => { throw new Error('no credentials configured'); },
+  });
+
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /pm could not start: no credentials configured/);
+});
+
+test('a clean PM run leaves no branch behind; one that wrote files keeps it', async () => {
+  // worktrees.cleanup keeps the branch unconditionally, which is right for an
+  // order - the branch IS its durable record. A PM's record is the plan on
+  // stdout, so a branch per goal is pollution. Unless the PM disobeyed "do NOT
+  // modify any files", in which case the branch is the evidence.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const branches = () => execSync('git branch --list "skillspace/*"', { cwd: repo, encoding: 'utf8' })
+    .split('\n').map((l) => l.replace(/^[* ]+/, '').trim()).filter(Boolean);
+
+  for (let i = 0; i < 3; i++) {
+    const g = goals.create(root, { projectId: project.id, text: `clean ${i}` });
+    const r = await plan.decompose(root, { goal: g, project, agent: shimAgent(PLAN_OK), childEnv: testEnv });
+    assert.strictEqual(r.status, 'running');
+  }
+  assert.deepStrictEqual(branches(), [], 'a branch per goal accumulated in the user\'s repo');
+
+  const dirty = goals.create(root, { projectId: project.id, text: 'writes a file' });
+  const writer = shimAgent(
+    `#!/bin/sh\necho meddled > meddled.txt\n${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+  const r = await plan.decompose(root, { goal: dirty, project, agent: writer, childEnv: testEnv });
+  assert.strictEqual(r.status, 'running');
+  assert.deepStrictEqual(
+    branches(), [`skillspace/${dirty.id}`],
+    'the PM modified files and the evidence was deleted'
+  );
+});
+
 test('a dir project plans in place and its files survive', async () => {
   const root = tmpDir('skillspace-home-');
   const work = tmpDir('skillspace-work-');
@@ -517,10 +762,19 @@ test('a dir project plans in place and its files survive', async () => {
   assert.strictEqual(project.kind, 'dir');
   const goal = goals.create(root, { projectId: project.id, text: 'x' });
 
-  const result = await plan.decompose(root, {
-    goal, project, agent: shimAgent(PLAN_OK), childEnv: testEnv,
-  });
+  const cwdFile = path.join(root, 'pm-cwd.txt');
+  const agent = shimAgent(
+    `#!/bin/sh\npwd > "${cwdFile}"\n${PLAN_OK.split('\n').slice(1).join('\n')}`
+  );
+
+  const result = await plan.decompose(root, { goal, project, agent, childEnv: testEnv });
 
   assert.strictEqual(result.status, 'running');
+  // "in place" was the name of this test and the one thing it never checked:
+  // both assertions below hold just as well if the PM ran in a worktree.
+  assert.strictEqual(
+    fs.readFileSync(cwdFile, 'utf8').trim(), fs.realpathSync(work),
+    'a dir project has no isolation mechanism; the PM must run in the directory itself'
+  );
   assert.ok(fs.existsSync(path.join(work, 'keep.txt')), 'a dir project must never be cleaned up');
 });

@@ -13,6 +13,7 @@ const { URL } = require('url');
 // shutdown path only; the routes that use them live in routes/.
 const orders = require('./lib/orders');
 const dispatch = require('./lib/dispatch');
+const plan = require('./lib/plan');
 // For reap() only. It carries the pid guard this file's own inline version
 // lacked: when spawn fails asynchronously the handle's pid is undefined, so
 // -pid is NaN, process.kill throws, and the fallback child.kill() reaches a
@@ -334,7 +335,12 @@ const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
 // through here. RUNNING holds this route's SSE children, which shutdown reaps
 // directly; dispatch owns the orders' claims because it owns the release.
 function agentsRunning() {
-  return RUNNING.size + dispatch.inFlightCount();
+  // Three pools, because there are three spawn paths: /api/run's SSE children,
+  // dispatch's orders, and lib/plan's PMs. A PM is an agent - it holds a slot
+  // in the ceiling and it holds the shutdown drain open until its goal is
+  // written. Leaving it out of this count was how the fourth spawn path would
+  // have escaped shutdown the way the third one did.
+  return RUNNING.size + dispatch.inFlightCount() + plan.inFlightCount();
 }
 
 // ONE ceiling, written once and asked in three places: /api/run's gate, the
@@ -1143,7 +1149,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     if (shuttingDown) process.exit(130);   // a second ^C means "now"
     shuttingDown = true;
-    const n = dispatch.cancelAll() + reapRunning('SIGTERM');
+    const n = dispatch.cancelAll() + reapRunning('SIGTERM') + plan.cancelAll();
     if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
     // Exit once the socket is closed AND every cancelled order has recorded
     // its outcome.
