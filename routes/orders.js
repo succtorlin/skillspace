@@ -50,16 +50,18 @@ const {
 //   record vanishes while agents are still running against its path, and the
 //   orders keep a projectId that no longer resolves. POST /:id/dispatch answers
 //   409 for one of those rather than 500ing, which is containment, not a fix.
-// - A DOUBLE-DISPATCH INSIDE THE CLAIM WINDOW ANSWERS 200 TWICE. The status
-//   check below refuses anything not `queued`, and runOrder marks the record
-//   running only after `worktree add` - tens of milliseconds on a git project -
-//   so two POSTs inside that window both read `queued` and both pass. The order
-//   is NOT run twice: runOrder's own `already dispatched` refusal catches the
-//   second, and this route logs it. But the second caller is told 200. Closing
-//   it needs dispatch to export whether an id is claimed - inFlight is private,
-//   and projectBusy cannot stand in for it because it is true for every git
-//   order on the project and would serialise the isolated case the guard exists
-//   not to touch. It belongs with whoever next opens lib/dispatch.js.
+// - A DOUBLE-DISPATCH INSIDE THE CLAIM WINDOW ANSWERED 200 TWICE. FIXED, and
+//   left here because the remaining half is still a limit. The status check
+//   below refuses anything not `queued`, and runOrder marks the record running
+//   only after `worktree add` - tens of milliseconds on a git project - so two
+//   POSTs inside that window both read `queued` and both used to pass. The
+//   order was never run twice; the second caller was simply told it had.
+//   dispatch.isClaimed() now answers that, and the dispatch route 409s on it.
+//   WHAT REMAINS: it is not a lock. It holds only because there is no await
+//   between that check and runOrder's synchronous claim, so it covers HTTP
+//   callers and nothing else. A caller reaching runOrder directly - the
+//   scheduler's shape - is still refused inside runOrder, which is where the
+//   actual protection has always lived.
 
 // The GLOBAL ceiling on concurrent agents is one predicate, set on dispatch at
 // boot in server.js and spanning both pools - this route's orders and
@@ -330,6 +332,27 @@ module.exports = (deps) => {
         return true;
       }
 
+      // runOrder refuses a second dispatch itself, but it does so inside a
+      // promise this route does not await - so the second caller used to get a
+      // 200 for work that never ran. The status check above cannot catch it:
+      // the record still reads `queued` until runOrder marks it running, which
+      // is after `worktree add`.
+      //
+      // NOT A LOCK, and nothing here serialises anything. It closes the window
+      // for HTTP callers only, and only because there is no await between this
+      // line and runOrder's synchronous claim below - the two are atomic with
+      // respect to another request on this same event loop, which is the only
+      // kind there is. A caller reaching runOrder any other way is still
+      // refused there, not here.
+      //
+      // BEFORE the project-busy and capacity gates, matching runOrder's own
+      // ordering, so a re-dispatch says it is already dispatched rather than
+      // blaming the project or the ceiling for it.
+      if (dispatch.isClaimed(id)) {
+        sendJson(res, 409, { error: 'order is already being dispatched' });
+        return true;
+      }
+
       if (project.kind !== 'git' && dispatch.projectBusy(project.id)) {
         sendJson(res, 409, {
           error: '该项目已有任务在运行（未隔离的目录一次只能跑一个）',
@@ -352,9 +375,11 @@ module.exports = (deps) => {
         .runOrder(root, { order: existing, project, agent: picked.agent, childEnv })
         .then((r) => {
           // runOrder REFUSES by resolving with { refused }, it does not throw.
-          // The status check above catches every refusal a caller can observe
-          // except one - see the known limit on double-dispatch - and this is
-          // the only place that window leaves a trace.
+          // The gates above now answer every refusal a caller can observe -
+          // isClaimed for a double dispatch, the status check for the rest - so
+          // reaching here means runOrder refused something this route thought
+          // was fine, and the log is the only trace that would otherwise exist.
+          // Still worth keeping: the gates are advisory, runOrder is authority.
           if (r && r.refused) {
             console.warn('[server] order %s was not dispatched: %s', id, r.refused);
           }

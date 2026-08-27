@@ -698,3 +698,40 @@ test('a caller that never asks about capacity is refused by runOrder itself', as
   });
   assert.strictEqual(ok.status, 'succeeded', JSON.stringify(ok));
 });
+
+test('isClaimed reports whether an id holds a slot right now', async () => {
+  // The scheduler needs to know "is THIS order already in flight" without
+  // asking projectBusy, which is true for every git order on the project and
+  // would therefore refuse orders that are perfectly safe to run.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const order = orders.create(root, { projectId: project.id, prompt: 'x' });
+
+  assert.strictEqual(dispatch.isClaimed(order.id), false, 'not claimed before dispatch');
+  // A FAST agent, deliberately. The claim is asserted on the line after the
+  // call with no await between them, so "the claim is synchronous" is pinned by
+  // construction rather than by a sleep long enough to have caught it - and the
+  // release is then observed on a normal settle, which is the general case. An
+  // earlier draft used the SLOW shim and cancelled: dispatch.cancel cannot
+  // reach an order that has no handle yet, so it would have returned false and
+  // left `await running` waiting out the full sleep.
+  const running = dispatch.runOrder(root, {
+    order, project, agent: shimAgent(OK), childEnv: testEnv,
+  });
+  assert.strictEqual(dispatch.isClaimed(order.id), true, 'the claim is synchronous');
+  await running;
+  assert.strictEqual(dispatch.isClaimed(order.id), false, 'released when it settles');
+});
+
+test('isClaimed is false for an id that does not exist', () => {
+  assert.strictEqual(dispatch.isClaimed('ord-nope'), false);
+  // The typeof guard these two exercise is NOT what makes them pass - a Map
+  // keyed by string ids has no null or undefined key either way, so dropping
+  // the guard leaves them green. That mutant is equivalent for the map's
+  // CONTENTS, and it is argued in lib/dispatch.js rather than chased with a
+  // test that cannot tell the two apart. What these pin is the RETURN TYPE: a
+  // caller must get false, never undefined, for a junk id.
+  assert.strictEqual(dispatch.isClaimed(null), false);
+  assert.strictEqual(dispatch.isClaimed(undefined), false);
+});

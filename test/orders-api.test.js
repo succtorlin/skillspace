@@ -1123,3 +1123,46 @@ test('a route factory refuses to construct without every dependency it needs', a
       `omitting ${key} constructed the goals route anyway`);
   }
 });
+
+// A project on a GIT repo, over HTTP. makeProject's directory is a bare
+// mkdtemp, so kind is detected as 'dir' - and on a dir project the route's
+// project-busy guard answers a second dispatch first, with a different message
+// and for a different reason. Git is the kind with no interlock above the
+// claim, so a 409 there can only have come from the claimed-id check.
+async function makeGitProject(at) {
+  const dir = tmp('skillspace-ordergit-');
+  execSync('git init -q', { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'file.txt'), 'original\n');
+  execSync('git add -A', { cwd: dir });
+  execSync('git -c user.email=t@t -c user.name=t commit -q -m init', { cwd: dir });
+  return makeProject({ path: dir }, at);
+}
+
+test('dispatching an order twice tells the second caller it was refused', async () => {
+  // Both POSTs land inside runOrder's claim window, both read `queued`, and
+  // before this the second got a 200 while its dispatch was silently refused
+  // by runOrder's own `already dispatched` guard. The order was never run
+  // twice; the caller was just told the wrong thing.
+  const project = await makeGitProject();
+  // Vacuous-pass guard: on a dir project the project-busy guard would answer
+  // instead, and this test would pass while pinning the wrong refusal.
+  assert.strictEqual(project.kind, 'git', 'the fixture is not a git project');
+  // seedOrder, not POST /api/orders: that route creates AND dispatches, so the
+  // order would already hold the claim and BOTH of these would be refused.
+  const id = seedOrder(storeRoot, 'queued', {
+    projectId: project.id, prompt: `${SLOW_MARK} dispatched twice`,
+  });
+
+  const [a, b] = await Promise.all([
+    json('POST', `/api/orders/${id}/dispatch`),
+    json('POST', `/api/orders/${id}/dispatch`),
+  ]);
+  const codes = [a.status, b.status].sort();
+  assert.deepStrictEqual(codes, [200, 409], `both callers got ${codes}`);
+  const refused = a.status === 409 ? a : b;
+  assert.match(refused.body.error, /already/, 'the 409 must say why');
+
+  // The winner holds a slot for SLOW_SECONDS otherwise, and every later test in
+  // this file shares this server.
+  await json('POST', `/api/orders/${id}/cancel`);
+});
