@@ -792,6 +792,92 @@ test('a clean PM run leaves no branch behind; one that wrote files keeps it', as
   );
 });
 
+test('a PM cancelled before it spawns never spawns', async () => {
+  // The two-phase claim puts a NULL in the map before `await worktrees.prepare`,
+  // and cancelAll() used to skip a null handle - so inside that window the count
+  // said 1 while the cancel said 0. The drain then noticed the PM, waited its
+  // six seconds, and exited over a credentialed agent that spawned afterwards
+  // into a dying process, reparented to init with no time bound.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const started = path.join(root, 'pm-started.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${started}"\nsleep 60\n`);
+
+  const running = plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+  // setImmediate lands inside the prepare window - a rev-parse plus a
+  // `worktree add`. A wall-clock delay can only hit it by luck.
+  const cancelled = await new Promise((r) => setImmediate(() => {
+    const counted = plan.inFlightCount();
+    const n = plan.cancelAll();
+    r({ counted, n });
+  }));
+
+  assert.strictEqual(cancelled.counted, 1, 'the claim was not visible to shutdown');
+  assert.strictEqual(cancelled.n, 1, 'a claimed-but-unspawned PM was skipped by cancelAll');
+
+  const result = await running;
+  assert.strictEqual(result.status, 'failed');
+  assert.match(result.error, /cancelled before it started/);
+  assert.ok(!fs.existsSync(started), 'the PM spawned after it had been cancelled');
+  // And it takes nothing with it: the worktree and its branch are cleaned up on
+  // this return exactly as on any other.
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
+  assert.strictEqual(
+    execSync('git branch --list "skillspace/*"', { cwd: repo, encoding: 'utf8' }).trim(), ''
+  );
+  assert.strictEqual(plan.inFlightCount(), 0);
+});
+
+test('a goal settled during prepare does not spawn an agent', async () => {
+  // dispatch.runOrder re-reads its record at exactly this point - "check intent
+  // before starting an agent nothing can then stop". Measured against dispatch
+  // for the same window before this landed: an order cancelled during prepare
+  // spawned nothing, a goal failed during prepare spawned a PM anyway.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const started = path.join(root, 'pm-started.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${started}"\n${PLAN_OK.split('\n').slice(1).join('\n')}`);
+
+  const running = plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+  await new Promise((r) => setImmediate(() => {
+    goals.failPlanning(root, goal.id, 'the human changed their mind', null);
+    r();
+  }));
+  const result = await running;
+
+  assert.strictEqual(result.status, 'failed');
+  assert.strictEqual(result.error, 'the human changed their mind', 'the settled record was overwritten');
+  assert.ok(!fs.existsSync(started), 'a PM spawned for an already-settled goal');
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+  const wtRoot = path.join(root, 'worktrees');
+  assert.deepStrictEqual(fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [], []);
+});
+
+test('a goal deleted during prepare does not spawn an agent and returns null', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const goal = goals.create(root, { projectId: project.id, text: 'x' });
+  const started = path.join(root, 'pm-started.txt');
+  const agent = shimAgent(`#!/bin/sh\ntouch "${started}"\n${PLAN_OK.split('\n').slice(1).join('\n')}`);
+
+  const running = plan.decompose(root, { goal, project, agent, childEnv: testEnv });
+  await new Promise((r) => setImmediate(() => {
+    fs.rmSync(path.join(root, 'goals', `${goal.id}.json`), { force: true });
+    r();
+  }));
+  const result = await running;
+
+  assert.strictEqual(result, null, 'a caller doing result.status here gets a TypeError');
+  assert.ok(!fs.existsSync(started), 'a PM spawned for a goal that no longer exists');
+  assert.strictEqual(orders.list(root, { projectId: project.id }).length, 0);
+});
+
 test('a dir project plans in place and its files survive', async () => {
   const root = tmpDir('skillspace-home-');
   const work = tmpDir('skillspace-work-');
