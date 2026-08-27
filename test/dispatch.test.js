@@ -735,3 +735,54 @@ test('isClaimed is false for an id that does not exist', () => {
   assert.strictEqual(dispatch.isClaimed(null), false);
   assert.strictEqual(dispatch.isClaimed(undefined), false);
 });
+
+test('a duplicate dispatch is refused, never blamed on the budget and never settles the live order', async () => {
+  // ORDERING, with real damage behind it. Every gate above the duplicate check
+  // settles the record with markFailed, and orders.patch() refuses to move a
+  // SETTLED record - so a duplicate arriving while the run was live marked THAT
+  // run failed, and the agent's true outcome was discarded when it landed. The
+  // cost fell on the first dispatch rather than on the second caller. The
+  // daily-budget gate reached this on ordinary per-project config, which is the
+  // fixture below.
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const base = projects.create(root, { path: repo });
+  const project = { ...base, budget: { ...base.budget, maxOrdersPerDay: 1 } };
+
+  const first = orders.create(root, { projectId: project.id, prompt: 'the real run' });
+  const running = dispatch.runOrder(root, {
+    childEnv: testEnv, order: first, project, agent: shimAgent(SLOW),
+  });
+  await new Promise((r) => setTimeout(r, 400));
+  assert.strictEqual(orders.get(root, first.id).status, 'running',
+    'the premise is a LIVE order - nothing below means anything if it already settled');
+
+  // Pushes countToday to 2 against a cap of 1, arming the budget gate.
+  const second = orders.create(root, { projectId: project.id, prompt: 'pushes the count over' });
+
+  const dup = await dispatch.runOrder(root, {
+    childEnv: testEnv, order: first, project, agent: shimAgent(SLOW),
+  });
+  assert.strictEqual(dup.refused, 'already dispatched',
+    'the duplicate was blamed on something other than being a duplicate');
+  assert.strictEqual(orders.get(root, first.id).status, 'running',
+    'a duplicate dispatch settled an order whose agent was still alive');
+
+  // VACUOUS-PASS GUARD: the budget gate has to be genuinely armed, or the
+  // refusal above proved only that nothing was competing with it. A DIFFERENT
+  // order on this project fails on the cap, exactly as it should.
+  const blocked = await dispatch.runOrder(root, {
+    childEnv: testEnv, order: second, project, agent: shimAgent(OK),
+  });
+  assert.strictEqual(blocked.status, 'failed');
+  assert.match(orders.get(root, second.id).error, /daily limit/,
+    'the budget gate was not armed, so the precedence above was never tested');
+
+  // And the real run's outcome survives, rather than having been overwritten by
+  // a refusal that was meant for someone else.
+  assert.ok(dispatch.cancel(first.id));
+  const result = await running;
+  assert.strictEqual(result.status, 'cancelled');
+  assert.strictEqual(orders.get(root, first.id).status, 'cancelled',
+    "the live run's own outcome was discarded");
+});

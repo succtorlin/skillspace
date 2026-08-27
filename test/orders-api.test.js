@@ -1160,7 +1160,10 @@ test('dispatching an order twice tells the second caller it was refused', async 
   const codes = [a.status, b.status].sort();
   assert.deepStrictEqual(codes, [200, 409], `both callers got ${codes}`);
   const refused = a.status === 409 ? a : b;
-  assert.match(refused.body.error, /already/, 'the 409 must say why');
+  // /already being dispatched/, not /already/: the looser form is satisfied by
+  // `order is already running` from the adjacent STATUS check, which is the gate
+  // this test is trying to prove it did NOT reach.
+  assert.match(refused.body.error, /already being dispatched/, 'the 409 must say why');
 
   // The winner holds a slot for SLOW_SECONDS otherwise, and every later test in
   // this file shares this server.

@@ -60,8 +60,11 @@ const {
 //   WHAT REMAINS: it is not a lock. It holds only because there is no await
 //   between that check and runOrder's synchronous claim, so it covers HTTP
 //   callers and nothing else. A caller reaching runOrder directly - the
-//   scheduler's shape - is still refused inside runOrder, which is where the
-//   actual protection has always lived.
+//   scheduler's shape - is refused inside runOrder, which is where the actual
+//   protection lives. That refusal is now unconditional: the duplicate check is
+//   runOrder's FIRST gate, so it can no longer be pre-empted by a gate that
+//   settles the record (the daily-budget one did, marking a LIVE order failed
+//   and discarding its agent's real outcome).
 // - THE isClaimed GATE'S PRECEDENCE OVER PROJECT-BUSY IS UNPINNED. It sits
 //   before both rival gates so a re-dispatch is not blamed on the project or
 //   the ceiling, matching runOrder's own ordering. The CEILING half is pinned
