@@ -6,3 +6,82 @@
    NEVER --ground-3 under text: --muted measures 4.34:1 (dark) and 4.25:1
    (light) there, and light --accent 4.34:1 — all below AA.
    ============================================================ */
+
+/* ---------- panel anatomy: hairline + one ground step, eyebrow header ---------- */
+.bd-panel {
+  background: var(--ground-1);
+  border: 1px solid var(--hair);
+  border-radius: 14px;
+  padding: 16px;
+  min-width: 0;
+}
+.bd-eyebrow {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--face-mono); font-size: 10px; font-weight: 400;
+  letter-spacing: .22em; text-transform: uppercase; color: var(--accent);
+  margin: 0 0 12px;
+}
+.bd-eyebrow::before { content: ""; width: 14px; height: 1px; background: var(--accent); flex: none; opacity: .8; }
+
+/* ---------- bracket numeral: the .jb-num grammar, for an order's seq ----------
+   The brackets are decoration, so they carry empty alt text (`content: x / ""`)
+   where supported; the first declaration is the fallback for engines without
+   alt-text syntax. Without it VoiceOver reads ⌐ as "not sign". */
+.seq {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; font-weight: 600; color: var(--ink-2);
+}
+.seq::before { content: "⌐"; content: "⌐" / ""; opacity: .55; }
+.seq::after { content: "¬"; content: "¬" / ""; opacity: .55; }
+
+/* ---------- status dot: the .jb-dot grammar, one per state ----------
+   Never the only signal - every dot sits beside its status words. Non-text
+   contrast vs --ground-1 (1.4.11 ≥ 3:1): muted 5.36/5.18, danger 5.42/5.43,
+   ink-2 8.87/7.77, accent 11.99/5.29 (dark/light). */
+.sdot {
+  flex: none; display: inline-block; width: 8px; height: 8px;
+  border-radius: 50%; border: 1.5px solid transparent; background: transparent;
+}
+.sdot[data-state="queued"],
+.sdot[data-state="goal-planned"],
+.sdot[data-state="sched-off"],
+.sdot[data-state="sched-unknown"],
+.sdot[data-state="unknown"],
+.sdot[data-state="sched-held"] { border-color: var(--muted); }
+.sdot[data-state="running"],
+.sdot[data-state="goal-planning"],
+.sdot[data-state="goal-running"],
+.sdot[data-state="sched-working"] { background: var(--accent); animation: jb-pulse 1.2s ease-in-out infinite; }
+.sdot[data-state="succeeded"],
+.sdot[data-state="goal-done"],
+.sdot[data-state="sched-idle"] { background: var(--ink-2); }
+.sdot[data-state="failed"],
+.sdot[data-state="interrupted"],
+.sdot[data-state="goal-failed"],
+.sdot[data-state="sched-erroring"],
+.sdot[data-state="sched-stalled"] { background: var(--danger); }
+.sdot[data-state="sched-paused"],
+.sdot[data-state="sched-blocked"],
+.sdot[data-state="goal-stalled"] { border-color: var(--danger); }
+/* cancelled is a dash, not a dot: "stopped", not "failed" */
+.sdot[data-state="cancelled"] { width: 9px; height: 2px; border-radius: 1px; background: var(--muted); border: 0; }
+/* A frozen pulse is worse than none (the .jb-dot note in style.css). */
+@media (prefers-reduced-motion: reduce) {
+  .sdot { animation: none; opacity: 1; }
+}
+
+/* ---------- empty / filtered / failed / loading ---------- */
+.bd-state { padding: 32px 16px; text-align: center; color: var(--ink-2); font-size: 13px; line-height: 1.7; }
+.bd-state-title { font-family: var(--face-display); font-weight: 500; font-size: 16px; color: var(--ink); margin-bottom: 4px; }
+.bd-state .btn { margin-top: 12px; }
+.bd-skel { display: grid; gap: 8px; padding: 8px 0; }
+.bd-skel span { display: block; height: 12px; border-radius: 4px; background: var(--ground-2); }
+.bd-skel span:nth-child(2) { width: 82%; }
+.bd-skel span:nth-child(3) { width: 64%; }
+.bd-stale {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 12px; border-radius: 10px;
+  border: 1px solid var(--danger); background: var(--ground-2);
+  font-size: 12.5px; color: var(--ink);
+}
