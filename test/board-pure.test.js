@@ -695,3 +695,17 @@ test('noLogText says "it did not start" only when it did not', () => {
   assert.doesNotMatch(settled, /没有启动/);
   assert.match(settled, /日志文件/);
 });
+
+// A project registered before plan 2d has no maxAttemptsPerOrder, and the
+// server then enforces projects.DEFAULT_BUDGET's value (lib/attempts.js). The
+// panel must state that effective cap, never "no limit" - the limits panel's
+// whole job is to say what is actually enforced.
+test('budgetView shows the default attempt cap the server enforces when a project predates it', () => {
+  const projects = require('../lib/projects');
+  const legacy = { kind: 'git', concurrency: 2, budget: { maxOrdersPerGoal: 12, orderTimeoutMs: 900000, maxOrdersPerDay: 100 } };
+  const row = pure.budgetView(legacy, [], Date.now()).rows.find((r) => r.key === 'attempts');
+  const def = projects.DEFAULT_BUDGET.maxAttemptsPerOrder;
+  assert.ok(row.value.includes(`≤ ${def} 次`), `expected the default cap ${def}, got ${row.value}`);
+  assert.ok(!row.value.includes('未设上限'), row.value);
+  assert.strictEqual(pure.DEFAULT_ATTEMPTS_PER_ORDER, def, 'the console mirror of the default must match lib/projects.js');
+});
