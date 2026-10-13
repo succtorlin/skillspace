@@ -9,7 +9,7 @@ const path = require('path');
 // second file at load - the board would simply be absent, with one line in a
 // console nobody has open. Function redeclarations are worse: the later one
 // silently wins.
-const FILES = ['pure.js', 'icons.js', 'board.js', 'order-drawer.js', 'goal-panel.js', 'app.js'];
+const FILES = ['auth.js', 'pure.js', 'icons.js', 'board.js', 'order-drawer.js', 'goal-panel.js', 'app.js'];
 const DECL = /^(?:async\s+)?(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/gm;
 
 test('no two console scripts declare the same top-level name', () => {

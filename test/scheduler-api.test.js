@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, execSync, execFileSync } = require('child_process');
 const net = require('net');
+const { secretFrom, register, authLine } = require('./helpers/auth');
 
 const store = require('../lib/store');
 const goals = require('../lib/goals');
@@ -165,6 +166,9 @@ async function startServer(home, extraEnv) {
   let out = '';
   proc.stderr.on('data', (c) => (err += c));
   proc.stdout.on('data', (c) => (out += c));
+  // Every /api/* call needs the per-boot secret, published only as the
+  // link on stdout. test/helpers/auth.js adds it to fetch from here on.
+  register(port, await secretFrom(proc));
   const deadline = Date.now() + 15000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error('server exited early: ' + err + out);
@@ -266,7 +270,7 @@ function holdActiveRequest(port) {
     const sock = net.connect({ host: '127.0.0.1', port });
     sock.on('error', reject);
     sock.on('connect', () => {
-      sock.write('POST /api/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+      sock.write('POST /api/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n' + authLine(port)
         + 'Content-Type: application/json\r\nContent-Length: 400\r\n\r\n');
       // A few bytes so the request body is genuinely in progress rather than
       // merely announced, then nothing.

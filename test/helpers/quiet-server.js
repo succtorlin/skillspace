@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const net = require('net');
 const { spawn } = require('child_process');
+const { secretFrom, register } = require('./auth');
 
 // A server for routes that spawn NOTHING. Unlike the agent-spawning suites it
 // needs no shim: HOME is an empty temp dir and PATH is /usr/bin:/bin, so no
@@ -40,6 +41,8 @@ async function startQuietServer(created) {
   proc.stdout.on('data', (c) => (out += c));
   proc.stderr.on('data', (c) => (out += c));
   const base = `http://127.0.0.1:${port}`;
+  // The per-boot API secret, from the link the server prints (see ./auth.js).
+  register(port, await secretFrom(proc));
   const deadline = Date.now() + 15000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error('quiet server exited early: ' + out);

@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, execSync, execFileSync } = require('child_process');
 const net = require('net');
+const { secretFrom, register } = require('./helpers/auth');
 
 const store = require('../lib/store');
 const goals = require('../lib/goals');
@@ -154,6 +155,9 @@ async function startServer(home, extraEnv) {
   let out = '';
   proc.stderr.on('data', (c) => (err += c));
   proc.stdout.on('data', (c) => (out += c));
+  // Every /api/* call needs the per-boot secret, published only as the
+  // link on stdout. test/helpers/auth.js adds it to fetch from here on.
+  register(port, await secretFrom(proc));
   const deadline = Date.now() + 15000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error('server exited early: ' + err + out);

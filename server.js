@@ -27,6 +27,10 @@ const runner = require('./lib/runner');
 // routes/scheduler.js, and everything the loop itself needs it takes as
 // arguments rather than reaching back into this file.
 const scheduler = require('./lib/scheduler');
+// The per-boot API secret. lib/auth.js carries the threat model; the short
+// version is that the Origin/Host checks below stop a web page, and this stops
+// a local process - including an agent this server spawned.
+const auth = require('./lib/auth');
 const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
 const makeGoalRoutes = require('./routes/goals');
@@ -40,6 +44,11 @@ const HOST_BIND = process.env.HOST || '127.0.0.1';
 const BIND_IS_LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST_BIND);
 const PUBLIC = path.join(__dirname, 'public');
 const HOME = os.homedir();
+// Generated here and held ONLY in this constant: never written to disk, never
+// put in process.env (so neither childEnv's allowlist nor
+// SKILLSPACE_ENV_PASSTHROUGH=1 can hand it to an agent). Printed once, as the
+// link in the listen() banner below.
+const API_SECRET = auth.newSecret();
 
 // Durable records live outside both the app directory and the user's repos, so
 // upgrading SkillSpace never touches data and a project directory never gains
@@ -745,7 +754,9 @@ function plainIdFrom(res, raw, label) {
 // no preflight - so any site the user visits could write to the registry. And
 // /api/run spawns an agent from a GET, which <img src> triggers with no Origin
 // header at all, so Sec-Fetch-Site is the header that actually covers it.
-// Absent headers mean a non-browser client (curl, the test suite): allowed.
+// Absent headers mean a non-browser client (curl, the test suite): allowed by
+// THIS check, which is only about web pages. A local process is what the
+// per-boot API secret (lib/auth.js) is for; it is checked right after this.
 //
 // The two checks are NOT redundant - they cover disjoint request classes, and
 // removing either silently uncovers a class the other never saw. Origin is
@@ -754,8 +765,8 @@ function plainIdFrom(res, raw, label) {
 // Host really is 127.0.0.1, so hostAllowed cannot help. Nothing this file owns
 // rests on the weak side - GET is read-only and unreadable cross-origin
 // without CORS headers, a cross-site form POST always carries Origin, and
-// DELETE is preflighted - so the residual lands on /api/run, which is
-// separately filed for review.
+// DELETE is preflighted - so the residual landed on /api/run, which now also
+// requires the API secret: a cross-site <img src> cannot know it.
 function isCrossOrigin(req) {
   const site = req.headers['sec-fetch-site'];
   if (site && site !== 'same-origin' && site !== 'none') return true;
@@ -776,9 +787,12 @@ function isCrossOrigin(req) {
 // posture, just a confusing one. isCrossOrigin stays unconditional - that is
 // CSRF defence and applies whatever we are bound to.
 function hostAllowed(req) {
-  if (!BIND_IS_LOOPBACK) return true;
   const h = req.headers.host;
-  if (!h) return true; // HTTP/1.0 and curl send none
+  // Refused whatever we are bound to. Every browser and curl sends Host; a
+  // request without one is a hand-rolled client, and "absent means allowed"
+  // was the half of this check a local process could walk straight through.
+  if (!h) return false;
+  if (!BIND_IS_LOOPBACK) return true;
   const name = h.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
   return name === '127.0.0.1' || name === 'localhost' || name === '::1';
 }
@@ -812,7 +826,7 @@ function denyNavigation(res, what) {
 // The console's own files. A Set, not a chain of ===, so adding one is one
 // edit; anything not named here is not served, whatever is in public/.
 const CONSOLE_ASSETS = new Set([
-  '/app.js', '/icons.js', '/pure.js', '/style.css',
+  '/auth.js', '/app.js', '/icons.js', '/pure.js', '/style.css',
   '/board.css', '/board.js', '/order-drawer.js', '/goal-panel.js',
 ]);
 
@@ -827,6 +841,43 @@ function serveStatic(res, file) {
   fs.createReadStream(full).pipe(res);
 }
 
+// The console page, for the holder of the cookie only, with the secret in a
+// <meta> for public/auth.js to send on every /api/* fetch. no-store: a cached
+// copy of this page is a cached copy of the secret.
+function serveConsole(res) {
+  let html;
+  try { html = fs.readFileSync(path.join(PUBLIC, 'index.html'), 'utf8'); } catch (_) {
+    res.writeHead(404); return res.end('not found');
+  }
+  html = html.replace('<head>', `<head>\n<meta name="skillspace-auth" content="${API_SECRET}">`);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(html);
+}
+
+// What GET / answers to anyone without the cookie - curl and a prompt-injected
+// agent included. It names where the key is and carries nothing else.
+const LOCK_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>SkillSpace · 已上锁</title>
+<style>body{font:16px/1.6 -apple-system,system-ui,sans-serif;max-width:34rem;margin:15vh auto;padding:0 16px;color:#ddd;background:#141414}
+code{background:#222;padding:2px 6px;border-radius:4px}</style></head><body>
+<h1>SkillSpace 已上锁</h1>
+<p>这个控制台能派出 AI agent，所以只对拿着本次启动钥匙的人开放。</p>
+<p>回到启动 SkillSpace 的终端，打开里面打印的那条链接（形如 <code>http://localhost:PORT/?auth=…</code>）。每次重启钥匙都会换新。</p>
+</body></html>`;
+
+function serveLock(res) {
+  res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(LOCK_PAGE);
+}
+
+// The one /api/* path that is NOT gated by the secret: the classification
+// callback an agent curls (buildClassifyPrompt). That agent is deliberately
+// never given the API secret; the per-job token in its URL is its credential,
+// and the route refuses an unknown one.
+function authExempt(req, p) {
+  return p === '/api/experts/import' && req.method === 'POST';
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://localhost:${PORT}`);
   const p = u.pathname;
@@ -835,6 +886,15 @@ const server = http.createServer(async (req, res) => {
   if (isCrossOrigin(req) || !hostAllowed(req)) {
     res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('forbidden');
+  }
+
+  // After the cross-origin and Host checks, which still apply to everything:
+  // those stop a web page, this stops a local process. /api/run is inside the
+  // prefix, so a header-less GET cannot spawn an agent either.
+  if (p.startsWith('/api/') && !authExempt(req, p) && !auth.apiAuthorized(req, u, API_SECRET)) {
+    return sendJson(res, 401, {
+      error: 'unauthorized: open the link SkillSpace printed in its terminal (the key changes on every restart)',
+    });
   }
 
   // Every route below runs inside this. A throw from a lib call used to take
@@ -887,7 +947,21 @@ const schedulerRoutes = makeSchedulerRoutes(routeDeps);
 const attemptRoutes = makeAttemptRoutes(routeDeps);
 
 async function route(req, res, u, p) {
-  if (p === '/' ) return serveStatic(res, 'index.html');
+  if (p === '/') {
+    // The printed link: trade the secret for a cookie and get it out of the
+    // address bar (and the history) at once.
+    if (u.searchParams.has(auth.QUERY)) {
+      if (!auth.matches(u.searchParams.get(auth.QUERY), API_SECRET)) return serveLock(res);
+      res.writeHead(302, {
+        'Set-Cookie': auth.setCookieHeader(PORT, API_SECRET),
+        Location: '/',
+        'Cache-Control': 'no-store',
+      });
+      return res.end();
+    }
+    if (!auth.cookieAuthorized(req, PORT, API_SECRET)) return serveLock(res);
+    return serveConsole(res);
+  }
   if (CONSOLE_ASSETS.has(p)) return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
   // the app is an instrument, this page sells the idea of it.
@@ -1379,7 +1453,10 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 
 server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
-  console.log(`  → http://localhost:${PORT}`);
+  // The ONLY place the secret is published. Open this link in the browser;
+  // a launcher that spawned this process reads it from stdout (see README).
+  console.log(`  → http://localhost:${PORT}/?auth=${API_SECRET}`);
+  console.log('    （打开上面这条链接进入控制台；每次重启都会换新钥匙）');
   for (const s of listSources()) {
     const tag = s.builtin ? s.label : `自定义 ${s.label}`;
     console.log(`  ${s.exists ? '✓' : '✗'} ${tag}：${s.dir}${s.exists ? `（${s.count} 个 Skill）` : '（目录不存在）'}`);

@@ -739,7 +739,8 @@ function runSkill(agent, skill, task) {
   $('#run-out').textContent = '';
   $('#run-cmd').textContent = '';
   const url = `/api/run?agent=${encodeURIComponent(agent)}&skill=${encodeURIComponent(skill.name)}&folder=${encodeURIComponent(skill.folder)}&dir=${encodeURIComponent(curDir())}&task=${encodeURIComponent(task)}`;
-  const es = new EventSource(url);
+  // ?auth= because EventSource cannot send the header public/auth.js adds.
+  const es = new EventSource(skillspaceAuthUrl(url));
   state.es = es;
   es.addEventListener('start', (e) => { $('#run-cmd').textContent = JSON.parse(e.data).command; });
   es.addEventListener('chunk', (e) => { const out = $('#run-out'); out.textContent += JSON.parse(e.data); out.scrollTop = out.scrollHeight; });

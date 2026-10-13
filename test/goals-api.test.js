@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const net = require('net');
+const { secretFrom, register, authLine } = require('./helpers/auth');
 
 const store = require('../lib/store');
 const goals = require('../lib/goals');
@@ -166,6 +167,9 @@ async function startServer(home, extraEnv) {
   let out = '';
   proc.stderr.on('data', (c) => (err += c));
   proc.stdout.on('data', (c) => (out += c));
+  // Every /api/* call needs the per-boot secret, published only as the
+  // link on stdout. test/helpers/auth.js adds it to fetch from here on.
+  register(port, await secretFrom(proc));
   const deadline = Date.now() + 15000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error('server exited early: ' + err + out);
@@ -319,7 +323,7 @@ function rawRequest(method, pathname, extraHeaders, body, at) {
         .map(([k, v]) => `${k}: ${v}\r\n`)
         .join('');
       sock.end(
-        `${method} ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\n${extra}` +
+        `${method} ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\n${authLine(port)}${extra}` +
         `Content-Type: application/json\r\n` +
         `Content-Length: ${Buffer.byteLength(payload)}\r\n` +
         `Connection: close\r\n\r\n${payload}`

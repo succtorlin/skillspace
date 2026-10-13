@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const net = require('net');
+const { secretFrom, register, authLine } = require('./helpers/auth');
 
 const created = [];
 function tmp(prefix) {
@@ -61,6 +62,7 @@ async function spawnServer(env, probeHost = '127.0.0.1') {
   let err = '';
   proc.stderr.on('data', (c) => (err += c));
   proc.stdout.on('data', () => {});
+  register(port, await secretFrom(proc));
   const deadline = Date.now() + 15000;
   for (;;) {
     if (proc.exitCode !== null) throw new Error('server exited early: ' + err);
@@ -100,6 +102,7 @@ before(async () => {
   });
   let stderr = '';
   child.stderr.on('data', (c) => (stderr += c));
+  register(port, await secretFrom(child));
   // Poll until it answers rather than sleeping a fixed interval.
   const deadline = Date.now() + 15000;
   for (;;) {
@@ -270,7 +273,7 @@ function rawPost(pathname, bodyBuf, splitAt) {
     sock.on('end', () => resolve(out));
     sock.on('connect', () => {
       sock.write(
-        `POST ${pathname} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+        `POST ${pathname} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n${authLine(port)}` +
         `Content-Type: application/json\r\nContent-Length: ${bodyBuf.length}\r\n` +
         `Connection: close\r\n\r\n`
       );
@@ -291,7 +294,7 @@ function rawGet(pathname, hostHeader) {
     sock.on('error', reject);
     sock.on('end', () => resolve(out));
     sock.on('connect', () => {
-      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: ${hostHeader}\r\nConnection: close\r\n\r\n`);
+      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: ${hostHeader}\r\n${authLine(port)}Connection: close\r\n\r\n`);
     });
   });
 }
@@ -513,7 +516,8 @@ test('same-origin and header-less clients are still served', async () => {
   // What typed navigation sends.
   const nav = await fetch(base + '/api/config', { headers: { 'Sec-Fetch-Site': 'none' } });
   assert.strictEqual(nav.status, 200, 'typed navigation must keep working');
-  // What curl and this suite send: nothing.
+  // What curl and this suite send: no Origin, no Sec-Fetch-* - only the API
+  // secret (test/helpers/auth.js adds it), which is a separate check.
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
 
@@ -584,7 +588,7 @@ test('a connection dropped mid-body persists nothing', async () => {
     await new Promise((resolve) => {
       const sock = net.connect({ host: '127.0.0.1', port: Number(port) }, () => {
         sock.write(
-          `POST /api/experts HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+          `POST /api/experts HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n${authLine(port)}` +
           `Content-Type: application/json\r\nContent-Length: 200\r\n\r\n{"name":"partial"`
         );
         setTimeout(() => { sock.destroy(); resolve(); }, 60);
@@ -620,7 +624,7 @@ function rawGetHeaders(pathname, extraHeaders) {
       const extra = Object.entries(extraHeaders)
         .map(([k, v]) => `${k}: ${v}\r\n`)
         .join('');
-      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\n${extra}Connection: close\r\n\r\n`);
+      sock.end(`GET ${pathname} HTTP/1.1\r\nHost: 127.0.0.1\r\n${authLine(port)}${extra}Connection: close\r\n\r\n`);
     });
   });
 }
@@ -760,7 +764,9 @@ test('a spawned agent does not run in the SkillSpace install directory', async (
   });
   let err = '';
   kid.stderr.on('data', (c) => (err += c));
+  const secretP = secretFrom(kid);
   try {
+    register(port, await secretP);
     const b2 = `http://127.0.0.1:${port}`;
     const deadline = Date.now() + 15000;
     for (;;) {

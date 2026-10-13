@@ -15,8 +15,12 @@
 ```bash
 cd skillspace
 node server.js
-# 打开 http://localhost:4177
+# 打开终端里打印的那条链接：http://localhost:4177/?auth=…
 ```
+
+**控制台是上锁的。** SkillSpace 能派出 AI agent，而本机任何进程（包括它自己派出去的 agent）都能访问 `localhost:4177`，所以每次启动都会生成一把随机钥匙，**只打印在启动它的终端里**。打开那条链接会给浏览器设一个 HttpOnly / SameSite=Strict 的 cookie，之后直接用 `http://localhost:4177` 就行；重启后钥匙换新，需要重新打开新链接。
+
+脚本或别的程序要调 `/api/*`：自己启动 `server.js`，从它 stdout 里读出 `/?auth=<64 位十六进制>` 这一行，之后每个请求带上请求头 `X-SkillSpace-Auth: <钥匙>`（EventSource 这种发不了请求头的，用 GET 查询参数 `auth=<钥匙>`）。钥匙不写入磁盘、不进环境变量，所以 agent 拿不到；如果你把 server 的 stdout 重定向进了一个文件，那个文件就等于钥匙，注意权限。唯一的例外是「自动分类」的回传口子 `POST /api/experts/import?token=…`：agent 只拿得到那一次任务的 token。
 
 ### 2. Skill 从哪来（自动扫描，不用手填路径）
 

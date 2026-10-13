@@ -100,8 +100,24 @@ const env = {
     ? { SKILLSPACE_SCHEDULER_INTERVAL_MS: process.env.SKILLSPACE_SCHEDULER_INTERVAL_MS } : {}),
 };
 
-const server = spawn(process.execPath, ['server.js'], { cwd: repoRoot, env, stdio: 'inherit' });
+// stdout is piped (and echoed) rather than inherited: the server publishes its
+// per-boot API secret only as the link it prints there, and this script needs
+// it for its own API calls below. Every fetch to the server sends it.
+const server = spawn(process.execPath, ['server.js'], { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'inherit'] });
 const base = `http://127.0.0.1:${port}`;
+let secret = null;
+let banner = '';
+server.stdout.on('data', (c) => {
+  process.stdout.write(c);
+  if (secret) return;
+  banner += c;
+  const m = banner.match(/\/\?auth=([0-9a-f]{64})/);
+  if (m) secret = m[1];
+});
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = (url, init = {}) => nativeFetch(url, {
+  ...init, headers: { ...(init.headers || {}), ...(secret ? { 'X-SkillSpace-Auth': secret } : {}) },
+});
 const stop = () => { server.kill('SIGTERM'); };
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
@@ -180,7 +196,7 @@ if (args.includes('--seed-verdicts')) {
   console.log('  seeded 6 verdict records under 2 goals in demo-git');
 }
 
-console.log(`\n  board demo: ${base}   (scheduler ${schedulerOn ? 'ON' : 'OFF'})`);
+console.log(`\n  board demo: ${base}/?auth=${secret}   (scheduler ${schedulerOn ? 'ON' : 'OFF'})`);
 console.log(`  store: ${store}`);
 console.log('  goals to type: anything (4-order plan) · DEMO-TOO-BIG · DEMO-GARBAGE');
 console.log('  ^C to stop. Temp dirs are left for inspection under $TMPDIR/skillspace-demo-*\n');
