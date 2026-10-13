@@ -7,6 +7,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const worktrees = require('../lib/worktrees');
+const projects = require('../lib/projects');
 
 const created = [];
 function tmpDir(prefix) {
@@ -516,4 +517,35 @@ test('the mutex is per repo, not global', async () => {
 
   await worktrees.cleanup(ws);
   await worktrees.cleanup(wf);
+});
+
+test('discard removes a clean scratch worktree and its branch', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const wt = await worktrees.prepare(root, project, 'vrd-scratch-1');
+  const { warning } = await worktrees.discard(wt);
+  assert.strictEqual(warning, null);
+  assert.ok(!fs.existsSync(wt.cwd));
+  assert.strictEqual(execSync(`git branch --list ${wt.branch}`, { cwd: repo }).toString().trim(), '',
+    'a scratch branch is pollution in the user repo');
+});
+
+test('discard keeps the branch of a scratch agent that wrote files, and says so', async () => {
+  const root = tmpDir('skillspace-home-');
+  const repo = tmpGitRepo();
+  const project = projects.create(root, { path: repo });
+  const wt = await worktrees.prepare(root, project, 'vrd-scratch-2');
+  fs.writeFileSync(path.join(wt.cwd, 'oops.txt'), 'told not to\n');
+  const { warning } = await worktrees.discard(wt);
+  assert.match(warning, /modified files despite being told not to/);
+  assert.notStrictEqual(execSync(`git branch --list ${wt.branch}`, { cwd: repo }).toString().trim(), '');
+});
+
+test('branchFor names the branch prepare creates', async () => {
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const wt = await worktrees.prepare(root, project, 'ord-branchfor');
+  assert.strictEqual(wt.branch, worktrees.branchFor('ord-branchfor'));
+  await worktrees.cleanup(wt);
 });
