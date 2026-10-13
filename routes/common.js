@@ -106,4 +106,19 @@ function available(list) {
   return list.map((a) => a && a.id).filter(Boolean).join(', ') || '无';
 }
 
-module.exports = { isPlainId, RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent };
+// `?project=` on the two list routes the board polls (plan 3, Task 0).
+// ABSENT lists every project's records - callers and tests rely on that, and
+// it is a request someone made on purpose. PRESENT BUT BLANK is refused: it is
+// what a cleared filter or an unset variable produces, and it used to answer
+// with the whole store, which a board would then render as one project's.
+// Returns { filter } or { error }.
+function projectFilterFrom(searchParams) {
+  if (!searchParams.has('project')) return { filter: {} };
+  const v = searchParams.get('project');
+  if (!v.trim()) return { error: 'project must not be empty (omit it to list every project)' };
+  return { filter: { projectId: v } };
+}
+
+module.exports = {
+  isPlainId, RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent, projectFilterFrom,
+};

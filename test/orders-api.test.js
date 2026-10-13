@@ -1241,3 +1241,46 @@ test('a double dispatch is refused as already dispatched, not blamed on the ceil
     await stopServer(kid);
   }
 });
+
+// ---------- plan 3, Task 0: what the board needs from the list route ----------
+
+test('GET /api/orders with an empty project= is a 400, not the whole store', async () => {
+  // A cleared filter is the obvious way for a client to build this query, and
+  // it used to answer with every order of every project. ABSENT still lists
+  // everything - that is a different request, and the tests above use it.
+  const project = await makeProject();
+  (await json('POST', '/api/orders', { projectId: project.id, prompt: 'x' })).body.order;
+  for (const q of ['?project=', '?project=%20%20', '?project']) {
+    const r = await json('GET', '/api/orders' + q);
+    assert.strictEqual(r.status, 400, `${q} answered ${r.status}`);
+    assert.match(r.body.error, /project/);
+    assert.strictEqual(r.body.orders, undefined, `${q} still returned a list`);
+  }
+  assert.strictEqual((await json('GET', '/api/orders')).status, 200);
+});
+
+test('GET /api/orders marks a claimed order, and only while it is claimed', async () => {
+  // An order dispatched by hand or by the loop reads `queued` until
+  // `worktree add` finishes. `claimed` is the derivation that tells a board it
+  // is already starting. Running orders are claimed too - the claim lasts the
+  // whole dispatch - and a settled one is not.
+  const project = await makeProject();
+  const order = (await json('POST', '/api/orders', { projectId: project.id, prompt: SLOW_MARK })).body.order;
+  const row = await waitFor('the order to be listed as claimed', async () => {
+    const r = await json('GET', `/api/orders?project=${project.id}`);
+    const o = r.body.orders.find((x) => x.id === order.id);
+    return o && o.claimed === true ? o : false;
+  });
+  assert.ok(row.status === 'queued' || row.status === 'running', row.status);
+  // Never written to disk: a derivation must not become a stored fact.
+  assert.strictEqual((await json('GET', `/api/orders/${order.id}`)).body.order.claimed, undefined,
+    'the single-order route carries claimed - is it on the record?');
+
+  await json('POST', `/api/orders/${order.id}/cancel`);
+  await settled(order.id);
+  await waitFor('the claim to be released', async () => {
+    const r = await json('GET', `/api/orders?project=${project.id}`);
+    const o = r.body.orders.find((x) => x.id === order.id);
+    return o && !('claimed' in o);
+  });
+});

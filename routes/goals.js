@@ -7,7 +7,7 @@ const dispatch = require('../lib/dispatch');
 const attempts = require('../lib/attempts');
 const requireDeps = require('./deps');
 const {
-  RUN_ROUTE_REQUIRED, isPlainId, errorMessage, clientFault, resolveAgent,
+  RUN_ROUTE_REQUIRED, isPlainId, errorMessage, clientFault, resolveAgent, projectFilterFrom,
 } = require('./common');
 
 // The goal routes. Same contract as routes/projects.js and routes/orders.js: a
@@ -54,7 +54,8 @@ const {
 // Known limits, recorded rather than fixed - both shared with routes/orders.js,
 // and the shared half of both routes now genuinely has ONE place to be fixed in
 // (routes/common.js) rather than two files that agreed by hand:
-// - `?project=` WITH AN EMPTY VALUE lists every goal rather than none.
+// - `?project=` WITH AN EMPTY VALUE listed every goal rather than none.
+//   FIXED in plan 3 (Task 0): a 400 now, through projectFilterFrom.
 // - plainIdFrom RESPONDS AND RETURNS NULL, so the caller's next line must be a
 //   return.
 //
@@ -74,8 +75,12 @@ module.exports = (deps) => {
 
   return async ({ req, res, u, p }) => {
     if (p === '/api/goals' && req.method === 'GET') {
-      const projectId = u.searchParams.get('project') || null;
-      sendJson(res, 200, { goals: goals.list(root, projectId ? { projectId } : {}) });
+      const pf = projectFilterFrom(u.searchParams);
+      if (pf.error) {
+        sendJson(res, 400, { error: pf.error });
+        return true;
+      }
+      sendJson(res, 200, { goals: goals.list(root, pf.filter) });
       return true;
     }
 

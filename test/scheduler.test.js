@@ -1144,6 +1144,13 @@ test('a project that cannot produce a worktree is paused, not drained', async ()
     // counter three tests rely on cannot see this class at all.
     assert.strictEqual(scheduler.stats().refused, 0);
     assert.match(orders.get(root, failed[0].id).error, /EEXIST|ENOTDIR|not a directory/i);
+    // WHICH project (plan 3, Task 0): a bare count cannot tell a user looking
+    // at a quiet board whether the pause is theirs.
+    const ids = scheduler.stats().pausedProjectIds;
+    assert.strictEqual(ids.length, 1);
+    assert.strictEqual(ids[0].id, project.id);
+    assert.strictEqual(ids[0].consecutive, 3);
+    assert.ok(Date.parse(ids[0].until) > Date.now(), `until is not a future moment: ${ids[0].until}`);
   } finally {
     await drain();
   }
@@ -1336,6 +1343,7 @@ test('stats() answers what a panel has to render', async () => {
     assert.strictEqual(s.lastError, null);
     assert.strictEqual(s.lastErrorAt, null);
     assert.strictEqual(s.pausedProjects, 0);
+    assert.deepStrictEqual(s.pausedProjectIds, [], "a project with no trouble is listed as paused");
     for (const k of ['ticks', 'offered', 'started', 'refused', 'failedToStart', 'errors']) {
       assert.strictEqual(typeof s[k], 'number', `${k} is missing from stats()`);
     }

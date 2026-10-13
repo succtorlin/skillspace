@@ -37,6 +37,10 @@ const REQUIRED = ['sendJson'];
 //   already has it from GET /api/orders. Adding a field here would also mean
 //   editing lib/scheduler.js, which is a second file in a diff whose whole
 //   point is that server.js does not grow.
+//   ONE EXCEPTION since plan 3: `pausedProjectIds` ([{id, until, consecutive}])
+//   beside the bare `pausedProjects` count. It is read from the scheduler's
+//   own in-memory pause map - still O(paused projects), no store read - and a
+//   board needs it to say WHICH project is paused rather than "one of them".
 //
 // Known limits:
 // - `running` MEANS THE TIMER IS ARMED, NOT THAT THE LOOP IS MAKING PROGRESS.

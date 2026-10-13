@@ -5,7 +5,7 @@ const dispatch = require('../lib/dispatch');
 const attempts = require('../lib/attempts');
 const requireDeps = require('./deps');
 const {
-  RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent,
+  RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent, projectFilterFrom,
 } = require('./common');
 
 // The order routes. Same contract as routes/projects.js: a factory taking the
@@ -37,9 +37,10 @@ const {
 //   RUN_ROUTE_REQUIRED, shared with routes/goals.js, so it is one place to edit
 //   rather than one per agent-spawning route. It still has to match the
 //   destructure.
-// - `?project=` WITH AN EMPTY VALUE lists every order rather than none. No
-//   consumer today, but the board in plan 3 builds exactly this query and a
-//   cleared filter is the obvious way to produce it.
+// - `?project=` WITH AN EMPTY VALUE listed every order rather than none.
+//   FIXED in plan 3 (Task 0): it is a 400 now, through routes/common.js's
+//   projectFilterFrom, shared with routes/goals.js. An ABSENT project= still
+//   lists everything.
 // - plainIdFrom RESPONDS AND RETURNS NULL, so every caller must remember to
 //   return immediately. Fine at the three call sites it has; misuse-prone past
 //   that.
@@ -101,13 +102,26 @@ module.exports = (deps) => {
 
   return async ({ req, res, u, p }) => {
     if (p === '/api/orders' && req.method === 'GET') {
-      const projectId = u.searchParams.get('project') || null;
-      const list = orders.list(root, projectId ? { projectId } : {});
+      const pf = projectFilterFrom(u.searchParams);
+      if (pf.error) {
+        sendJson(res, 400, { error: pf.error });
+        return true;
+      }
+      const list = orders.list(root, pf.filter);
       // Chains BESIDE the records, never merged in: supersededBy is derived,
       // and a client must not be able to mistake it for a stored fact. One goal
       // read per goal on the page, not per order. Known limit: O(page) on top
       // of list()'s O(store), on a route the board will poll.
-      sendJson(res, 200, { orders: list, chains: attempts.chainMap(root, list) });
+      //
+      // `claimed: true` IS the one derivation that rides ON a row, and only
+      // on this list route, only when true, and only on a copy - never on the
+      // record, never on GET /api/orders/:id. Plan 3's board asked for it in
+      // that shape: an order dispatched by hand or by the loop reads `queued`
+      // until `worktree add` finishes, and the board must not show "waiting"
+      // for one that is already starting. Absent means "not claimed right
+      // now", which is also what every record written to disk says.
+      const rows = list.map((o) => (dispatch.isClaimed(o.id) ? { ...o, claimed: true } : o));
+      sendJson(res, 200, { orders: rows, chains: attempts.chainMap(root, list) });
       return true;
     }
 

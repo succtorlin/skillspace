@@ -1105,3 +1105,14 @@ test("the suite does not touch the developer's own experts.json", async () => {
   assert.strictEqual(now, expertsBefore,
     'running the tests rewrote the repo experts.json - SKILLSPACE_EXPERTS_FILE is not reaching the server');
 });
+
+// ---------- plan 3, Task 0: the review hold, and the list route ----------
+
+test('GET /api/goals with an empty project= is a 400, not the whole store', async () => {
+  for (const q of ['?project=', '?project=%20', '?project']) {
+    const r = await json('GET', '/api/goals' + q);
+    assert.strictEqual(r.status, 400, `${q} answered ${r.status}`);
+    assert.strictEqual(r.body.goals, undefined, `${q} still returned a list`);
+  }
+  assert.strictEqual((await json('GET', '/api/goals')).status, 200);
+});
