@@ -5,6 +5,7 @@ const orders = require('../lib/orders');
 const planner = require('../lib/plan');
 const dispatch = require('../lib/dispatch');
 const attempts = require('../lib/attempts');
+const logs = require('../lib/logs');
 const requireDeps = require('./deps');
 const {
   RUN_ROUTE_REQUIRED, isPlainId, errorMessage, clientFault, resolveAgent, projectFilterFrom,
@@ -267,6 +268,30 @@ module.exports = (deps) => {
       const found = orderIds.map((oid) => orders.get(root, oid)).filter(Boolean);
       // Chains beside the records, never merged in - see routes/orders.js.
       sendJson(res, 200, { goal, orders: found, chains: attempts.chainMap(root, found) });
+      return true;
+    }
+
+    // The PM's output while it decomposes, same contract as the order log
+    // (routes/orders.js says why the status is read first). lib/plan writes it
+    // to logs/<goalId>.log.
+    const goalLogMatch = p.match(/^\/api\/goals\/([^/]+)\/log$/);
+    if (goalLogMatch && req.method === 'GET') {
+      const id = plainIdFrom(res, goalLogMatch[1], 'goal');
+      if (id === null) return true; // already answered 400
+      const goal = goals.get(root, id);
+      if (!goal) {
+        sendJson(res, 404, { error: 'no such goal' });
+        return true;
+      }
+      const status = goal.status;
+      let log;
+      try {
+        log = logs.readSlice(logs.logPath(root, id), u.searchParams.get('from'));
+      } catch (e) {
+        sendJson(res, 500, { error: errorMessage(e) });
+        return true;
+      }
+      sendJson(res, 200, { log, status });
       return true;
     }
 

@@ -3,6 +3,7 @@ const projects = require('../lib/projects');
 const orders = require('../lib/orders');
 const dispatch = require('../lib/dispatch');
 const attempts = require('../lib/attempts');
+const logs = require('../lib/logs');
 const requireDeps = require('./deps');
 const {
   RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent, projectFilterFrom,
@@ -273,6 +274,38 @@ module.exports = (deps) => {
         console.warn('[orders] could not derive the chain of %s: %s', id, errorMessage(e));
       }
       sendJson(res, 200, { order, chain });
+      return true;
+    }
+
+    // The order's log, by byte offset, for a browser that polls it. Read-only:
+    // no navigation guard, nothing spawned. Why a poll and not SSE is argued in
+    // docs/plans/2026-10-12-board.md.
+    //
+    // THE STATUS IS READ BEFORE THE SLICE, and the order matters. lib/runner
+    // settles a record only after its log has drained to disk, so a status read
+    // as settled FIRST guarantees the slice that follows sees the whole log -
+    // and a client may stop polling on `settled && next === size`. Read the
+    // other way round, an order settling between the two reads would report
+    // settled over a slice that missed its tail, and the client would stop one
+    // chunk short, forever. No black-box test can schedule that interleaving.
+    const logMatch = p.match(/^\/api\/orders\/([^/]+)\/log$/);
+    if (logMatch && req.method === 'GET') {
+      const id = plainIdFrom(res, logMatch[1], 'order');
+      if (id === null) return true; // already answered 400
+      const order = orders.get(root, id);
+      if (!order) {
+        sendJson(res, 404, { error: 'no such order' });
+        return true;
+      }
+      const status = order.status;
+      let log;
+      try {
+        log = logs.readSlice(logs.logPath(root, id), u.searchParams.get('from'));
+      } catch (e) {
+        sendJson(res, 500, { error: errorMessage(e) });
+        return true;
+      }
+      sendJson(res, 200, { log, status });
       return true;
     }
 
