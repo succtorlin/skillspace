@@ -145,6 +145,7 @@ function boardRowHtml(o) {
     `<span class="bd-title">${esc(orderTitle(o))}</span>` +
     `<span class="bd-agent">${esc(o.agent || '—')}</span>` +
     `<span class="bd-status"><span class="sdot" data-state="${escAttr(rs.dot)}" aria-hidden="true"></span>${esc(rs.text)}</span>` +
+    `<span class="bd-verdict">${boardVerdictBadge(o)}</span>` +
     `<span class="bd-dur"${live}>${esc(dur)}</span>` +
     '</button></li>';
 }
@@ -308,4 +309,13 @@ async function composeOneOffOrder({ title, prompt, acceptance, agent }) {
   }
   if (r.status === 404) return { ok: false, reload: true, text: '这个项目不存在了，列表会刷新' };
   return { ok: false, text: '派发失败：' + ((r.body && r.body.error) || (r.status ? `HTTP ${r.status}` : '无法连接服务器')) };
+}
+
+// Plan 2d: the verdict beside the status, never instead of it - `succeeded`
+// with `rejected` is exactly the case the design exists to show. Called from
+// order-drawer.js and goal-panel.js too.
+function boardVerdictBadge(o) {
+  const v = verdictView(o);
+  if (!v) return '';
+  return `<span class="vbadge" data-kind="${escAttr(v.kind)}"><span aria-hidden="true">${esc(v.glyph)}</span>${esc(v.label)}</span>`;
 }

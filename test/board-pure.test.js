@@ -155,7 +155,24 @@ test('groupOrders does not reorder the array it was handed', () => {
 
 test('the succeeded group heading does not claim the work was checked', () => {
   const g = pure.BOARD_GROUPS.find((x) => x.key === 'succeeded');
-  assert.match(g.label, /尚无验收/);
+  assert.match(g.label, /未验收/);
+});
+
+test('verdicts get their own groups, and exit 0 waits for one (plan 2d)', () => {
+  const j = (over) => order({ goalId: 'g', startedAt: 'x', ...over });
+  const groups = pure.groupOrders([
+    j({ id: 'v', status: 'succeeded', verdict: 'verified', verdictState: 'judged' }),
+    j({ id: 'u', status: 'succeeded' }),
+    j({ id: 'r', status: 'succeeded', verdict: 'rejected', verdictState: 'judged' }),
+    j({ id: 'e', status: 'succeeded', verdictState: 'error' }),
+    j({ id: 'f', status: 'failed', exitCode: 3 }),
+    j({ id: 'fv', status: 'failed', exitCode: 3, verdict: 'verified', verdictState: 'judged' }),
+  ]);
+  assert.deepStrictEqual(groups.map((g) => g.key), ['attention', 'failed', 'succeeded', 'verified']);
+  assert.deepStrictEqual(groups[0].orders.map((o) => o.id).sort(), ['e', 'r'], 'a rejection and an errored verdict both need a human');
+  assert.deepStrictEqual(groups[3].orders.map((o) => o.id).sort(), ['fv', 'v'], 'a verified failure is verified: the verdict outranks the status');
+  assert.match(pure.BOARD_GROUPS.find((g) => g.key === 'attention').label, /驳回/);
+  assert.match(pure.BOARD_GROUPS.find((g) => g.key === 'verified').label, /已验收/);
 });
 
 // ---------- today ----------

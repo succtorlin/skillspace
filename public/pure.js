@@ -176,17 +176,27 @@ function failureView(order, budget) {
 
 // Board order: what needs eyes first. `interrupted` shares the failed group -
 // both are "this did not finish cleanly" - and the row text tells them apart.
+// Since plan 2d a verdict outranks the status it judged. Work that needs a
+// human - a rejection, a verdict that errored - sits high; verified sits low,
+// below exit-0-not-yet-verified, so "done and checked" never hides "done and
+// unchecked". The succeeded group says 未验收, not 待验收: a one-off order
+// lands there too and no PM will ever judge it (its row badge says so).
 const BOARD_GROUPS = [
   { key: 'running', label: '运行中' },
   { key: 'queued', label: '排队' },
+  { key: 'attention', label: '驳回 · 验收出错 · 需要你处理' },
   { key: 'failed', label: '失败 · 中断' },
-  { key: 'succeeded', label: '退出 0 · 尚无验收' },
+  { key: 'succeeded', label: '退出 0 · 未验收' },
+  { key: 'verified', label: '已验收' },
   { key: 'cancelled', label: '已取消' },
 ];
 function boardGroupKey(order) {
+  const v = verdictOf(order);
+  if (v === 'verified') return 'verified';
+  if (v === 'rejected' || (order && order.verdictState === 'error')) return 'attention';
   const st = order && order.status;
   if (st === 'interrupted') return 'failed';
-  return BOARD_GROUPS.some((g) => g.key === st) ? st : 'unknown';
+  return ['running', 'queued', 'failed', 'succeeded', 'cancelled'].includes(st) ? st : 'unknown';
 }
 function boardTime(s) {
   const n = Date.parse(s || '');

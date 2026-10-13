@@ -314,3 +314,39 @@ body[data-view="board"] .topbar .icon-btn { display: none; }
   .seg { max-width: 100%; min-width: 0; }
   .seg-item { padding-left: 10px; padding-right: 10px; min-width: 0; }
 }
+
+/* ---------- verdict badges (plan 2d) ----------
+   VERIFIED is a solid --ink slab with --ground-1 text (15.66:1 dark,
+   17.68:1 light). EXIT-0-AWAITING is hollow with a DASHED --hair-lit border
+   and --ink-2 text (8.87/7.77 on ground-1, 8.06/6.88 on a hovered row): a
+   claim nobody has checked yet. REJECTED and an ERRORED verdict wear the
+   danger hairline with --danger-ink text (8.08/7.06). They stay apart in
+   grayscale - fill vs no fill, solid vs dashed, ✓ vs ○ vs ✕ - and none
+   borrows the mint accent, which means "actionable". */
+.vbadge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px; border: 1px solid transparent;
+  font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .04em; white-space: nowrap;
+}
+.bd-status .vbadge, .gp-step .vbadge { margin-left: 8px; }
+.vbadge[data-kind="verified"] { background: var(--ink); color: var(--ground-1); border-color: var(--ink); font-weight: 700; }
+.vbadge[data-kind="awaiting"] { background: transparent; color: var(--ink-2); border: 1px dashed var(--hair-lit); }
+.vbadge[data-kind="none"] { background: transparent; color: var(--ink-2); border: 1px dotted var(--hair-lit); }
+.vbadge[data-kind="judging"] { background: transparent; color: var(--ink); border-color: var(--hair-lit); }
+.vbadge[data-kind="rejected"],
+.vbadge[data-kind="error"] { background: transparent; color: var(--danger-ink); border-color: var(--danger); }
+.vbadge[data-kind="unknown"] { color: var(--ink-2); border-color: var(--hair-lit); }
+.sdot[data-state="verified"] { background: var(--ink); }
+.sdot[data-state="attention"] { border-color: var(--danger); }
+.ord-verdict { display: grid; gap: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+.ord-verdict-k {
+  margin-right: 8px; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2);
+}
+/* the verdict column on a board row */
+.bd-row { grid-template-columns: 6ch minmax(0, 1fr) 9ch 15ch 16ch 8ch; grid-template-areas: "seq title agent status verdict dur"; }
+.bd-verdict { grid-area: verdict; min-width: 0; }
+@media (max-width: 560px) {
+  .bd-row { grid-template-columns: 6ch minmax(0, 1fr) auto; grid-template-areas: "seq title dur" "seq status verdict"; }
+  .bd-agent { display: none; }
+}

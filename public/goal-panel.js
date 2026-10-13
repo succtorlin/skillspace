@@ -157,7 +157,7 @@ function goalPanelRenderDetail(b) {
       const canDispatch = o.status === 'queued' && !o.claimed && canStep;
       return '<li class="gp-step">' +
         `<button type="button" class="gp-step-open" data-order-id="${escAttr(o.id)}"><span class="seq">${esc(seqLabel(o))}</span><span class="gp-step-title">${esc(orderTitle(o))}</span></button>` +
-        `<span class="bd-status"><span class="sdot" data-state="${escAttr(o.status || 'unknown')}" aria-hidden="true"></span>${esc(f ? f.title : orderStatusText(o.status))}</span>` +
+        `<span class="bd-status"><span class="sdot" data-state="${escAttr(o.status || 'unknown')}" aria-hidden="true"></span>${esc(f ? f.title : orderStatusText(o.status))}${boardVerdictBadge(o)}</span>` +
         `<p class="gp-accept"><span class="gp-accept-k">验收</span>${esc(o.acceptance || '（PM 没有给验收标准）')}</p>` +
         (canDispatch ? `<button type="button" class="btn gp-dispatch" data-dispatch="${escAttr(o.id)}">派发</button>` : '') +
         '</li>';

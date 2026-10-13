@@ -4,6 +4,7 @@
 //   node scripts/board-demo.mjs               scheduler OFF (review mode), port 4199
 //   node scripts/board-demo.mjs --scheduler   scheduler ON
 //   node scripts/board-demo.mjs --store DIR   reuse a store (restart → `interrupted`)
+//   node scripts/board-demo.mjs --seed-verdicts   + plan 2d verdict records (fresh store only)
 //
 // The ONLY agent it can find is a shim in a fake $HOME/.local/bin, and that is
 // asserted before anything is printed: PATH is /usr/bin:/bin and HOME is a
@@ -130,6 +131,53 @@ if (!storeArg) {
   }).then((r) => r.json());
   await post({ name: 'demo-git', path: repo, budget: { orderTimeoutMs: 8000 } });
   await post({ name: 'demo-dir', path: dir });
+}
+
+if (args.includes('--seed-verdicts')) {
+  // Plan 2d's record shapes, written straight to the store so every verdict
+  // state can be screenshotted side by side without waiting on a judge:
+  // verified, exit-0-awaiting, rejected-then-retried (a chain of two),
+  // an errored verdict with the PM's unreadable reply, and - under a second,
+  // failed goal - a rejection with no retry coming.
+  const projects = await (await fetch(base + '/api/projects')).json();
+  const git = projects.projects.find((p) => p.name === 'demo-git');
+  if (!git) { console.error('--seed-verdicts needs a fresh store (demo-git missing)'); stop(); process.exit(1); }
+  const now = Date.now();
+  const iso = (dt) => new Date(now - dt).toISOString();
+  const V = { verdict: null, verdictReason: null, verdictState: null, verdictError: null, verdictRaw: null,
+    verdictAgent: null, verdictLog: null, verdictRuns: 0, verdictStartedAt: null, verdictAt: null, retryRefused: null };
+  const judged = (verdict, reason) => ({ verdict, verdictReason: reason, verdictState: 'judged', verdictAgent: 'claude',
+    verdictRuns: 1, verdictStartedAt: iso(30000), verdictAt: iso(25000) });
+  const rec = (id, goalId, over) => ({
+    id, projectId: git.id, goalId, seq: 0, title: id, prompt: 'seeded', acceptance: 'seeded acceptance',
+    agent: 'claude', cwd: null, status: 'succeeded', exitCode: 0, error: null, supersedes: null,
+    createdAt: iso(60000), startedAt: iso(50000), finishedAt: iso(40000), ...V, ...over,
+  });
+  const g1 = 'goal-00000000000001-0000-seed-stalled';
+  const g2 = 'goal-00000000000002-0000-seed-failed';
+  const o = (n, tag) => `ord-0000000000000${n}-0000-seed-${tag}`;
+  const seeds = [
+    rec(o(1, 'verified'), g1, { title: 'Verified', seq: 0, acceptance: 'npm test passes', ...judged('verified', 'all acceptance checks pass') }),
+    rec(o(2, 'awaiting'), g1, { title: 'Exit 0, awaiting a verdict', seq: 1, acceptance: 'the README names the new flag' }),
+    rec(o(3, 'rejected'), g1, { title: 'Rejected, then retried', seq: 2, acceptance: 'only settings.js changes', ...judged('rejected', 'edited the wrong file') }),
+    rec(o(4, 'retry'), g1, { title: 'Rejected, then retried', seq: 2, acceptance: 'only settings.js changes', supersedes: o(3, 'rejected'),
+      createdAt: iso(20000), startedAt: iso(15000), finishedAt: iso(10000), ...judged('verified', 'fixed: only settings.js changed') }),
+    rec(o(5, 'verdict-error'), g1, { title: 'The verdict could not be read', seq: 3, acceptance: 'the export button works',
+      verdictState: 'error', verdictError: 'the reply carried no verdict', verdictRaw: 'I looked at it and I am not sure.',
+      verdictAgent: 'claude', verdictRuns: 1, verdictStartedAt: iso(30000), verdictAt: iso(25000) }),
+    rec(o(6, 'final'), g2, { title: 'Rejected with no retry coming', seq: 0, status: 'failed', exitCode: 3,
+      acceptance: 'exits 0', ...judged('rejected', 'it exited 3 and did not do the work'), retryRefused: 'no attempts left (3 of 3)' }),
+  ];
+  const goal = (id, status, orderIds, over) => ({ id, projectId: git.id, text: id.includes('stalled') ? 'Seeded verdicts: a goal that needs you' : 'Seeded verdicts: a rejection with no retry coming',
+    status, pmAgent: 'claude', orderIds, error: null, rawPlan: null, held: false, createdAt: iso(70000), finishedAt: null, ...over });
+  fs.mkdirSync(path.join(store, 'orders'), { recursive: true });
+  fs.mkdirSync(path.join(store, 'goals'), { recursive: true });
+  for (const r of seeds) fs.writeFileSync(path.join(store, 'orders', `${r.id}.json`), JSON.stringify(r, null, 2));
+  fs.writeFileSync(path.join(store, 'goals', `${g1}.json`), JSON.stringify(goal(g1, 'stalled', seeds.slice(0, 5).map((r) => r.id)), null, 2));
+  fs.writeFileSync(path.join(store, 'goals', `${g2}.json`), JSON.stringify(goal(g2, 'failed', [o(6, 'final')], {
+    error: `1 order(s) rejected with no retry coming; first: ${o(6, 'final')} (no attempts left (3 of 3)): it exited 3 and did not do the work`,
+    finishedAt: iso(5000) }), null, 2));
+  console.log('  seeded 6 verdict records under 2 goals in demo-git');
 }
 
 console.log(`\n  board demo: ${base}   (scheduler ${schedulerOn ? 'ON' : 'OFF'})`);

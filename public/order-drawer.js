@@ -92,6 +92,14 @@ function drawerRenderOrder(order) {
     ['状态', `<span class="sdot" data-state="${escAttr(order.status || 'unknown')}" aria-hidden="true"></span>${esc(orderStatusText(order.status))}`],
     ['Agent', esc(order.agent || '尚未分配')],
     ['退出码', esc(exitCodeText(order))],
+    ['验收', (() => {
+      const v = verdictView(order);
+      if (!v) {
+        return esc(order.status === 'cancelled' || order.status === 'interrupted' || (order.status === 'failed' && !order.startedAt)
+          ? '没有结果可验收' : '还没有结果');
+      }
+      return boardVerdictBadge(order);
+    })()],
     ['用时', `<span data-elapsed>${esc(elapsed === null ? '未运行' : fmtDuration(elapsed))}</span>` +
       (order.status === 'running' && limit ? ` <span class="ord-limit">/ 上限 ${esc(limit)}</span>` : '')],
     ['工作目录', `<span class="ord-path">${esc(order.cwd || '尚未创建')}</span>`],
@@ -104,6 +112,7 @@ function drawerRenderOrder(order) {
     fb.dataset.kind = f.kind;
     fb.innerHTML = `<strong class="ord-failure-title">${esc(f.title)}</strong><p>${esc(f.detail)}</p>`;
   }
+  drawerRenderVerdict(order);
   drawerEl('ord-prompt').textContent = order.prompt || '';
   drawerEl('ord-prompt-n').textContent = `· ${String(Array.from(order.prompt || '').length)} 字`;
   drawerEl('ord-acceptance').textContent = order.acceptance ||
@@ -278,4 +287,28 @@ async function drawerCancel(id) {
   if (drawer.order) drawerRenderActions(drawer.order);
   await drawerRefreshOrder(gen);
   boardRefresh();
+}
+
+// The verdict's reasons, under the facts: why it was rejected, why judging
+// failed (with the PM's unreadable reply behind a disclosure), and why no
+// retry is coming. Plan 2d's fields; absent on older records.
+function drawerRenderVerdict(order) {
+  const box = drawerEl('ord-verdict');
+  const v = verdictView(order);
+  const parts = [];
+  if (v && v.detail && v.kind !== 'awaiting' && v.kind !== 'none') {
+    parts.push(`<p><span class="ord-verdict-k">${esc(v.kind === 'verified' ? 'PM 的结论' : v.kind === 'rejected' ? '驳回理由' : '原因')}</span>${esc(v.detail)}</p>`);
+  } else if (v && v.detail) {
+    parts.push(`<p>${esc(v.detail)}</p>`);
+  }
+  if (typeof order.verdictRaw === 'string' && order.verdictRaw) {
+    parts.push(`<details class="ord-sec"><summary>PM 的原始回复 <span class="cmd-chars">· ${String(order.verdictRaw.length)} 字</span></summary>` +
+      `<pre class="ord-pre" tabindex="0" role="log" aria-label="PM 的原始回复">${esc(order.verdictRaw)}</pre></details>`);
+  }
+  if (typeof order.retryRefused === 'string' && order.retryRefused) {
+    parts.push(`<p><span class="ord-verdict-k">不会再重试</span>${esc(order.retryRefused)}</p>`);
+  }
+  box.hidden = !parts.length;
+  box.dataset.kind = v ? v.kind : '';
+  box.innerHTML = parts.join('');
 }
