@@ -2000,3 +2000,33 @@ test('a goal whose PM is no longer installed says why it waits, instead of waiti
     await drain();
   }
 });
+
+test('a queued order its goal does not name is never dispatched (a crash mid-supersede)', async () => {
+  // attempts.supersede creates the successor, attaches it (goalId) and THEN
+  // adds it to goal.orderIds. A crash between the last two leaves a queued
+  // order whose goalId points at a goal that does not count it - outside every
+  // per-goal budget and attempt cap - and the dispatch pass ran it.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  orders.recordVerdict(root, a.id, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'wrong file' });
+  const orphan = orders.create(root, { projectId: project.id, prompt: 'one (retry)', supersedes: a.id });
+  orders.attachToGoal(root, orphan.id, goal.id, 0);
+  const tally = path.join(tmpDir(), 'tally');
+  try {
+    // judgeFor absent, so the retry pass's own successor (it sees A rejected
+    // with no successor in the goal's family) is the only other thing that
+    // may run; the orphan must not.
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => tallyShim(tally, 0) });
+    await ticksPass(4, 15);
+    assert.strictEqual(orders.get(root, orphan.id).status, 'queued', 'the orphan was dispatched');
+    const warned = scheduler.stats();
+    assert.ok(goals.get(root, goal.id).orderIds.every((id) => id !== orphan.id));
+    assert.ok(warned.skipped >= 1);
+    assert.strictEqual(warned.lastSkip.reason, "order not in its goal's plan");
+    assert.strictEqual(warned.lastSkip.orderId, orphan.id);
+  } finally {
+    await drain();
+  }
+});

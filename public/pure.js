@@ -287,6 +287,7 @@ const SKIP_REASON_TEXT = {
   'goal held for review': '目标在等你放行',
   'goal unreadable': '目标记录读不了',
   'goal orderIds malformed': '目标记录损坏',
+  "order not in its goal's plan": '这一单不在它目标的计划里（多半是重试中途崩溃留下的），不会自动运行',
   'project unreadable': '项目记录读不了',
   'project paused after repeated failures to start': '项目连续启动失败，暂停中',
   'no agent available': '没有可用的 agent',
