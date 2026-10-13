@@ -206,3 +206,32 @@
   margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hair);
   font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch;
 }
+
+/* ---------- order mode of the run drawer ---------- */
+.ord-meta { padding: 12px 18px; border-bottom: 1px solid var(--hair); display: grid; gap: 12px; overflow-y: auto; max-height: 52vh; }
+.ord-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 16px; }
+.ord-facts dt { font-family: var(--face-mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+.ord-facts dd { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink); min-width: 0; }
+.ord-path { font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); word-break: break-all; }
+.ord-limit { color: var(--muted); font-family: var(--face-mono); font-size: 11px; }
+.ord-failure {
+  padding: 8px 12px; border-left: 2px solid var(--danger); border-radius: 0 8px 8px 0;
+  background: var(--ground-2); font-size: 12.5px; line-height: 1.6; color: var(--ink);
+}
+.ord-failure-title { display: block; color: var(--danger-ink); font-weight: 600; }
+.ord-failure[data-kind="cancelled"] { border-left-color: var(--hair-lit); }
+.ord-failure[data-kind="cancelled"] .ord-failure-title { color: var(--ink); }
+.ord-sec > summary {
+  cursor: pointer; font-family: var(--face-mono); font-size: 10.5px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2);
+}
+.ord-pre {
+  margin-top: 8px; padding: 8px 12px; max-height: 180px; overflow-y: auto;
+  background: var(--ground-0); border: 1px solid var(--hair); border-radius: 8px;
+  font-family: var(--face-mono); font-size: 12px; line-height: 1.6;
+  color: var(--ink); white-space: pre-wrap; word-break: break-word;
+}
+.ord-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ord-actions:empty { display: none; }
+.ord-log-note { font-size: 12px; color: var(--ink-2); }
+.ord-log-note:empty { display: none; }

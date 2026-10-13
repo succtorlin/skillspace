@@ -236,14 +236,31 @@
     </div>
   </div>
 
-  <!-- 本地运行输出抽屉 -->
-  <div id="run" class="run-drawer" style="display:none" role="complementary" aria-labelledby="run-skill">
+  <!-- 本地运行输出抽屉；plan 3 起也是订单抽屉（order mode） -->
+  <div id="run" class="run-drawer" style="display:none" role="complementary" aria-labelledby="run-title">
     <div class="run-head">
-      <div class="run-title"><span id="run-skill"></span> · 运行结果</div>
+      <h2 class="run-title" id="run-title" tabindex="-1"><span id="run-skill"></span><span id="run-suffix"> · 运行结果</span></h2>
       <div class="run-status" id="run-status" role="status" aria-live="polite">运行中…</div>
       <button class="run-x" id="run-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
     </div>
     <div class="run-cmd" id="run-cmd"></div>
+    <div id="ord-meta" class="ord-meta" hidden>
+      <dl id="ord-facts" class="ord-facts"></dl>
+      <div id="ord-failure" class="ord-failure" hidden></div>
+      <details class="ord-sec">
+        <summary>指令 <span id="ord-prompt-n" class="cmd-chars"></span></summary>
+        <pre id="ord-prompt" class="ord-pre"></pre>
+      </details>
+      <details class="ord-sec" open>
+        <summary>验收标准</summary>
+        <pre id="ord-acceptance" class="ord-pre"></pre>
+      </details>
+      <div id="ord-actions" class="ord-actions">
+        <button type="button" class="btn" id="ord-dispatch" hidden>立即派发</button>
+        <button type="button" class="btn ghost" id="ord-cancel" hidden>取消这一单</button>
+      </div>
+      <p id="ord-log-note" class="ord-log-note"></p>
+    </div>
     <pre class="run-out" id="run-out" tabindex="0" role="log" aria-label="运行输出"></pre>
   </div>
 

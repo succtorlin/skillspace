@@ -667,6 +667,14 @@ $('#cm-save').addEventListener('click', async () => {
 // ---------- 本地运行抽屉 ----------
 function runSkill(agent, skill, task) {
   if (state.es) state.es.close();
+  // The drawer is shared with order mode (order-drawer.js). A Skill run must
+  // leave it entirely, or the order's facts and its log poll stay underneath.
+  // Deleting orderId is what stops order-drawer.js's poll (drawerIsOpenFor).
+  delete $('#run').dataset.orderId;
+  $('#ord-meta').hidden = true;
+  $('#run-cmd').hidden = false;
+  $('#run-suffix').hidden = false;
+  $('#run-out').removeAttribute('aria-live');
   $('#run').style.display = 'flex';
   // The log is the point of the drawer; focus it so a keyboard user lands on
   // the streamed output rather than having to tab the whole page to reach it.

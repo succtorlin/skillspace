@@ -1,1 +1,191 @@
-// Plan 3. Classic script, loaded after pure.js and icons.js, before app.js.
+// Order drawer — spec §8.3: "extends the current run drawer". Same #run
+// element and the same Escape/close contract app.js gives it, plus an order
+// mode: facts, failure, prompt, acceptance, actions, and the log.
+//
+// The log is polled by byte offset (GET /api/orders/:id/log?from=N) - spec §7
+// said "SSE while running, file when finished"; one mechanism serves both,
+// and plan 3's "Live updates" says why.
+//
+// The log <pre> keeps role="log" but is set aria-live="off" in order mode: an
+// agent printing a line a second would otherwise talk over everything. Status
+// changes are announced once, through #run-status.
+
+const DRAWER_POLL_MS = 1000;
+let drawer = { id: null, order: null, chain: null, from: 0, dropped: 0, timer: null, pending: null, gen: 0 };
+
+function drawerEl(id) { return document.getElementById(id); }
+
+function drawerIsOpenFor(id) {
+  const run = drawerEl('run');
+  return !!run && run.style.display !== 'none' && run.dataset.orderId === id;
+}
+
+// Called from board.js and goal-panel.js.
+function openOrderDrawer(id) {
+  if (!id) return;
+  showOrder(id);
+}
+
+async function showOrder(id) {
+  const run = drawerEl('run');
+  clearTimeout(drawer.timer);
+  const gen = drawer.gen + 1;
+  drawer = { id, order: null, chain: null, from: 0, dropped: 0, timer: null, pending: null, gen };
+  run.dataset.orderId = id;
+  run.style.display = 'flex';
+  drawerEl('run-cmd').hidden = true;
+  drawerEl('run-suffix').hidden = true;
+  drawerEl('ord-meta').hidden = false;
+  const out = drawerEl('run-out');
+  out.textContent = '';
+  out.setAttribute('aria-live', 'off');
+  drawerEl('ord-log-note').textContent = '';
+  drawerEl('run-skill').textContent = '读取订单…';
+  drawerEl('run-status').textContent = '';
+  const r = await boardGetJson('/api/orders/' + encodeURIComponent(id));
+  if (drawer.gen !== gen) return; // Standing question 5
+  if (!r.ok || !r.body || !r.body.order) {
+    drawerEl('run-skill').textContent = r.status === 404 ? '这一单不存在了' : '订单读取失败';
+    drawerEl('run-status').textContent = r.status === 404 ? '' : '关掉抽屉再点一次试试';
+    drawerEl('ord-meta').hidden = true;
+    return;
+  }
+  // Plan 2d: the chain arrives BESIDE the record (null when it cannot be
+  // derived). Kept for the attempt history (Task 17).
+  drawer = { ...drawer, chain: r.body.chain || null };
+  drawerRenderOrder(r.body.order);
+  setTimeout(() => { if (drawer.gen === gen) drawerEl('run-title').focus(); }, 30);
+  drawerPollLog(gen);
+}
+
+function drawerBudgetFor(order) {
+  const p = boardCurrent().project;
+  return p && p.id === order.projectId ? p.budget : null;
+}
+
+function drawerRenderOrder(order) {
+  drawer = { ...drawer, order };
+  const budget = drawerBudgetFor(order);
+  const f = failureView(order, budget);
+  // A one-off order has no seq; "·· · title" would read as noise.
+  drawerEl('run-skill').textContent = Number.isInteger(order.seq) && order.seq >= 0
+    ? `${seqLabel(order)} · ${orderTitle(order)}` : orderTitle(order);
+  const st = drawerEl('run-status');
+  st.textContent = f ? f.title : orderStatusText(order.status);
+  const live = order.status === 'queued' || order.status === 'running';
+  st.className = 'run-status' + (live ? '' : f && f.kind !== 'cancelled' ? ' err' : ' done');
+
+  const elapsed = orderElapsed(order, Date.now());
+  const limit = budget && Number.isFinite(budget.orderTimeoutMs) ? fmtDuration(budget.orderTimeoutMs) : null;
+  const facts = [
+    ['状态', `<span class="sdot" data-state="${escAttr(order.status || 'unknown')}" aria-hidden="true"></span>${esc(orderStatusText(order.status))}`],
+    ['Agent', esc(order.agent || '尚未分配')],
+    ['退出码', esc(exitCodeText(order))],
+    ['用时', `<span data-elapsed>${esc(elapsed === null ? '未运行' : fmtDuration(elapsed))}</span>` +
+      (order.status === 'running' && limit ? ` <span class="ord-limit">/ 上限 ${esc(limit)}</span>` : '')],
+    ['工作目录', `<span class="ord-path">${esc(order.cwd || '尚未创建')}</span>`],
+  ];
+  drawerEl('ord-facts').innerHTML = facts.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+
+  const fb = drawerEl('ord-failure');
+  fb.hidden = !f;
+  if (f) {
+    fb.dataset.kind = f.kind;
+    fb.innerHTML = `<strong class="ord-failure-title">${esc(f.title)}</strong><p>${esc(f.detail)}</p>`;
+  }
+  drawerEl('ord-prompt').textContent = order.prompt || '';
+  drawerEl('ord-prompt-n').textContent = `· ${String(Array.from(order.prompt || '').length)} 字`;
+  drawerEl('ord-acceptance').textContent = order.acceptance ||
+    '没有验收标准。一次性订单可以不填；PM 拆出的订单都应该有。';
+  if (typeof drawerRenderActions === 'function') drawerRenderActions(order);
+}
+
+async function drawerRefreshOrder(gen) {
+  const id = drawer.id;
+  const r = await boardGetJson('/api/orders/' + encodeURIComponent(id));
+  if (drawer.gen !== gen || !r.ok || !r.body || !r.body.order) return;
+  const changed = !drawer.order || drawer.order.status !== r.body.order.status;
+  drawer = { ...drawer, chain: r.body.chain || null };
+  if (changed) drawer = { ...drawer, pending: null };
+  drawerRenderOrder(r.body.order);
+  if (changed) boardRefresh();
+}
+
+function drawerLogNote(step, status) {
+  const parts = [];
+  if (!step.exists) {
+    parts.push(status === 'queued' ? '还没开始运行，没有日志。' : '这一单没有日志（它没有启动）。');
+  }
+  if (drawer.dropped > 0) {
+    // Under a thousand, "约 0 千字" says nothing was dropped: count exactly.
+    const n = drawer.dropped;
+    const amount = n < 1000 ? `${String(n)} 字` : `约 ${String(Math.round(n / 1000))} 千字`;
+    parts.push(`前面 ${amount}已省略；完整日志在 SkillSpace 数据目录的 logs/${drawer.id}.log。`);
+  }
+  if (step.more) parts.push('正在追上日志…');
+  return parts.join(' ');
+}
+
+async function drawerPollLog(gen) {
+  if (drawer.gen !== gen || !drawerIsOpenFor(drawer.id)) return;
+  const id = drawer.id;
+  const r = await boardGetJson(`/api/orders/${encodeURIComponent(id)}/log?from=${String(drawer.from)}`);
+  if (drawer.gen !== gen || !drawerIsOpenFor(id)) return;
+  const status = r.body && r.body.status;
+  const step = r.ok ? logStep(r.body, status === 'queued' || status === 'running') : { ok: false };
+  const note = drawerEl('ord-log-note');
+  if (!step.ok) {
+    note.textContent = r.status === 404 ? '这一单不存在了。' : '日志读取失败，1 秒后重试。';
+    if (r.status !== 404) drawer = { ...drawer, timer: setTimeout(() => drawerPollLog(gen), DRAWER_POLL_MS) };
+    return;
+  }
+  const out = drawerEl('run-out');
+  const stick = shouldStick(out.scrollTop, out.clientHeight, out.scrollHeight);
+  if (step.reset) { out.textContent = ''; drawer = { ...drawer, dropped: 0 }; }
+  if (step.text) {
+    const capped = appendCapped(out.textContent, step.text, LOG_DOM_CAP);
+    out.textContent = capped.text;
+    drawer = { ...drawer, dropped: drawer.dropped + capped.dropped };
+  }
+  drawer = { ...drawer, from: step.next };
+  if (stick) out.scrollTop = out.scrollHeight;
+  note.textContent = drawerLogNote(step, status);
+  drawerTickElapsed();
+  if (!drawer.order || status !== drawer.order.status) await drawerRefreshOrder(gen);
+  if (step.done) return; // settled and drained: nothing more will ever arrive
+  if (drawer.gen !== gen) return;
+  // While catching up on a long log, do not wait a full second between slices.
+  drawer = { ...drawer, timer: setTimeout(() => drawerPollLog(gen), step.more ? 0 : DRAWER_POLL_MS) };
+}
+
+// Closing the drawer (×, Escape) stops the poll and, because the board row
+// that opened it may have been re-rendered since, puts focus back on the row
+// with the same id rather than leaving it on <body>.
+new MutationObserver(() => {
+  const run = drawerEl('run');
+  if (run.style.display !== 'none' || !run.dataset.orderId) return;
+  const id = run.dataset.orderId;
+  clearTimeout(drawer.timer);
+  drawer = { ...drawer, gen: drawer.gen + 1, timer: null };
+  delete run.dataset.orderId;
+  // Focus still INSIDE the now-hidden drawer counts as lost: the browser does
+  // not blur a node it has just hidden until the next style recalc, so at
+  // this moment activeElement can still be the drawer's title rather than
+  // <body> - measured, and it left the keyboard user on <body>.
+  const active = document.activeElement;
+  if (!active || active === document.body || run.contains(active)) {
+    const row = document.querySelector(`.bd-row[data-order-id="${CSS.escape(id)}"]`);
+    if (row) row.focus();
+  }
+}).observe(document.getElementById('run'), { attributes: true, attributeFilter: ['style'] });
+
+// The 用时 fact of a running order moves every log poll (once a second)
+// without re-rendering the facts - a re-render would also rebuild the
+// failure block and the actions under a keyboard user.
+function drawerTickElapsed() {
+  const el = document.querySelector('#ord-facts [data-elapsed]');
+  const o = drawer.order;
+  if (!el || !o || o.status !== 'running') return;
+  const ms = orderElapsed(o, Date.now());
+  el.textContent = ms === null ? '未运行' : fmtDuration(ms);
+}
