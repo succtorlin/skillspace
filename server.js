@@ -414,7 +414,9 @@ const RUN_TIMEOUT_MS = Number(process.env.SKILLSPACE_RUN_TIMEOUT_MS) || 900000;
 // Set SKILLSPACE_ENV_PASSTHROUGH=1 to restore the old behaviour if an agent
 // needs a variable this list does not name. If you hit that, the fix is to add
 // the prefix here rather than leave the passthrough on.
-const ENV_BASE = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ'];
+// The base list is shared with SkillSpace's own git (lib/git.js), so the two
+// cannot drift.
+const { ENV_BASE } = require('./lib/env');
 const ENV_PREFIXES = {
   claude: ['ANTHROPIC_', 'CLAUDE_'],
   codex: ['OPENAI_', 'CODEX_'],

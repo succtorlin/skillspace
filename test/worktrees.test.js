@@ -26,6 +26,24 @@ function tmpGitRepo() {
   gitCommit(d, 'init');
   return d;
 }
+// Hooks no longer run under SkillSpace's own git (lib/git.js), so a test that
+// needs `worktree add` to be slow or to fail after creating the tree puts a
+// wrapper ahead of the real git on PATH instead. lib/git passes PATH through.
+// `onAdd` is shell run in place of nothing, after the real add, only for
+// `worktree add`.
+async function withGitWrapper(onAdd, fn) {
+  const realGit = execSync('command -v git', { encoding: 'utf8' }).trim();
+  const bin = tmpDir('skillspace-gitwrap-');
+  fs.writeFileSync(path.join(bin, 'git'),
+    '#!/bin/sh\n' +
+    'case " $* " in\n' +
+    `  *" worktree add "*) "${realGit}" "$@" || exit $?\n${onAdd}\n    exit 0 ;;\n` +
+    'esac\n' +
+    `exec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const saved = process.env.PATH;
+  process.env.PATH = `${bin}:${saved}`;
+  try { return await fn(); } finally { process.env.PATH = saved; }
+}
 after(() => {
   for (const d of created) {
     try { fs.rmSync(d, { recursive: true, force: true }); } catch (_) {}
@@ -200,34 +218,29 @@ test('a failed prepare leaves nothing behind', async () => {
 
 test('a worktree git created but could not finish is cleaned up', async () => {
   // The not-a-repo case above aborts before git makes the directory, so it
-  // never exercises the removal. A failing post-checkout hook does: git creates
-  // the worktree fully, then exits non-zero. Repos really do have these hooks
-  // (husky, git-lfs, direnv), and no agent has spawned yet, so the half-made
-  // tree is git's own and safe to remove.
+  // never exercises the removal. A git that creates the worktree fully and
+  // then exits non-zero does - which is what a failing post-checkout hook did
+  // before SkillSpace stopped running hooks (lib/git.js); a wrapper stands in
+  // for it now. No agent has spawned yet, so the half-made tree is git's own
+  // and safe to remove.
   const orderId = 'ord-hook';
   const repo = tmpGitRepo();
-  // A real hook explains itself on stderr. git's own first line is progress,
-  // so this is also what distinguishes the cause from the chatter.
-  fs.writeFileSync(
-    path.join(repo, '.git', 'hooks', 'post-checkout'),
-    '#!/bin/sh\necho "hook rejected the checkout" >&2\nexit 1\n',
-    { mode: 0o755 }
-  );
   const root = tmpDir('skillspace-wthome-');
 
-  await assert.rejects(
-    () => worktrees.prepare(root, { kind: 'git', path: repo }, orderId),
-    (e) => {
-      // The order records why it failed, so the reason must be the cause and
-      // not the progress line git happened to print first.
-      assert.match(e.message, /worktree/);
-      assert.ok(
-        !e.message.includes('Preparing worktree'),
-        `the order recorded git's progress line as the cause: ${e.message}`
-      );
-      return true;
-    }
-  );
+  await withGitWrapper('    echo "Preparing worktree (new branch)" >&2\n    echo "error: rejected the checkout" >&2\n    exit 1', () =>
+    assert.rejects(
+      () => worktrees.prepare(root, { kind: 'git', path: repo }, orderId),
+      (e) => {
+        // The order records why it failed, so the reason must be the cause and
+        // not the progress line git happened to print first.
+        assert.match(e.message, /worktree/);
+        assert.ok(
+          !e.message.includes('Preparing worktree'),
+          `the order recorded git's progress line as the cause: ${e.message}`
+        );
+        return true;
+      }
+    ));
   const wtRoot = path.join(root, 'worktrees');
   const leftover = fs.existsSync(wtRoot) ? fs.readdirSync(wtRoot) : [];
   assert.deepStrictEqual(leftover, [], `prepare left ${JSON.stringify(leftover)} behind`);
@@ -483,29 +496,30 @@ test('the mutex is per repo, not global', async () => {
   //
   // Asserting that both prepares COMPLETE would not pin this: a global lock
   // completes both too, just serially. So make one repo's add genuinely slow -
-  // a post-checkout hook that sleeps, which `worktree add` runs - start it
-  // first, and let it get inside its add before the other begins. The fast
-  // repo must then finish FIRST. Under a global lock it cannot: it would be
-  // chained behind a holder that sleeps for a second.
+  // a wrapper around git that sleeps after `worktree add` in a repo carrying a
+  // marker (a sleeping post-checkout hook did this before SkillSpace stopped
+  // running hooks) - start it first, and let it get inside its add before the
+  // other begins. The fast repo must then finish FIRST. Under a global lock it
+  // cannot: it would be chained behind a holder that sleeps for a second.
   const root = tmpDir('skillspace-wthome-');
   const slowRepo = tmpGitRepo();
   const fastRepo = tmpGitRepo();
-  fs.writeFileSync(
-    path.join(slowRepo, '.git', 'hooks', 'post-checkout'),
-    '#!/bin/sh\nsleep 1\nexit 0\n',
-    { mode: 0o755 }
-  );
+  fs.writeFileSync(path.join(slowRepo, '.git', 'SLOW'), '');
 
   const finished = [];
-  const slow = worktrees.prepare(root, { kind: 'git', path: slowRepo }, 'ord_repo_slow')
-    .then((wt) => { finished.push('slow'); return wt; });
-  // Long enough that `slow` is past its read-only inspection and inside the
-  // add (one rev-parse, tens of ms), short enough that its 1s hook is still
-  // running. Without this the two race for the lock and a global lock could
-  // pass by luck.
-  await sleep(250);
-  const fast = worktrees.prepare(root, { kind: 'git', path: fastRepo }, 'ord_repo_fast')
-    .then((wt) => { finished.push('fast'); return wt; });
+  let slow, fast;
+  await withGitWrapper('    [ -f "$(pwd)/.git/SLOW" ] && sleep 1', async () => {
+    slow = worktrees.prepare(root, { kind: 'git', path: slowRepo }, 'ord_repo_slow')
+      .then((wt) => { finished.push('slow'); return wt; });
+    // Long enough that `slow` is past its read-only inspection and inside the
+    // add (one rev-parse, tens of ms), short enough that its 1s sleep is still
+    // running. Without this the two race for the lock and a global lock could
+    // pass by luck.
+    await sleep(250);
+    fast = worktrees.prepare(root, { kind: 'git', path: fastRepo }, 'ord_repo_fast')
+      .then((wt) => { finished.push('fast'); return wt; });
+    await Promise.all([slow, fast]);
+  });
 
   const [ws, wf] = await Promise.all([slow, fast]);
 
@@ -548,4 +562,135 @@ test('branchFor names the branch prepare creates', async () => {
   const wt = await worktrees.prepare(root, project, 'ord-branchfor');
   assert.strictEqual(wt.branch, worktrees.branchFor('ord-branchfor'));
   await worktrees.cleanup(wt);
+});
+
+// ---------- SkillSpace's own git runs inside agent-writable trees ----------
+// An agent can write the repository's config, its hooks, the worktree's
+// .gitattributes and the worktree's .git pointer. SkillSpace then runs git
+// there itself - status, add -A, commit, worktree remove - with whatever
+// environment it has. Each test below plants one way of turning that git into
+// "run my command", AFTER prepare (that is, as the agent), and asserts the
+// command never ran and the work was still preserved.
+
+function canaryScript(dir, name) {
+  const canary = path.join(dir, name);
+  const script = path.join(dir, name + '.sh');
+  // Records which git ran it, so a failure names the command.
+  fs.writeFileSync(script, `#!/bin/sh\nps -o args= -p $PPID >> "${canary}"\ncat\n`, { mode: 0o755 });
+  return { canary, script };
+}
+
+test('a core.fsmonitor the agent planted does not run during cleanup', async () => {
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  const outside = tmpDir('skillspace-canary-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_fsmon');
+  const { canary, script } = canaryScript(outside, 'fsmonitor');
+  // The agent: the common config is shared by every worktree of the repo.
+  execSync(`git config core.fsmonitor "${script}"`, { cwd: wt.cwd });
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'work\n');
+
+  const r = await worktrees.cleanup(wt);
+  assert.ok(!fs.existsSync(canary), 'SkillSpace ran the fsmonitor the agent planted');
+  assert.strictEqual(r.committed, true, String(r.preserveError));
+});
+
+test('hooks the agent planted - by hooksPath or in the hooks dir - do not run during cleanup', async () => {
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  const outside = tmpDir('skillspace-canary-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_hooks');
+  // --no-verify skips pre-commit and commit-msg only; these two still run.
+  const hooks = path.join(outside, 'hooks');
+  fs.mkdirSync(hooks);
+  for (const h of ['prepare-commit-msg', 'post-commit', 'post-checkout', 'reference-transaction']) {
+    fs.writeFileSync(path.join(hooks, h), `#!/bin/sh\ntouch "${path.join(outside, 'HOOK-' + h)}"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(repo, '.git', 'hooks', h), `#!/bin/sh\ntouch "${path.join(outside, 'GITDIR-' + h)}"\n`, { mode: 0o755 });
+  }
+  execSync(`git config core.hooksPath "${hooks}"`, { cwd: wt.cwd });
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'work\n');
+
+  const r = await worktrees.cleanup(wt);
+  assert.deepStrictEqual(fs.readdirSync(outside).filter((f) => f !== 'hooks'), [],
+    'SkillSpace ran a hook during its own snapshot');
+  assert.strictEqual(r.committed, true, String(r.preserveError));
+});
+
+test('a clean filter the agent planted does not run, and the work is committed as written', async () => {
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  const outside = tmpDir('skillspace-canary-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_filter');
+  const clean = canaryScript(outside, 'clean');
+  const proc = canaryScript(outside, 'process');
+  fs.writeFileSync(path.join(wt.cwd, '.gitattributes'), '* filter=evil\n');
+  execSync(`git config filter.evil.clean "${clean.script}"`, { cwd: wt.cwd });
+  execSync(`git config filter.evil.process "${proc.script}"`, { cwd: wt.cwd });
+  execSync('git config filter.evil.required true', { cwd: wt.cwd });
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'work\n');
+
+  const r = await worktrees.cleanup(wt);
+  const ran = (c) => (fs.existsSync(c) ? fs.readFileSync(c, 'utf8') : '');
+  assert.strictEqual(ran(clean.canary), '', 'SkillSpace ran the clean filter the agent planted');
+  assert.strictEqual(ran(proc.canary), '', 'SkillSpace ran the filter process the agent planted');
+  assert.strictEqual(r.committed, true, String(r.preserveError));
+  const body = execSync(`git show ${wt.branch}:agent-output.txt`, { cwd: repo, encoding: 'utf8' });
+  assert.strictEqual(body, 'work\n');
+});
+
+test('a rewritten .git pointer cannot redirect the snapshot into another repository', async () => {
+  // The worktree's .git is a FILE the agent can rewrite. Followed, it would
+  // send SkillSpace's add/commit - and that repo's config, hooks included - to
+  // a repository of the agent's choosing. The gitdir comes from SkillSpace's
+  // own record of the worktree instead.
+  const repo = tmpGitRepo();
+  const decoy = tmpGitRepo();
+  const outside = tmpDir('skillspace-canary-');
+  const root = tmpDir('skillspace-wthome-');
+  const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_pointer');
+  fs.writeFileSync(path.join(decoy, '.git', 'hooks', 'post-commit'),
+    `#!/bin/sh\ntouch "${path.join(outside, 'DECOY-HOOK')}"\n`, { mode: 0o755 });
+  const decoyHead = execSync('git rev-parse HEAD', { cwd: decoy, encoding: 'utf8' }).trim();
+  fs.writeFileSync(path.join(wt.cwd, '.git'), `gitdir: ${path.join(decoy, '.git')}\n`);
+  fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'work\n');
+
+  const r = await worktrees.cleanup(wt);
+  assert.strictEqual(execSync('git rev-parse HEAD', { cwd: decoy, encoding: 'utf8' }).trim(), decoyHead,
+    'the snapshot was committed into the repository the pointer named');
+  assert.deepStrictEqual(fs.readdirSync(outside), [], 'the decoy repository\'s hook ran');
+  assert.strictEqual(r.committed, true, String(r.preserveError));
+  const files = execSync(`git ls-tree -r --name-only ${wt.branch}`, { cwd: repo, encoding: 'utf8' });
+  assert.match(files, /agent-output\.txt/, 'the work did not land on the order branch');
+});
+
+test('SkillSpace\'s git gets a minimal environment, not every token the server holds', async () => {
+  // A wrapper ahead of the real git on PATH records the environment each
+  // invocation receives.
+  const realGit = execSync('command -v git', { encoding: 'utf8' }).trim();
+  const bin = tmpDir('skillspace-gitwrap-');
+  const dumps = tmpDir('skillspace-gitenv-');
+  fs.writeFileSync(path.join(bin, 'git'),
+    `#!/bin/sh\nenv > "${dumps}/$$.env"\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const saved = { PATH: process.env.PATH, AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY };
+  const repo = tmpGitRepo();
+  const root = tmpDir('skillspace-wthome-');
+  try {
+    process.env.PATH = `${bin}:${process.env.PATH}`;
+    process.env.AWS_SECRET_ACCESS_KEY = 'leak-me-not';
+    const wt = await worktrees.prepare(root, { kind: 'git', path: repo }, 'ord_envmin');
+    fs.writeFileSync(path.join(wt.cwd, 'agent-output.txt'), 'work\n');
+    await worktrees.cleanup(wt);
+    projects.detectKind(repo);
+  } finally {
+    process.env.PATH = saved.PATH;
+    if (saved.AWS_SECRET_ACCESS_KEY === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = saved.AWS_SECRET_ACCESS_KEY;
+  }
+  const envs = fs.readdirSync(dumps).map((f) => fs.readFileSync(path.join(dumps, f), 'utf8'));
+  assert.ok(envs.length >= 5, `expected every git call to go through the wrapper, saw ${envs.length}`);
+  for (const e of envs) {
+    assert.ok(!e.includes('leak-me-not'), 'a git invocation received the server\'s AWS token');
+    assert.match(e, /^GIT_CONFIG_NOSYSTEM=1$/m);
+    assert.match(e, /^GIT_CONFIG_GLOBAL=\/dev\/null$/m);
+  }
 });
