@@ -384,6 +384,10 @@ function openModal(skill) {
   $('#m-cat').textContent = skill.category;
   $('#m-desc').textContent = skill.description;
   $('#m-task').value = '';
+  $('#m-accept').value = '';
+  const proj = typeof boardCurrent === 'function' ? boardCurrent().project : null;
+  $('#m-order').disabled = !proj;
+  $('#m-order-note').textContent = oneOffNote(proj);
   updatePrompt();
   $('#modal').style.display = 'grid';
 }
@@ -447,6 +451,37 @@ $('#m-run').addEventListener('click', () => {
   const task = $('#m-task').value.trim();
   closeModal();
   runSkill(agent, skill, task);
+});
+
+$('#m-order').addEventListener('click', async () => {
+  const skill = state.current;
+  if (!skill) return;
+  const btn = $('#m-order');
+  btn.disabled = true;
+  try {
+    // The prompt is regenerated 200ms after typing stops; clicking inside that
+    // window would send the previous one. Regenerate now and wait for it.
+    clearTimeout(promptTimer); // the pending debounce would regenerate again behind us
+    await updatePrompt();
+    const task = $('#m-task').value.trim();
+    const res = await composeOneOffOrder({
+      title: task ? `${skill.name} · ${task}` : skill.name,
+      prompt: state.prompt,
+      acceptance: $('#m-accept').value.trim(),
+      agent: $('#agent').value,
+    });
+    if (!res.ok) {
+      toast(res.text, 'error');
+      if (res.reload) loadProjects();
+      return;
+    }
+    toast(res.text);
+    closeModal();
+    switchView('board');
+    openOrderDrawer(res.order.id);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 // ---------- 专家 ----------

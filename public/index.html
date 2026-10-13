@@ -125,15 +125,22 @@
         </div>
         <button class="modal-x" id="m-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
-      <div class="modal-desc" id="m-desc"></div>
+      <div class="modal-desc" id="m-desc" tabindex="0" role="region" aria-label="Skill 说明"></div>
       <label class="modal-label">补充说明 / 具体任务（可留空）</label>
       <textarea id="m-task" class="modal-task" placeholder="例如：帮我给这篇讲 Loop 工程的文章起 10 个标题"></textarea>
       <div class="modal-mode">
         <label class="mode-opt"><input type="radio" name="m-mode" value="path" checked> 路径口令<span class="mode-hint">指名 Skill + 补充说明 + SKILL.md 地址，Codex 自己读（推荐）</span></label>
         <label class="mode-opt"><input type="radio" name="m-mode" value="inject"> 完整口令<span class="mode-hint">把说明书整篇注入，换机器 / 读不到路径时用</span></label>
       </div>
+      <details class="modal-order" id="m-order-box">
+        <summary class="modal-label">派给项目（一次性订单）</summary>
+        <p class="modal-order-note" id="m-order-note"></p>
+        <label class="modal-label" for="m-accept">验收标准（可留空）</label>
+        <textarea id="m-accept" class="modal-task" rows="2" placeholder="例如：npm test 全绿，README 里写了新命令"></textarea>
+        <button class="btn" id="m-order" type="button">派给当前项目</button>
+      </details>
       <div class="modal-cmd-label">复制这段口令，粘贴到 Codex 对话框发送 <span id="m-chars" class="cmd-chars"></span></div>
-      <pre class="modal-cmd" id="m-cmd"></pre>
+      <pre class="modal-cmd" id="m-cmd" tabindex="0" role="region" aria-label="口令"></pre>
       <div class="modal-actions">
         <button class="btn ghost" id="m-cancel">取消</button>
         <button class="btn ghost" id="m-run">本地运行</button>

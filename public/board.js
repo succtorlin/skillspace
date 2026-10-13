@@ -291,3 +291,21 @@ function boardAddGoal(goal) {
   board = { ...board, goals: [goal, ...board.goals.filter((g) => g.id !== goal.id)] };
   boardRefresh();
 }
+
+// Called from app.js (the Skill modal). POST /api/orders creates AND
+// dispatches: no PM, no scheduler, no review. oneOffNote() says so in the
+// modal before the click.
+async function composeOneOffOrder({ title, prompt, acceptance, agent }) {
+  const p = board.project;
+  if (!p) return { ok: false, text: '先在左侧选一个项目' };
+  if (!prompt) return { ok: false, text: '口令还没生成好，稍等一下' };
+  const r = await boardPostJson('/api/orders', {
+    projectId: p.id, title, prompt, acceptance, ...(agent ? { agent } : {}),
+  });
+  if (r.ok && r.body && r.body.order) {
+    boardRefresh();
+    return { ok: true, order: r.body.order, text: `已派给「${p.name || p.path}」` };
+  }
+  if (r.status === 404) return { ok: false, reload: true, text: '这个项目不存在了，列表会刷新' };
+  return { ok: false, text: '派发失败：' + ((r.body && r.body.error) || (r.status ? `HTTP ${r.status}` : '无法连接服务器')) };
+}

@@ -290,3 +290,9 @@
 }
 .gp-held .btn { justify-self: start; }
 
+
+/* ---------- one-off order box in the Skill modal ---------- */
+.modal-order { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hair); }
+.modal-order > summary { cursor: pointer; }
+.modal-order-note { margin: 8px 0; font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch; }
+.modal-order .btn { margin-top: 8px; }
