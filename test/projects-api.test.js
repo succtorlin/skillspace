@@ -316,6 +316,14 @@ test('a body split mid-character round-trips intact', async () => {
   assert.ok(!rec.name.includes('\uFFFD'), 'name contains replacement characters');
 });
 
+test('registering a protected directory is the caller\'s 400, not a 500', async () => {
+  const r = await json('POST', '/api/projects', { name: 'root', path: '/' });
+  assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error, /^path is protected: /);
+  const s = await json('POST', '/api/projects', { name: 'store', path: storeRoot });
+  assert.strictEqual(s.status, 400, JSON.stringify(s.body));
+});
+
 test('a non-object JSON body cannot crash the server', async () => {
   // JSON.parse returns null, numbers, strings and arrays too. "null" is
   // truthy, so the empty-body ternary never fired and body[OVERSIZE]

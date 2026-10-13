@@ -38,11 +38,11 @@ module.exports = (deps) => {
       try {
         sendJson(res, 200, { project: projects.create(root, body) });
       } catch (e) {
-        // create() emits exactly two caller-fault shapes; anything else (EACCES
+        // create() emits exactly three caller-fault shapes; anything else (EACCES
         // on an unwritable store, for one) is ours, and reporting it as 400 told
         // the user their input was bad when the disk was.
         const msg = String((e && e.message) || e);
-        const clientFault = /^path (does not exist|is not a directory)/.test(msg);
+        const clientFault = /^path (does not exist|is not a directory|is protected)/.test(msg);
         sendJson(res, clientFault ? 400 : 500, { error: msg });
       }
       return true;

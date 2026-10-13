@@ -427,16 +427,33 @@ test('an ambient GIT_WORK_TREE cannot flip a junk .git into a repo', () => {
   }
 });
 
-test('a project at the filesystem root still gets a name', () => {
-  // path.basename('/') is '', and safeString only guards the value it is
-  // given, not the fallback — so name: "" reached disk and every UI site had
-  // to compensate by convention. Reachable through the console's own typed
-  // path fallback.
+test('the filesystem root, the home directory and SkillSpace\'s own store cannot be projects', () => {
+  // A dir project runs agents IN PLACE, with no worktree. Registering / or
+  // $HOME made "the project" every file the user owns, and registering the
+  // store (or any directory above it) let an agent rewrite SkillSpace's own
+  // records - its orders, its goals, its verdicts - from inside a run.
   const root = tmpRoot();
-  const p = projects.create(root, { path: '/' });
-  assert.notStrictEqual(p.name, '', 'an empty name forces every caller to paper over it');
-  assert.strictEqual(typeof p.name, 'string');
-  assert.ok(p.name.length > 0);
+  const inside = path.join(root, 'orders');
+  fs.mkdirSync(inside, { recursive: true });
+  for (const [what, dir] of [
+    ['the filesystem root', '/'],
+    ['the home directory', os.homedir()],
+    ['the store itself', root],
+    ['a directory inside the store', inside],
+    ['the store\'s parent', path.dirname(root)],
+  ]) {
+    assert.throws(() => projects.create(root, { path: dir }), /^Error: path is protected: /, what);
+  }
+  assert.deepStrictEqual(projects.list(root), [], 'a refused registration wrote nothing');
+  // A sibling of the store is an ordinary directory.
+  assert.ok(projects.create(root, { path: tmpDir() }).id);
+});
+
+test('a protected directory is refused through a symlink too', () => {
+  const root = tmpRoot();
+  const link = path.join(tmpDir(), 'to-store');
+  fs.symlinkSync(root, link);
+  assert.throws(() => projects.create(root, { path: link }), /path is protected/);
 });
 
 test('maxAttemptsPerOrder defaults to three and is bounded like every budget key', () => {
