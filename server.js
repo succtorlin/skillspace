@@ -94,12 +94,21 @@ function newExpertId() {
 }
 
 // 目录历史（本机状态，gitignore）
-const STATE_FILE = path.join(__dirname, '.skillspace.state.json');
+// Under SKILLSPACE_HOME when one is set, so a test or demo server never reads
+// or rewrites the real install's history (which is also where the console's
+// source list comes from). Unset, it stays where it always was, so an existing
+// install keeps its recent directories without any migration.
+const STATE_FILE = process.env.SKILLSPACE_HOME
+  ? path.join(process.env.SKILLSPACE_HOME, 'state.json')
+  : path.join(__dirname, '.skillspace.state.json');
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (_) { return {}; }
 }
 function saveState(s) {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch (_) {}
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+  } catch (_) {}
 }
 function recordDir(dir) {
   if (!dir) return;
