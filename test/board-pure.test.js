@@ -628,3 +628,22 @@ test('a log poll stops when the element it writes into is gone, not only when th
   assert.strictEqual(pure.logPollNext(true, live), 'again');
   assert.strictEqual(pure.logPollNext(true, { ok: false }), 'again', 'a failed read is retried while the element is there');
 });
+
+test('verdictRetryOffer: the door opens when the goal\'s PM is no longer installed, even with the loop judging', () => {
+  // The loop's judgeFor answers "not now" for an uninstalled PM, so the order
+  // waits for a verdict nothing will give. The door is the way out: the drawer
+  // then names the topbar agent as the judge.
+  const on = { scheduler: { running: true, judging: true } };
+  const g = { status: 'planned', pmAgent: 'codex' };
+  const offer = pure.verdictRetryOffer(judged({}), g, on, ['claude']);
+  assert.ok(offer, 'no door for an order whose PM is gone');
+  assert.match(offer.label, /验收/);
+  assert.strictEqual(offer.pmMissing, true);
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, on, ['claude', 'codex']), null, 'the PM is there; the loop will judge');
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, on), null, 'without the installed list, say nothing new');
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, on, []), null, 'no agent at all: nobody could take the door');
+});
+
+test('skipReasonText words a missing judge', () => {
+  assert.match(pure.skipReasonText('no judge available'), /PM/);
+});

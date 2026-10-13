@@ -290,6 +290,7 @@ const SKIP_REASON_TEXT = {
   'project unreadable': '项目记录读不了',
   'project paused after repeated failures to start': '项目连续启动失败，暂停中',
   'no agent available': '没有可用的 agent',
+  'no judge available': '目标的 PM 已经不在了，没人验收（在订单抽屉里换个 agent 验收）',
   'threw while being considered': '调度时出错',
 };
 function skipReasonText(reason) {
@@ -688,17 +689,23 @@ function retryOffer(order, chain, goal) {
 }
 
 // Whether to offer the verdict door (POST …/verdict/retry): an errored
-// verdict, or a result nothing will ever judge because the loop is off or
-// not judging. Returns { label } or null.
-function verdictRetryOffer(order, goal, cur) {
+// verdict, or a result nothing will ever judge - because the loop is off or
+// not judging, or because the goal's PM is no longer installed (the loop's
+// judgeFor answers "not now" for that, forever). `installed` is the list of
+// agent ids /api/config reports; without it the PM is assumed present.
+// Returns { label, pmMissing } or null.
+function verdictRetryOffer(order, goal, cur, installed) {
   if (!verdictPending(order) || verdictOf(order)) return null;
   if (goal && GOAL_SETTLED_STATES.includes(goal.status)) return null;
   const vs = order.verdictState === undefined ? null : order.verdictState;
-  if (vs === 'error') return { label: '重新验收' };
+  if (vs === 'error') return { label: '重新验收', pmMissing: false };
   if (vs !== null) return null;
   const s = cur && cur.scheduler;
   const loopJudges = !!s && s.running === true && s.judging !== false;
-  return loopJudges ? null : { label: '请 PM 验收' };
+  if (!loopJudges) return { label: '请 PM 验收', pmMissing: false };
+  const pmMissing = Array.isArray(installed) && installed.length > 0 &&
+    !!goal && typeof goal.pmAgent === 'string' && !installed.includes(goal.pmAgent);
+  return pmMissing ? { label: '换个 agent 验收', pmMissing: true } : null;
 }
 
 const RETRY_REASON_TEXT = [

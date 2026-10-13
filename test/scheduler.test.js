@@ -1974,3 +1974,29 @@ test('a goal store that cannot be listed does not cost the dispatch pass', async
     await drain();
   }
 });
+
+test('a goal whose PM is no longer installed says why it waits, instead of waiting silently', async () => {
+  // judgeFor answers "not now" when the goal's pmAgent is not installed, and
+  // the judge pass used to skip that silently: the goal sat at `planned`
+  // forever with every counter at zero and no reason anywhere.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  const warned = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => { warned.push(args.join(' ')); };
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => null, judgeFor: () => undefined });
+    await ticksPass(3, 15);
+    const s = scheduler.stats();
+    assert.strictEqual(s.lastSkip && s.lastSkip.reason, 'no judge available');
+    assert.strictEqual(s.lastSkip.orderId, a.id);
+    assert.strictEqual(warned.filter((w) => w.includes(a.id) && /judge/.test(w)).length, 1,
+      'warned once, not once per tick');
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned');
+  } finally {
+    console.warn = origWarn;
+    await drain();
+  }
+});

@@ -236,7 +236,9 @@ function drawerRenderActions(order) {
   r.setAttribute('aria-busy', drawer.pending === 'retry' ? 'true' : 'false');
   r.textContent = drawer.pending === 'retry' ? '新建中…' : '重试（新建一单）';
   const vr = drawerEl('ord-verdict-retry');
-  const offer = verdictRetryOffer(order, goal, b.sched);
+  const picker = document.getElementById('agent');
+  const installed = picker ? [...picker.options].map((o) => o.value).filter(Boolean) : [];
+  const offer = verdictRetryOffer(order, goal, b.sched, installed);
   vr.hidden = !offer;
   vr.disabled = drawer.pending === 'verdict';
   vr.textContent = drawer.pending === 'verdict' ? '交给 PM…' : offer ? offer.label : '重新验收';
