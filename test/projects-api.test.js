@@ -529,6 +529,21 @@ test('same-origin and header-less clients are still served', async () => {
   assert.strictEqual((await json('GET', '/api/projects')).status, 200);
 });
 
+test('an experts job token is 128 random bits, not Math.random and a timestamp', async () => {
+  // The token is the ONLY credential on the import callback, which is exempt
+  // from the API secret because an agent curls it.
+  const skillsDir = tmp('skillspace-skills-');
+  fs.mkdirSync(path.join(skillsDir, 'one'));
+  fs.writeFileSync(path.join(skillsDir, 'one', 'SKILL.md'), '---\nname: one\ndescription: d\n---\n');
+  const tokens = new Set();
+  for (let i = 0; i < 3; i++) {
+    const j = await (await fetch(`${base}/api/experts/job?dir=${encodeURIComponent(skillsDir)}`, { method: 'POST' })).json();
+    assert.match(j.token, /^[0-9a-f]{32}$/, `token ${j.token}`);
+    tokens.add(j.token);
+  }
+  assert.strictEqual(tokens.size, 3);
+});
+
 test('a top-level array reaches importExperts instead of being coerced away', async () => {
   // importExperts accepts `[...]` as well as {experts:[...]}, and a bare array
   // is a very plausible shape for the classification results an agent POSTs

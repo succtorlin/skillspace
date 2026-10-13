@@ -569,8 +569,11 @@ function buildExpertPrompt(expert, dir) {
 // ---------- 分类任务：出口令给 Codex / Claude Code 跑，再由它回传结果 ----------
 // 任务只活在内存里，进程重启就没了，本来也是一次性的。
 const JOBS = new Map();
+// The import callback's only credential: it is exempt from the API secret
+// because the agent that curls it is never given that. Math.random plus a
+// timestamp was guessable; 128 bits from the CSPRNG is not.
 function newToken() {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  return require('crypto').randomBytes(16).toString('hex');
 }
 function createJob(dir, skills) {
   const token = newToken();
