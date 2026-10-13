@@ -246,3 +246,13 @@ test('the experts import callback is the one exemption: its job token is its cre
   const job = await rawFetch(srv.base + '/api/experts/job?token=nope');
   assert.strictEqual(job.status, 401, 'only the import callback is exempt');
 });
+
+test('SKILLSPACE_ENV_PASSTHROUGH=1 is announced loudly at boot, and only then', async () => {
+  const s = await startServer({ SKILLSPACE_ENV_PASSTHROUGH: '1' });
+  try {
+    await waitFor('the boot banner', () => s.out().includes('/?auth='));
+    assert.match(s.out(), /WARNING.*SKILLSPACE_ENV_PASSTHROUGH=1/,
+      'the hatch that hands agents every token must not be silent');
+  } finally { await stop(s.proc); }
+  assert.doesNotMatch(srv.out(), /SKILLSPACE_ENV_PASSTHROUGH/);
+});

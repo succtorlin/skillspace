@@ -441,6 +441,17 @@ const ENV_PREFIXES = {
   qodercli: ['QODER_'],
 };
 
+// The hatch is kept, but never quietly: with it on, every agent gets every
+// token in this process's environment.
+if (process.env.SKILLSPACE_ENV_PASSTHROUGH === '1') {
+  console.warn(
+    '\n  ⚠ WARNING: SKILLSPACE_ENV_PASSTHROUGH=1 — every agent SkillSpace starts receives this\n' +
+    "    process's ENTIRE environment (AWS, GitHub, npm and any other tokens in it), not just\n" +
+    '    its own provider credentials. Add the missing prefix to ENV_PREFIXES in server.js\n' +
+    '    and turn this off.\n'
+  );
+}
+
 function childEnv(agent) {
   if (process.env.SKILLSPACE_ENV_PASSTHROUGH === '1') {
     return { ...process.env, PATH: CHILD_PATH };
