@@ -512,3 +512,15 @@ test('objectSpans is arraySpans for braces', () => {
   assert.deepStrictEqual(pm.objectSpans('stray } then {"a":1}'), ['{"a":1}']);
   assert.deepStrictEqual(pm.objectSpans('[{"a":1}]'), ['{"a":1}'], 'brackets are not counted');
 });
+
+test('a plan entry written as a markdown bullet loses the bullet, not the order', () => {
+  // orders.create refuses a prompt starting with "-" (it would reach the agent
+  // CLI as an option). A PM writing "- add the test" meant the text; strip the
+  // leading dashes here rather than fail the whole plan downstream.
+  const r = pm.extractPlan('[{"title":"a","prompt":"- add the test","acceptance":""},' +
+    '{"title":"b","prompt":"--force the push","acceptance":""}]');
+  assert.strictEqual(r.error, null);
+  assert.deepStrictEqual(r.orders.map((o) => o.prompt), ['add the test', 'force the push']);
+  const empty = pm.extractPlan('[{"title":"a","prompt":"---","acceptance":""}]');
+  assert.match(empty.error, /entry 0 has no prompt/);
+});

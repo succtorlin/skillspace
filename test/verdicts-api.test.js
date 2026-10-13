@@ -62,17 +62,19 @@ const SLOW_JUDGE = 'SLOW-JUDGE';
 //                      when the goal text says RETRY-ME
 //   an order prompt    prints that same plan text and exits 0: `succeeded`
 const SHIM = `#!/bin/sh
-case "$2" in
+# The prompt is the LAST argument (after "--" for claude/codex).
+for P; do :; done
+case "$P" in
   *"${VERDICT_OPENING}"*)
-    case "$2" in *${SLOW_JUDGE}*) sleep 30 ;; esac
-    case "$2" in
+    case "$P" in *${SLOW_JUDGE}*) sleep 30 ;; esac
+    case "$P" in
       *"REVIEWER FEEDBACK"*) printf '%s\\n' '{"verdict":"verified","reason":"fixed"}' ;;
       *JUDGE-REJECTS-ONCE*) printf '%s\\n' '{"verdict":"rejected","reason":"add the missing test"}' ;;
       *) printf '%s\\n' '{"verdict":"verified","reason":"looks right"}' ;;
     esac
     exit 0 ;;
 esac
-case "$2" in
+case "$P" in
   *RETRY-ME*)
 cat <<'JSON'
 [{"title":"one","prompt":"do one JUDGE-REJECTS-ONCE","acceptance":"one is done"}]
@@ -101,8 +103,9 @@ function rigAgent() {
   const localBin = path.join(fakeHome, '.local', 'bin');
   fs.mkdirSync(localBin, { recursive: true });
   for (const id of RIG_AGENTS) {
-    // buildArgs is (p) => ['-p', p] for claude and (p) => ['exec', p] for
-    // codex, so the prompt is $2 either way and one script serves both.
+    // buildArgs is (p) => ['-p', '--', p] for claude and (p) => ['exec', '--', p]
+    // for codex, so the prompt is the last argument either way and one script
+    // serves both.
     const shim = path.join(localBin, id);
     fs.writeFileSync(shim, SHIM);
     fs.chmodSync(shim, 0o755);

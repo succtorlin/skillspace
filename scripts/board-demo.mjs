@@ -46,9 +46,11 @@ if (String(port) === '4177') {
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
 
 const SHIM = `#!/bin/sh
-case "$2" in
+# The prompt is the LAST argument (after "--" for claude/codex).
+for P; do :; done
+case "$P" in
   *"You are reviewing one finished work order."*)
-    case "$2" in
+    case "$P" in
       *"REVIEWER FEEDBACK"*) echo '{"verdict":"verified","reason":"fixed: the feedback was addressed"}' ;;
       *DEMO-REJECT*) echo '{"verdict":"rejected","reason":"edited the wrong file"}' ;;
       *DEMO-EXIT3*) echo '{"verdict":"rejected","reason":"it exited 3 and did not do the work"}' ;;
@@ -57,7 +59,7 @@ case "$2" in
     esac
     exit 0 ;;
   *"You are planning work"*)
-    case "$2" in
+    case "$P" in
       *DEMO-TOO-BIG*)
         i=0; printf '['
         while [ $i -lt 13 ]; do

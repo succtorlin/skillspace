@@ -54,7 +54,7 @@ function errorMessage(e) {
 // reword. That fix now has ONE site to land in instead of two, which is half
 // the reason this file exists.
 function clientFault(e) {
-  return /^\w+ (is required|is too long)/.test(errorMessage(e));
+  return /^\w+ (is required|is too long|must not start with)/.test(errorMessage(e));
 }
 
 // Which agent a request asked for, or why it cannot have one.

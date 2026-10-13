@@ -73,7 +73,9 @@ const NAP_SECONDS = 3;
 const PROSE = 'I would start by reading the README and then talking to someone.';
 
 const PM_SHIM = `#!/bin/sh
-case "$2" in
+# The prompt is the LAST argument (after "--" for claude/codex).
+for P; do :; done
+case "$P" in
   *${PROSE_MARK}*) echo "${PROSE}" ; exit 0 ;;
   *${SLOW_MARK}*) sleep ${SLOW_SECONDS} ;;
   *${NAP_MARK}*) sleep ${NAP_SECONDS} ;;
@@ -99,8 +101,9 @@ function rigAgent() {
   const localBin = path.join(fakeHome, '.local', 'bin');
   fs.mkdirSync(localBin, { recursive: true });
   for (const id of RIG_AGENTS) {
-    // buildArgs is (p) => ['-p', p] for claude and (p) => ['exec', p] for
-    // codex, so the prompt is $2 either way and one script serves both.
+    // buildArgs is (p) => ['-p', '--', p] for claude and (p) => ['exec', '--', p]
+    // for codex, so the prompt is the last argument either way and one script
+    // serves both.
     const shim = path.join(localBin, id);
     fs.writeFileSync(shim, PM_SHIM);
     fs.chmodSync(shim, 0o755);

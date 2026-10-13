@@ -330,13 +330,21 @@ function readSkills(dir) {
 function detectAgents() {
   const found = [];
   // Each entry declares how ITS binary takes a headless prompt. Verified:
-  //   claude -p <prompt>          (--print / non-interactive)
+  //   claude -p -- <prompt>       (--print / non-interactive)
   //   opencode run <message>
-  //   codex exec <prompt>
+  //   codex exec -- <prompt>
   //   qodercli -p <prompt>
+  //
+  // The prompt is one argv element, but each CLI parses its own arguments, so
+  // a prompt beginning with "-" would be read as an option. "--" ends option
+  // parsing where the parser is known to honour it: claude's is commander and
+  // codex's is clap, both of which do. opencode's (yargs) and qodercli's could
+  // not be confirmed without running a prompt through them, so they are left
+  // as they were - and lib/orders.create refuses a prompt that starts with
+  // "-", which covers every agent whatever its parser does.
   for (const [id, bin, run] of [
-    ['claude', 'claude', (p) => ['-p', p]],
-    ['codex', 'codex', (p) => ['exec', p]],
+    ['claude', 'claude', (p) => ['-p', '--', p]],
+    ['codex', 'codex', (p) => ['exec', '--', p]],
     ['opencode', 'opencode', (p) => ['run', p]],
     ['qodercli', 'qodercli', (p) => ['-p', p]],
   ]) {
@@ -643,7 +651,8 @@ function buildCommand(agentId, name, task, dir, folder) {
   // 预览命令做精简展示，不把整篇说明书铺出来。
   // 子命令/开关直接取自真实 args，预览和实际执行不会各说各话。
   const args = agent.buildArgs(prompt);
-  const flag = args.length > 1 ? args[0] : '';
+  // The flags shown are everything before the prompt, "--" included.
+  const flag = args.slice(0, -1).join(' ');
   const display = body
     ? `${agent.bin} ${flag} "〈注入「${name}」Skill 说明书〉+ 任务：${task || '默认流程'}"`
     : `${agent.bin} ${flag} "请使用「${name}」这个 Skill：${task || '默认流程'}"`;

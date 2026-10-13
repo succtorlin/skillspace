@@ -481,3 +481,16 @@ test('a record written before verdicts existed can still be judged', () => {
   const r = orders.recordVerdict(root, id, { verdictState: 'judging', verdictRuns: 1 });
   assert.strictEqual(r.verdictState, 'judging');
 });
+
+test('a prompt that would reach the agent CLI as an option is refused', () => {
+  // The prompt is one argv element. For a CLI whose argv SkillSpace cannot end
+  // with `--` (opencode, qodercli), "--dangerously-skip-permissions" as the
+  // whole prompt would be parsed as that flag, not sent as text.
+  const root = tmpRoot();
+  for (const prompt of ['-rf /', '--dangerously-skip-permissions', '  --help']) {
+    assert.throws(() => orders.create(root, { projectId: 'prj-1', prompt }),
+      /^Error: prompt must not start with "-"/, prompt);
+  }
+  assert.ok(orders.create(root, { projectId: 'prj-1', prompt: 'fix the -v flag' }).id,
+    'a dash inside the prompt is fine');
+});

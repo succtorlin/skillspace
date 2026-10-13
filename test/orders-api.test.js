@@ -65,10 +65,11 @@ function rigAgent() {
   const localBin = path.join(fakeHome, '.local', 'bin');
   fs.mkdirSync(localBin, { recursive: true });
   const shim = path.join(localBin, 'claude');
-  // agent.buildArgs for claude is (p) => ['-p', p], so the prompt is $2.
+  // agent.buildArgs for claude is (p) => ['-p', '--', p], so the prompt is the
+  // last argument.
   fs.writeFileSync(
     shim,
-    `#!/bin/sh\ncase "$2" in\n  *${SLOW_MARK}*) sleep ${SLOW_SECONDS} ;;\nesac\nexit 0\n`
+    `#!/bin/sh\nfor P; do :; done\ncase "$P" in\n  *${SLOW_MARK}*) sleep ${SLOW_SECONDS} ;;\nesac\nexit 0\n`
   );
   fs.chmodSync(shim, 0o755);
 }
@@ -298,6 +299,13 @@ test('POST /api/orders rejects an unknown project with 404', async () => {
   const r = await json('POST', '/api/orders', { projectId: 'prj-nope', prompt: 'do a thing' });
   assert.strictEqual(r.status, 404, JSON.stringify(r.body));
   assert.match(r.body.error, /no such project/);
+});
+
+test('POST /api/orders refuses a prompt shaped like a CLI option with 400', async () => {
+  const project = await makeProject();
+  const r = await json('POST', '/api/orders', { projectId: project.id, prompt: '--dangerously-skip-permissions' });
+  assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+  assert.match(r.body.error, /must not start with "-"/);
 });
 
 test('POST /api/orders rejects a missing prompt with 400, not 500', async () => {
