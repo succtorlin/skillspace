@@ -428,3 +428,12 @@ test('oneOffNote says a directory project is edited in place', () => {
   assert.match(pure.oneOffNote(null), /先在左侧选一个项目/);
   assert.match(pure.oneOffNote({ name: 'x', kind: 'git' }), /不经过 PM/);
 });
+
+// ---------- claimed (Task 0) ----------
+test('orderRowStatus: a claimed queued order is starting, not waiting', () => {
+  assert.deepStrictEqual(pure.orderRowStatus(order({ status: 'queued', claimed: true }), null), { text: '正在启动', dot: 'running' });
+  assert.deepStrictEqual(pure.orderRowStatus(order({ status: 'queued' }), null), { text: '排队', dot: 'queued' });
+  assert.deepStrictEqual(pure.orderRowStatus(order({ status: 'failed', error: 'timeout', startedAt: 'x' }), null), { text: '超时，被终止', dot: 'failed' });
+  assert.deepStrictEqual(pure.orderRowStatus(order({ status: 'running', claimed: true }), null), { text: '运行中', dot: 'running' });
+  assert.strictEqual(pure.orderRowStatus(order({ status: undefined }), null).dot, 'unknown');
+});

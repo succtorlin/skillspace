@@ -91,6 +91,9 @@
   display: grid; gap: 12px; margin: 12px 10px 40px; align-items: start;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
   grid-template-areas: "head head" "orders compose" "orders budget";
+  /* the last row takes the slack, so the limits panel sits under the
+     composer instead of floating halfway down a long orders column */
+  grid-template-rows: auto auto 1fr;
 }
 .bd-head { grid-area: head; }
 .bd-orders { grid-area: orders; }
@@ -114,7 +117,7 @@
 .side-group[open] > summary::after { content: "－"; content: "－" / ""; }
 
 @media (max-width: 1024px) {
-  .view-board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "compose" "orders" "budget"; }
+  .view-board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "compose" "orders" "budget"; grid-template-rows: none; }
 }
 @media (max-width: 560px) {
   .view-board { margin-left: 6px; margin-right: 6px; }
@@ -138,3 +141,43 @@
   color: inherit; font: inherit; text-align: left; cursor: pointer;
 }
 .proj-del { min-width: 24px; min-height: 24px; justify-content: center; margin-left: 0; }
+
+/* ---------- groups and rows ---------- */
+.bd-groups { display: grid; gap: 4px; }
+.bd-group-head {
+  display: flex; align-items: center; gap: 8px; padding: 12px 8px 4px;
+  font-family: var(--face-mono); font-size: 11px; font-weight: 400;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2);
+}
+.bd-n { font-variant-numeric: tabular-nums; color: var(--muted); letter-spacing: 0; }
+.bd-rows { list-style: none; display: grid; gap: 2px; }
+.bd-row {
+  display: grid; align-items: center; gap: 12px; width: 100%;
+  grid-template-columns: 6ch minmax(0, 1fr) 9ch 15ch 8ch;
+  grid-template-areas: "seq title agent status dur";
+  padding: 8px; border-radius: 8px; border: 1px solid transparent;
+  background: transparent; color: var(--ink); font: inherit; font-size: 13.5px;
+  text-align: left; cursor: pointer;
+}
+.bd-row:hover { background: var(--ground-2); border-color: var(--hair); }
+.bd-row:active { border-color: var(--hair-lit); }
+.bd-row .seq { grid-area: seq; }
+.bd-title { grid-area: title; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-agent, .bd-dur {
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--ink-2);
+}
+.bd-agent { grid-area: agent; }
+.bd-dur { grid-area: dur; text-align: right; }
+.bd-status { grid-area: status; display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.bd-filter {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+  font-size: 12.5px; color: var(--ink-2);
+}
+@media (max-width: 560px) {
+  .bd-row {
+    grid-template-columns: 6ch minmax(0, 1fr) auto;
+    grid-template-areas: "seq title status" "seq agent dur";
+    row-gap: 2px;
+  }
+  .bd-dur { text-align: right; }
+}

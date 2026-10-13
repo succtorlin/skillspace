@@ -522,6 +522,17 @@ function oneOffNote(project) {
     '路径口令里的 SKILL.md 在项目外，agent 读不到时改用「完整口令」。';
 }
 
+// What a board row says about where an order is. A queued order that dispatch
+// already holds (GET /api/orders' `claimed`, plan 3 Task 0) is STARTING - its
+// worktree is being made - and must not read as waiting in line.
+function orderRowStatus(order, budget) {
+  const st = order && order.status;
+  if (st === 'queued' && order.claimed === true) return { text: '正在启动', dot: 'running' };
+  const f = failureView(order, budget);
+  const known = Object.prototype.hasOwnProperty.call(ORDER_STATUS_TEXT, st);
+  return { text: f ? f.title : orderStatusText(st), dot: known ? st : 'unknown' };
+}
+
 // Inert in the browser: a classic script has no `module`, so the typeof guard
 // short-circuits and the declarations above simply stay globals.
 if (typeof module !== 'undefined' && module.exports) {
@@ -533,5 +544,6 @@ if (typeof module !== 'undefined' && module.exports) {
     boardState, goalOrderIds,
     schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
+    orderRowStatus,
   };
 }
