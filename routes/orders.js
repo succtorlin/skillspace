@@ -2,6 +2,7 @@
 const projects = require('../lib/projects');
 const orders = require('../lib/orders');
 const dispatch = require('../lib/dispatch');
+const attempts = require('../lib/attempts');
 const requireDeps = require('./deps');
 const {
   RUN_ROUTE_REQUIRED, errorMessage, clientFault, resolveAgent,
@@ -101,7 +102,12 @@ module.exports = (deps) => {
   return async ({ req, res, u, p }) => {
     if (p === '/api/orders' && req.method === 'GET') {
       const projectId = u.searchParams.get('project') || null;
-      sendJson(res, 200, { orders: orders.list(root, projectId ? { projectId } : {}) });
+      const list = orders.list(root, projectId ? { projectId } : {});
+      // Chains BESIDE the records, never merged in: supersededBy is derived,
+      // and a client must not be able to mistake it for a stored fact. One goal
+      // read per goal on the page, not per order. Known limit: O(page) on top
+      // of list()'s O(store), on a route the board will poll.
+      sendJson(res, 200, { orders: list, chains: attempts.chainMap(root, list) });
       return true;
     }
 
@@ -237,7 +243,22 @@ module.exports = (deps) => {
         sendJson(res, 404, { error: 'no such order' });
         return true;
       }
-      sendJson(res, 200, { order });
+      // A goal order's chain is read from its goal's orderIds; a loose order's
+      // from its project's loose orders - O(project) for that case, recorded.
+      //
+      // The chain is a DERIVATION beside the record and must never cost the
+      // record itself. The loose case needs a listing of the store, which this
+      // GET otherwise never does - it reads one known path, and
+      // test/orders-api's rejected-dispatch test polls it while orders/ has no
+      // read bit. A family that cannot be read is `chain: null`, the contract's
+      // "could not be established", never a 500 over a record that is readable.
+      let chain = null;
+      try {
+        chain = attempts.chainFor(root, order);
+      } catch (e) {
+        console.warn('[orders] could not derive the chain of %s: %s', id, errorMessage(e));
+      }
+      sendJson(res, 200, { order, chain });
       return true;
     }
 

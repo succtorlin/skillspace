@@ -442,3 +442,203 @@ test('a judge holds the shutdown drain open and is reaped by it', async () => {
     await stopServer(s.child);
   }
 });
+
+// ------------------------------------------------------------ the human doors
+
+// Humans drive here, so the loop is OFF and every judgement or retry below is
+// one the test caused.
+async function humanServer(prefix) {
+  const home = tmp(prefix);
+  const s = await startServer(home, { SKILLSPACE_SCHEDULER: '0' });
+  const project = await makeGitProject(s.base);
+  return { home, s, project };
+}
+
+// A goal naming one finished order, written straight to the store.
+function seedJudged(home, project, extra) {
+  const o = seedOrder(home, 'succeeded', {
+    projectId: project.id, prompt: 'add the flag', acceptance: 'the flag is tested',
+    title: 'Flag', seq: 0, exitCode: 0, startedAt: new Date().toISOString(), ...(extra || {}),
+  });
+  const g = seedGoal(home, 'planned', { projectId: project.id, orderIds: [o], pmAgent: 'claude' });
+  store.writeJson(home, `orders/${o}.json`, { ...readOrder(home, o), goalId: g });
+  return { o, g };
+}
+
+// undici rewrites Sec-Fetch-Mode to `cors` on its own requests but leaves
+// Sec-Fetch-Dest alone, and the server's guard refuses on EITHER - so this
+// reaches the guard through its `document` half. The guard itself is pinned
+// shape by shape over a raw socket in test/orders-api.test.js; what this pins
+// is that the retry route calls it at all.
+const NAV = { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' };
+
+test('POST /api/orders/:id/retry supersedes a rejected order and returns its chain', async () => {
+  const { home, s, project } = await humanServer('vrd-retryhome-');
+  try {
+    const { o, g } = seedJudged(home, project, {
+      verdictState: 'judged', verdict: 'rejected', verdictReason: 'no test', retryRefused: 'no attempts left (3 of 3)',
+    });
+    const before = readOrder(home, o);
+    const r = await json('POST', `/api/orders/${o}/retry`, undefined, s.base);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.strictEqual(r.body.order.supersedes, o);
+    assert.strictEqual(r.body.order.status, 'queued');
+    assert.match(r.body.order.prompt, /no test/);
+    assert.deepStrictEqual(r.body.chain, {
+      rootId: o, headId: r.body.order.id, ids: [o, r.body.order.id],
+      attempt: 2, attempts: 2, supersedes: o, supersededBy: null,
+    });
+    assert.deepStrictEqual(readGoal(home, g).orderIds, [o, r.body.order.id]);
+    assert.deepStrictEqual(readOrder(home, o), before, 'the rejected order was touched');
+
+    const again = await json('POST', `/api/orders/${o}/retry`, undefined, s.base);
+    assert.strictEqual(again.status, 409);
+    assert.match(again.body.error, /already superseded/);
+    assert.strictEqual(again.body.supersededBy, r.body.order.id);
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('two concurrent retries of one order create one attempt', async () => {
+  // The authority is supersede()'s synchronous check-then-create, seen from
+  // the wire. NOT a complete guard against an await creeping in: measured, it
+  // catches a yield long enough for the second request to be read (a 5ms
+  // timer) but not `await null` or a setImmediate. The synchronous contract
+  // itself is pinned in test/attempts.test.js, where every await is caught.
+  const { home, s, project } = await humanServer('vrd-racehome-');
+  try {
+    const { o, g } = seedJudged(home, project, { status: 'cancelled', startedAt: null });
+    const [a, b] = await Promise.all([
+      json('POST', `/api/orders/${o}/retry`, undefined, s.base),
+      json('POST', `/api/orders/${o}/retry`, undefined, s.base),
+    ]);
+    assert.deepStrictEqual([a.status, b.status].sort(), [200, 409]);
+    assert.strictEqual(readGoal(home, g).orderIds.length, 2);
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('POST /api/orders/:id/retry refuses what must not be retried', async () => {
+  const { home, s, project } = await humanServer('vrd-refusehome-');
+  try {
+    const post = (id, headers) => fetch(`${s.base}/api/orders/${id}/retry`, { method: 'POST', headers });
+    const queued = seedJudged(home, project, { status: 'queued', startedAt: null }).o;
+    const verified = seedJudged(home, project, { verdictState: 'judged', verdict: 'verified', verdictReason: 'ok' }).o;
+    const awaiting = seedJudged(home, project).o;
+    assert.strictEqual((await post(queued)).status, 409);
+    assert.strictEqual((await post(verified)).status, 409);
+    const aw = await post(awaiting);
+    assert.strictEqual(aw.status, 409);
+    assert.match((await aw.json()).error, /awaiting its verdict/);
+    assert.strictEqual((await post('ord-nope')).status, 404);
+    assert.strictEqual((await post('..%2F..%2Fetc')).status, 400);
+    const cancelled = seedJudged(home, project, { status: 'cancelled', startedAt: null });
+    const nav = await post(cancelled.o, NAV);
+    assert.strictEqual(nav.status, 403, 'a link clicked in Mail must not start work');
+    assert.strictEqual(readGoal(home, cancelled.g).orderIds.length, 1, 'the refused request created an order');
+    // POST only. 2b's dispatch route once answered GET and spawned an agent.
+    const got = await fetch(`${s.base}/api/orders/${cancelled.o}/retry`);
+    assert.strictEqual(got.status, 404, 'the retry door answered a GET');
+    assert.strictEqual(readGoal(home, cancelled.g).orderIds.length, 1, 'a GET created an order');
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('POST /api/orders/:id/retry answers 429 at the daily cap', async () => {
+  const home = tmp('vrd-caphome-');
+  const s = await startServer(home, { SKILLSPACE_SCHEDULER: '0' });
+  try {
+    const r = await json('POST', '/api/projects', { name: 'Capped', path: gitRepoDir(), budget: { maxOrdersPerDay: 1 } }, s.base);
+    const { o } = seedJudged(home, r.body.project, { status: 'cancelled', startedAt: null });
+    const res = await json('POST', `/api/orders/${o}/retry`, undefined, s.base);
+    assert.strictEqual(res.status, 429);
+    assert.match(res.body.error, /daily limit/);
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('POST /api/orders/:id/verdict/retry re-judges an errored verdict, once at a time', async () => {
+  const { home, s, project } = await humanServer('vrd-vretryhome-');
+  try {
+    const { o } = seedJudged(home, project, {
+      verdictState: 'error', verdictError: 'the PM returned no JSON verdict', verdictRuns: 1,
+    });
+    const [a, b] = await Promise.all([
+      json('POST', `/api/orders/${o}/verdict/retry`, {}, s.base),
+      json('POST', `/api/orders/${o}/verdict/retry`, {}, s.base),
+    ]);
+    assert.deepStrictEqual([a.status, b.status].sort(), [200, 409], 'judge() admission is the authority');
+    const ok = a.status === 200 ? a : b;
+    assert.strictEqual(ok.body.order.verdictState, 'judging');
+    const rec = await waitFor('the verdict', () => {
+      const x = readOrder(home, o);
+      return x.verdictState === 'judged' && x;
+    });
+    assert.strictEqual(rec.verdict, 'verified');
+    assert.strictEqual(rec.verdictRuns, 2);
+    assert.strictEqual(rec.verdictAgent, 'claude', "the goal's own PM judged it");
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('POST /api/orders/:id/verdict/retry refuses what cannot or must not be judged', async () => {
+  const { home, s, project } = await humanServer('vrd-vrefusehome-');
+  try {
+    const post = (id, body) => json('POST', `/api/orders/${id}/verdict/retry`, body || {}, s.base);
+    const judged = seedJudged(home, project, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'r' }).o;
+    assert.match((await post(judged)).body.error, /already judged: rejected/);
+    const cancelled = seedJudged(home, project, { status: 'cancelled', startedAt: null }).o;
+    const c = await post(cancelled);
+    assert.strictEqual(c.status, 409);
+    assert.match(c.body.error, /no result to judge/);
+    const loose = seedOrder(home, 'succeeded', { projectId: project.id, startedAt: new Date().toISOString() });
+    assert.match((await post(loose)).body.error, /outside a goal/);
+    const named = await post(seedJudged(home, project, { verdictState: 'error' }).o, { agent: 'nope' });
+    assert.strictEqual(named.status, 400, 'a named agent that does not exist is the caller\'s fault');
+    // The other half of that line: a STORED pmAgent that is no longer installed
+    // is the state's fault, not the caller's - 409, never 400.
+    const stale = seedJudged(home, project, { verdictState: 'error' });
+    store.writeJson(home, `goals/${stale.g}.json`, { ...readGoal(home, stale.g), pmAgent: 'gone' });
+    const st = await post(stale.o);
+    assert.strictEqual(st.status, 409, JSON.stringify(st.body));
+    assert.strictEqual((await post('ord-nope')).status, 404);
+    // POST only: a GET must not start a credentialed judge.
+    const got = await fetch(`${s.base}/api/orders/${stale.o}/verdict/retry`);
+    assert.strictEqual(got.status, 404, 'the verdict door answered a GET');
+    assert.strictEqual(readOrder(home, stale.o).verdictState, 'error', 'a GET started a judge');
+  } finally {
+    await stopServer(s.child);
+  }
+});
+
+test('chains come beside the records on every GET, never inside them', async () => {
+  const { home, s, project } = await humanServer('vrd-gethome-');
+  try {
+    const { o, g } = seedJudged(home, project, {
+      verdictState: 'judged', verdict: 'rejected', verdictReason: 'r', retryRefused: 'cap',
+    });
+    const next = (await json('POST', `/api/orders/${o}/retry`, undefined, s.base)).body.order.id;
+
+    const one = await json('GET', `/api/orders/${next}`, undefined, s.base);
+    assert.strictEqual(one.body.chain.attempt, 2);
+    assert.strictEqual(one.body.chain.rootId, o);
+    assert.strictEqual(one.body.order.supersededBy, undefined, 'a derivation leaked into the record');
+
+    const root = await json('GET', `/api/orders/${o}`, undefined, s.base);
+    assert.strictEqual(root.body.chain.supersededBy, next);
+
+    const goal = await json('GET', `/api/goals/${g}`, undefined, s.base);
+    assert.strictEqual(goal.body.chains[o].attempt, 1);
+    assert.strictEqual(goal.body.chains[next].attempt, 2);
+
+    const list = await json('GET', `/api/orders?project=${project.id}`, undefined, s.base);
+    assert.strictEqual(list.body.chains[next].supersedes, o);
+  } finally {
+    await stopServer(s.child);
+  }
+});

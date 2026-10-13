@@ -31,6 +31,7 @@ const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
 const makeGoalRoutes = require('./routes/goals');
 const makeSchedulerRoutes = require('./routes/scheduler');
+const makeAttemptRoutes = require('./routes/attempts');
 
 const PORT = process.env.PORT || 4177;
 // Declared here rather than beside listen(), because the Host-header guard
@@ -873,6 +874,10 @@ const goalRoutes = makeGoalRoutes(routeDeps);
 // Takes the same deps object as the other three and uses one key of it. See
 // routes/scheduler.js for why the list is that short.
 const schedulerRoutes = makeSchedulerRoutes(routeDeps);
+// The two doors a human uses after a verdict. None of its paths overlaps a
+// sibling's: routes/orders.js matches /api/orders/:id exactly, /:id/cancel and
+// /:id/dispatch.
+const attemptRoutes = makeAttemptRoutes(routeDeps);
 
 async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
@@ -883,7 +888,7 @@ async function route(req, res, u, p) {
   if (p === '/landing.css') return serveStatic(res, 'landing.css');
   if (p === '/landing.js') return serveStatic(res, 'landing.js');
 
-  // Each module answers or declines; none of the four overlaps any path below
+  // Each module answers or declines; none of the five overlaps any path below
   // or each other, so the order they are tried in and their position here are
   // free. Their constants
   // were bound once at construction (see routeDeps); only the four per-request
@@ -893,6 +898,7 @@ async function route(req, res, u, p) {
   if (await orderRoutes(rq)) return;
   if (await goalRoutes(rq)) return;
   if (await schedulerRoutes(rq)) return;
+  if (await attemptRoutes(rq)) return;
 
   if (p === '/api/config') {
     return sendJson(res, 200, {

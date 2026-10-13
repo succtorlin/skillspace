@@ -4,6 +4,7 @@ const goals = require('../lib/goals');
 const orders = require('../lib/orders');
 const planner = require('../lib/plan');
 const dispatch = require('../lib/dispatch');
+const attempts = require('../lib/attempts');
 const requireDeps = require('./deps');
 const {
   RUN_ROUTE_REQUIRED, isPlainId, errorMessage, clientFault, resolveAgent,
@@ -204,10 +205,9 @@ module.exports = (deps) => {
       // outcome the paragraph above says must not happen. No data was ever
       // exposed; store.abs refuses before it reads.
       const orderIds = (Array.isArray(goal.orderIds) ? goal.orderIds : []).filter(isPlainId);
-      sendJson(res, 200, {
-        goal,
-        orders: orderIds.map((oid) => orders.get(root, oid)).filter(Boolean),
-      });
+      const found = orderIds.map((oid) => orders.get(root, oid)).filter(Boolean);
+      // Chains beside the records, never merged in - see routes/orders.js.
+      sendJson(res, 200, { goal, orders: found, chains: attempts.chainMap(root, found) });
       return true;
     }
 

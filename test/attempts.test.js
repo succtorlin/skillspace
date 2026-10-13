@@ -208,3 +208,21 @@ test('a rollback orphan does not read as a successor', () => {
   // A fresh read: `a` above predates attachToGoal, so its goalId is null.
   assert.strictEqual(attempts.chainFor(root, orders.get(root, a.id)).supersededBy, r.order.id);
 });
+
+test('supersede answers synchronously - that is the whole concurrency story', () => {
+  // lib/attempts' header: the uniqueness check and the create that acts on it
+  // have no await between them, so the tick and a request cannot both
+  // supersede one order. An async supersede() breaks that, and the HTTP
+  // double-POST in test/verdicts-api only notices a yield long enough for the
+  // second request to arrive - measured: a 5ms timer is caught; `await null`
+  // and a setImmediate yield are not. This pins the contract for every await.
+  const { root, project } = setup();
+  const { made: [a] } = goalWith(root, project);
+  reject(root, a.id);
+  const r = attempts.supersede(root, { orderId: a.id, origin: 'verdict' });
+  assert.strictEqual(typeof (r && r.then), 'undefined', 'supersede returned a promise');
+  assert.ok(r.order, r.refused);
+  const again = attempts.supersede(root, { orderId: a.id, origin: 'human' });
+  assert.strictEqual(typeof (again && again.then), 'undefined', 'a refusal returned a promise');
+  assert.match(again.refused, /already superseded/);
+});
