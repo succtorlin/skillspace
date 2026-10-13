@@ -107,12 +107,37 @@ after(async () => {
   for (const d of created) fs.rmSync(d, { recursive: true, force: true });
 });
 
-test('the secret is 32 random bytes printed once as a link, and differs per boot', async () => {
+test('a non-TTY boot keeps the secret off stdout and writes it to a 0600 console-link file', async () => {
+  // launchd sends stdout to a world-readable log (/tmp/skillspace.log, 644),
+  // which any agent could cat. Spawned with pipes, stdout is not a TTY.
   assert.match(srv.secret, /^[0-9a-f]{64}$/);
-  assert.ok(srv.out().includes(`/?auth=${srv.secret}`), 'the link is what a human opens');
+  assert.doesNotMatch(srv.out(), /[0-9a-f]{64}/, 'the secret reached a non-TTY stdout');
+  const file = path.join(srv.home, 'console-link');
+  assert.ok(srv.out().includes(file), 'stdout names where the link is');
+  assert.match(srv.out(), /\?auth=<see console-link file>/);
+  const st = fs.statSync(file);
+  assert.strictEqual(st.mode & 0o777, 0o600, `mode ${(st.mode & 0o777).toString(8)}`);
+  const link = fs.readFileSync(file, 'utf8').trim();
+  assert.strictEqual(link, `http://localhost:${srv.port}/?auth=${srv.secret}`);
+  // The link in the file is the one that works.
+  const r = await rawFetch(`http://127.0.0.1:${srv.port}/?auth=${new URL(link).searchParams.get('auth')}`, { redirect: 'manual' });
+  assert.strictEqual(r.status, 302);
+  assert.match(r.headers.get('set-cookie') || '', /HttpOnly/);
+});
+
+test('the secret differs per boot, and a clean shutdown removes the console-link file', async () => {
   const other = await startServer();
-  try { assert.notStrictEqual(other.secret, srv.secret, 'per boot, not fixed'); }
-  finally { await stop(other.proc); }
+  const file = path.join(other.home, 'console-link');
+  assert.notStrictEqual(other.secret, srv.secret, 'per boot, not fixed');
+  assert.ok(fs.existsSync(file));
+  await stop(other.proc);
+  assert.strictEqual(other.proc.exitCode, 0, 'not a clean shutdown');
+  assert.ok(!fs.existsSync(file), 'a stale key file outlived the server');
+});
+
+test('the lock page points at npm run open', async () => {
+  const html = await (await rawFetch(srv.base + '/')).text();
+  assert.match(html, /npm run open/);
 });
 
 test('every /api/* route refuses a request without the secret', async () => {
@@ -250,7 +275,7 @@ test('the experts import callback is the one exemption: its job token is its cre
 test('SKILLSPACE_ENV_PASSTHROUGH=1 is announced loudly at boot, and only then', async () => {
   const s = await startServer({ SKILLSPACE_ENV_PASSTHROUGH: '1' });
   try {
-    await waitFor('the boot banner', () => s.out().includes('/?auth='));
+    await waitFor('the boot banner', () => s.out().includes('?auth='));
     assert.match(s.out(), /WARNING.*SKILLSPACE_ENV_PASSTHROUGH=1/,
       'the hatch that hands agents every token must not be silent');
   } finally { await stop(s.proc); }

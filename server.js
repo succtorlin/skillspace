@@ -31,6 +31,7 @@ const scheduler = require('./lib/scheduler');
 // version is that the Origin/Host checks below stop a web page, and this stops
 // a local process - including an agent this server spawned.
 const auth = require('./lib/auth');
+const consoleLink = require('./lib/console-link');
 const makeProjectRoutes = require('./routes/projects');
 const makeOrderRoutes = require('./routes/orders');
 const makeGoalRoutes = require('./routes/goals');
@@ -49,6 +50,12 @@ const HOME = os.homedir();
 // SKILLSPACE_ENV_PASSTHROUGH=1 can hand it to an agent). Printed once, as the
 // link in the listen() banner below.
 const API_SECRET = auth.newSecret();
+const CONSOLE_LINK = `http://localhost:${PORT}/?auth=${API_SECRET}`;
+const CONSOLE_LINK_FILE = consoleLink.defaultFile();
+// Removed on any exit this process gets to run code for (the shutdown handler
+// below ends in process.exit). A SIGKILL leaves it behind; the next boot
+// overwrites it, and its key no longer works anyway.
+process.on('exit', () => consoleLink.remove(CONSOLE_LINK_FILE, CONSOLE_LINK));
 
 // Durable records live outside both the app directory and the user's repos, so
 // upgrading SkillSpace never touches data and a project directory never gains
@@ -896,7 +903,7 @@ const LOCK_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"
 code{background:#222;padding:2px 6px;border-radius:4px}</style></head><body>
 <h1>SkillSpace 已上锁</h1>
 <p>这个控制台能派出 AI agent，所以只对拿着本次启动钥匙的人开放。</p>
-<p>回到启动 SkillSpace 的终端，打开里面打印的那条链接（形如 <code>http://localhost:PORT/?auth=…</code>）。每次重启钥匙都会换新。</p>
+<p>在 SkillSpace 文件夹里运行 <code>npm run open</code>（或者打开启动它的终端里打印的那条链接，形如 <code>http://localhost:PORT/?auth=…</code>）。每次重启钥匙都会换新。</p>
 </body></html>`;
 
 function serveLock(res) {
@@ -1487,10 +1494,23 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 
 server.listen(PORT, HOST_BIND, () => {
   console.log(`\n  SkillSpace · 技控台  已启动`);
-  // The ONLY place the secret is published. Open this link in the browser;
-  // a launcher that spawned this process reads it from stdout (see README).
-  console.log(`  → http://localhost:${PORT}/?auth=${API_SECRET}`);
-  console.log('    （打开上面这条链接进入控制台；每次重启都会换新钥匙）');
+  // The secret is published in two places only: a 0600 file (lib/console-
+  // link.js; `npm run open` reads it) and, when stdout is an interactive
+  // terminal, the banner. A non-TTY stdout is usually a log file - launchd's
+  // is /tmp/skillspace.log, world-readable - so there it is redacted.
+  try {
+    consoleLink.write(CONSOLE_LINK_FILE, CONSOLE_LINK);
+  } catch (e) {
+    console.warn(`[server] could not write the console link to ${CONSOLE_LINK_FILE}: ${e.message}`);
+  }
+  if (process.stdout.isTTY) {
+    console.log(`  → ${CONSOLE_LINK}`);
+    console.log('    （打开上面这条链接进入控制台；每次重启都会换新钥匙）');
+  } else {
+    console.log(`  → http://localhost:${PORT}/?auth=<see console-link file>`);
+    console.log(`    console link: ${CONSOLE_LINK_FILE}`);
+    console.log('    （在 SkillSpace 文件夹里运行 npm run open 打开控制台）');
+  }
   for (const s of listSources()) {
     const tag = s.builtin ? s.label : `自定义 ${s.label}`;
     console.log(`  ${s.exists ? '✓' : '✗'} ${tag}：${s.dir}${s.exists ? `（${s.count} 个 Skill）` : '（目录不存在）'}`);

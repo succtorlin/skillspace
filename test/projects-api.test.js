@@ -233,7 +233,8 @@ test('DELETE rejects an id that is not a plain identifier', async () => {
   }
 
   // The real claim: no traversal created a sibling namespace in the store.
-  assert.deepStrictEqual(fs.readdirSync(storeRoot).sort(), ['projects.json']);
+  // console-link is the server's own boot file (under SKILLSPACE_HOME in tests).
+  assert.deepStrictEqual(fs.readdirSync(storeRoot).sort(), ['console-link', 'projects.json']);
 });
 
 test('a nested path is not claimed by the project DELETE route', async () => {
