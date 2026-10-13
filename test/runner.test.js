@@ -383,15 +383,17 @@ test('an agent that backgrounds a subprocess reports its real exit code, not a t
   const logFile = path.join(tmpDir(), 'run.log');
   const started = Date.now();
   const r = await runner.run({
-    agent: shimAgent('#!/bin/sh\nsleep 8 &\necho "done"\nexit 0\n'), prompt: 'x',
-    cwd: tmpDir(), logFile, timeoutMs: 5000,
+    agent: shimAgent('#!/bin/sh\nsleep 20 &\necho "done"\nexit 0\n'), prompt: 'x',
+    cwd: tmpDir(), logFile, timeoutMs: 30000,
   });
   const elapsed = Date.now() - started;
   assert.strictEqual(r.exitCode, 0, 'the real exit code was lost');
   assert.strictEqual(r.error, null, 'a finished agent was recorded as a failure');
-  // Settles on the stdio grace (~2s), not the 5s timeout; the gap is the
-  // discrimination, and it is wide enough not to flake under load.
-  assert.ok(elapsed < 4000, `settled in ${elapsed}ms - it waited for the timeout, not the exit`);
+  // Settles on the stdio grace (~2s). The bound proves only what matters -
+  // that it settled before BOTH the backgrounded child released stdout (20s)
+  // and the timeout (30s) - with a margin no loaded machine eats. A tight
+  // bound here (4s against a 5s timeout) flaked under a full parallel suite.
+  assert.ok(elapsed < 15000, `settled in ${elapsed}ms - it waited for the stdio or the timeout, not the exit`);
 });
 
 test('an unusable timeoutMs falls back to the default bound, never to no bound', () => {
