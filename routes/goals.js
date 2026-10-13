@@ -105,6 +105,17 @@ module.exports = (deps) => {
         return true;
       }
 
+      // THE REVIEW HOLD (plan 3, Task 0). Optional; absent, null and false all
+      // mean "run when planned", today's behaviour. Anything else that is not
+      // a boolean is refused rather than read for truthiness: {"hold":"no"} is
+      // truthy, and a caller who wrote it meant the opposite. Checked with the
+      // other caller faults, before the capacity bound and before any record.
+      const hold = body.hold;
+      if (hold !== undefined && hold !== null && typeof hold !== 'boolean') {
+        sendJson(res, 400, { error: `hold must be true or false, got ${JSON.stringify(hold)}` });
+        return true;
+      }
+
       // Resolved BEFORE the record is created, so a refusal leaves nothing
       // behind. The rule itself lives in routes/common.js, shared with the
       // orders route: the goal record persists `pmAgent`, so a silent
@@ -131,7 +142,7 @@ module.exports = (deps) => {
 
       let goal;
       try {
-        goal = goals.create(root, { projectId: project.id, text: body.text });
+        goal = goals.create(root, { projectId: project.id, text: body.text, hold: hold === true });
       } catch (e) {
         // goals.create emits its own caller-fault shapes; anything else (EACCES
         // on an unwritable store, for one) is ours. The predicate is shared
@@ -174,6 +185,49 @@ module.exports = (deps) => {
       // decompose runs up to its first await in this same tick. Follow it with
       // GET.
       sendJson(res, 200, { goal });
+      return true;
+    }
+
+    // Release a goal held for review: the scheduler may run its queued orders
+    // from the next tick. It spawns nothing itself, but it is the click that
+    // lets the loop start credentialed agents, so it carries the same
+    // navigation guard as the routes that spawn them - a link in Slack must
+    // not release a plan nobody read. No body.
+    //
+    // 409 for a goal that is settled (nothing left to release it into) or not
+    // held (a second release, or a goal never held): the request named a real
+    // goal whose state cannot take it. The checks and the write have no await
+    // between them, so a concurrent second release reads the first's write
+    // and gets the 409.
+    const releaseMatch = p.match(/^\/api\/goals\/([^/]+)\/release$/);
+    if (releaseMatch && req.method === 'POST') {
+      if (isTopLevelNavigation(req)) {
+        denyNavigation(res, '/api/goals/:id/release');
+        return true;
+      }
+      const id = plainIdFrom(res, releaseMatch[1], 'goal');
+      if (id === null) return true; // already answered 400
+      const goal = goals.get(root, id);
+      if (!goal) {
+        sendJson(res, 404, { error: 'no such goal' });
+        return true;
+      }
+      if (goals.SETTLED.has(goal.status)) {
+        sendJson(res, 409, { error: `goal is already ${goal.status}` });
+        return true;
+      }
+      if (!goals.isHeld(goal)) {
+        sendJson(res, 409, { error: 'goal is not held' });
+        return true;
+      }
+      let released;
+      try {
+        released = goals.release(root, id);
+      } catch (e) {
+        sendJson(res, 500, { error: errorMessage(e) });
+        return true;
+      }
+      sendJson(res, 200, { goal: released });
       return true;
     }
 

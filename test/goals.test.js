@@ -456,3 +456,53 @@ test('addOrder appends without aliasing, once, and only to a live goal', () => {
     'a settled goal took a new order');
   assert.strictEqual(goals.addOrder(root, 'goal-nope', 'ord-c'), null);
 });
+
+// ---------- the review hold (plan 3, Task 0) ----------
+
+test('a goal is not held unless the caller asks, and only true asks', () => {
+  const root = tmpRoot();
+  assert.strictEqual(goals.create(root, { projectId: 'p', text: 'x' }).held, false);
+  assert.strictEqual(goals.create(root, { projectId: 'p', text: 'x', hold: true }).held, true);
+  // Strict: a truthy non-boolean is not a request to hold. The route refuses
+  // it with a 400; this module never reads it as one.
+  assert.strictEqual(goals.create(root, { projectId: 'p', text: 'x', hold: 'yes' }).held, false);
+  const g = goals.create(root, { projectId: 'p', text: 'x', hold: true });
+  assert.strictEqual(goals.get(root, g.id).held, true, 'the hold was not persisted');
+});
+
+test('the hold survives the plan landing', () => {
+  // planned() patches the record; a hold that planned() dropped would let the
+  // scheduler run the very orders the human asked to read first.
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x', hold: true });
+  goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'fake' });
+  assert.strictEqual(goals.get(root, g.id).held, true);
+});
+
+test('release clears the hold once; a second release changes nothing', () => {
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x', hold: true });
+  goals.planned(root, g.id, { orderIds: ['ord-a'], pmAgent: 'fake' });
+  const r = goals.release(root, g.id);
+  assert.strictEqual(r.held, false);
+  assert.strictEqual(r.status, 'planned', 'release moved the status');
+  assert.strictEqual(goals.get(root, g.id).held, false);
+  const again = goals.release(root, g.id);
+  assert.strictEqual(again.held, false);
+  assert.strictEqual(goals.release(root, 'goal-nope'), null);
+});
+
+test('release does not rewrite a settled goal', () => {
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x', hold: true });
+  goals.failPlanning(root, g.id, 'no plan', null);
+  assert.strictEqual(goals.release(root, g.id).held, true, 'a settled record was rewritten');
+  assert.strictEqual(goals.get(root, g.id).held, true);
+});
+
+test('isHeld reads a record written before holds existed as not held', () => {
+  assert.strictEqual(goals.isHeld({ id: 'g', status: 'planned' }), false);
+  assert.strictEqual(goals.isHeld({ id: 'g', held: 'true' }), false);
+  assert.strictEqual(goals.isHeld({ id: 'g', held: true }), true);
+  assert.strictEqual(goals.isHeld(null), false);
+});

@@ -1013,3 +1013,48 @@ test('an order left queued is taken by the loop, and dispatch by id then refuses
   assert.strictEqual(after.agent, 'claude');
   assert.strictEqual(after.exitCode, 0);
 });
+
+// ------------------------------------------------------------------ the hold (plan 3, Task 0)
+
+test('a goal posted with hold:true waits for release, and says why', async () => {
+  // Over the wire, with the loop running: the review window the spec asks for.
+  // Mutant: the scheduler's held check removed - both orders run within a
+  // tick of the plan landing and the first assertion fails.
+  const home = tmp('sched-holdhome-');
+  const s = await startServer(home, {
+    SKILLSPACE_SCHEDULER_INTERVAL_MS: '100',
+    SKILLSPACE_MAX_RUNS: '8',
+  });
+  try {
+    const project = await makeGitProject(s.base);
+    const posted = await json('POST', '/api/goals', { projectId: project.id, text: 'read me first', hold: true }, s.base);
+    assert.strictEqual(posted.status, 200, JSON.stringify(posted.body));
+    const goalId = posted.body.goal.id;
+    const planned = await waitFor('the plan to land', async () => {
+      const r = await json('GET', '/api/goals/' + goalId, undefined, s.base);
+      return r.body.goal.status === 'planned' ? r.body : false;
+    });
+    assert.strictEqual(planned.orders.length, 2);
+
+    // Ten ticks' worth of chances to be wrong.
+    const t0 = (await stats(s.base)).ticks;
+    await waitFor('ten ticks', async () => (await stats(s.base)).ticks >= t0 + 10);
+    const still = await json('GET', '/api/goals/' + goalId, undefined, s.base);
+    assert.deepStrictEqual(still.body.orders.map((o) => o.status), ['queued', 'queued'],
+      'a held goal\'s orders ran');
+    const st = await stats(s.base);
+    assert.strictEqual(st.lastSkip && st.lastSkip.reason, 'goal held for review');
+    assert.ok(Array.isArray(st.pausedProjectIds), 'pausedProjectIds is missing from the route');
+
+    const rel = await json('POST', `/api/goals/${goalId}/release`, undefined, s.base);
+    assert.strictEqual(rel.status, 200, JSON.stringify(rel.body));
+    await waitFor('the released goal to run to done', async () => {
+      const r = await json('GET', '/api/goals/' + goalId, undefined, s.base);
+      return r.body.goal.status === 'done';
+    }, 60000);
+    assert.strictEqual((await json('POST', `/api/goals/${goalId}/release`, undefined, s.base)).status, 409,
+      'a done goal was released a second time');
+  } finally {
+    await stopServer(s.child);
+  }
+});

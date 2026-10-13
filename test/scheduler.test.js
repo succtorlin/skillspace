@@ -604,6 +604,41 @@ test('an order attached to a goal still being planned is not dispatched', async 
   }
 });
 
+test('a held goal\'s orders stay queued across ticks, and release lets them run', async () => {
+  // Plan 3, Task 0: the review hold. Mutant: the held check removed - the
+  // order is offered on the first tick and the tally gains a pid.
+  // A git project, as in the planning test above: nothing else holds the
+  // project, so with the check gone the agent really spawns.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const goal = goals.create(root, { projectId: project.id, text: 'read it first', hold: true });
+  const order = orders.create(root, { projectId: project.id, prompt: 'held work' });
+  orders.attachToGoal(root, order.id, goal.id, 0);
+  goals.planned(root, goal.id, { orderIds: [order.id], pmAgent: 'fake' });
+  const tally = path.join(tmpDir('skillspace-tally-'), 'ran.txt');
+  const agent = tallyShim(tally, 0);
+
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => agent });
+    await ticksPass(8, 15);
+    assert.strictEqual(scheduler.stats().offered, 0, 'a held goal\'s order was offered');
+    assert.strictEqual(pidsIn(tally).length, 0, 'an agent ran for a goal held for review');
+    assert.strictEqual(orders.get(root, order.id).status, 'queued');
+    // It says WHY, or a held board is indistinguishable from an idle loop.
+    const skip = scheduler.stats().lastSkip;
+    assert.ok(skip, 'the hold was not reported');
+    assert.strictEqual(skip.reason, 'goal held for review');
+    assert.strictEqual(skip.orderId, order.id);
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned', 'the hold moved the goal');
+
+    goals.release(root, goal.id);
+    await waitFor('the order to run once the goal is released',
+      () => orders.get(root, order.id).status !== 'queued');
+  } finally {
+    await drain();
+  }
+});
+
 test('a goal is never marked done over work that is not there', async () => {
   // Two mutants, one property - `done` is SETTLED and never rewritten, so a
   // wrong `done` is the record's last word.

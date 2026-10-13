@@ -1116,3 +1116,93 @@ test('GET /api/goals with an empty project= is a 400, not the whole store', asyn
   }
   assert.strictEqual((await json('GET', '/api/goals')).status, 200);
 });
+
+test('POST /api/goals {hold:true} stores a held goal; the default is not held', async () => {
+  const project = await makeProject();
+  const held = await json('POST', '/api/goals', { projectId: project.id, text: 'read first', hold: true });
+  assert.strictEqual(held.status, 200, JSON.stringify(held.body));
+  assert.strictEqual(held.body.goal.held, true);
+  const after = await planned(held.body.goal.id);
+  assert.strictEqual(after.goal.status, 'planned');
+  assert.strictEqual(after.goal.held, true, 'the plan landing dropped the hold');
+
+  const plain = await json('POST', '/api/goals', { projectId: project.id, text: 'just run' });
+  assert.strictEqual(plain.body.goal.held, false);
+  await planned(plain.body.goal.id);
+});
+
+test('POST /api/goals refuses a hold that is not a boolean, before any record exists', async () => {
+  const project = await makeProject();
+  for (const hold of ['yes', 1, {}, []]) {
+    const r = await json('POST', '/api/goals', { projectId: project.id, text: 'x', hold });
+    assert.strictEqual(r.status, 400, `hold ${JSON.stringify(hold)} answered ${r.status}`);
+    assert.match(r.body.error, /hold/);
+  }
+  assert.deepStrictEqual((await json('GET', `/api/goals?project=${project.id}`)).body.goals, [],
+    'a refused hold left a goal (and a PM) behind');
+  // null and false are a client that has no hold to ask for.
+  for (const hold of [null, false]) {
+    const r = await json('POST', '/api/goals', { projectId: project.id, text: 'x', hold });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.goal.held, false);
+    await planned(r.body.goal.id);
+  }
+});
+
+test('POST /api/goals/:id/release clears the hold once, and cannot release twice', async () => {
+  const project = await makeProject();
+  const goal = (await json('POST', '/api/goals', { projectId: project.id, text: 'hold me', hold: true })).body.goal;
+  await planned(goal.id);
+  const r = await json('POST', `/api/goals/${goal.id}/release`);
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  assert.strictEqual(r.body.goal.held, false);
+  assert.strictEqual(r.body.goal.status, 'planned');
+  assert.strictEqual((await json('GET', `/api/goals/${goal.id}`)).body.goal.held, false);
+
+  const again = await json('POST', `/api/goals/${goal.id}/release`);
+  assert.strictEqual(again.status, 409);
+  assert.match(again.body.error, /not held/);
+
+  const plain = (await json('POST', '/api/goals', { projectId: project.id, text: 'never held' })).body.goal;
+  await planned(plain.id);
+  assert.strictEqual((await json('POST', `/api/goals/${plain.id}/release`)).status, 409);
+});
+
+test('release answers 404, 400, 409-settled, and GET is not a release', async () => {
+  assert.strictEqual((await json('POST', '/api/goals/goal-nope/release')).status, 404);
+  assert.strictEqual((await json('POST', '/api/goals/..%2Fprojects/release')).status, 400);
+  const project = await makeProject();
+  const goal = (await json('POST', '/api/goals', { projectId: project.id, text: `${PROSE_MARK} held`, hold: true })).body.goal;
+  const settledGoal = await planned(goal.id);
+  assert.strictEqual(settledGoal.goal.status, 'failed', 'the prose PM did not fail the goal');
+  const r = await json('POST', `/api/goals/${goal.id}/release`);
+  assert.strictEqual(r.status, 409);
+  assert.match(r.body.error, /already failed/);
+
+  const live = (await json('POST', '/api/goals', { projectId: project.id, text: 'get me', hold: true })).body.goal;
+  await planned(live.id);
+  const g = await json('GET', `/api/goals/${live.id}/release`);
+  assert.notStrictEqual(g.status, 200, 'a GET released a goal');
+  assert.strictEqual((await json('GET', `/api/goals/${live.id}`)).body.goal.held, true);
+});
+
+test('POST /api/goals/:id/release refuses a top-level navigation', async () => {
+  // Releasing lets the loop start credentialed agents, so it carries the
+  // guard every state-changing goal route carries.
+  const project = await makeProject();
+  const goal = (await json('POST', '/api/goals', { projectId: project.id, text: 'nav', hold: true })).body.goal;
+  await planned(goal.id);
+  for (const h of [
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Mode': 'navigate' },
+    { 'Sec-Fetch-Site': 'none', 'Sec-Fetch-Dest': 'document' },
+  ]) {
+    const res = await rawRequest('POST', `/api/goals/${goal.id}/release`, h, '');
+    assert.match(res, /^HTTP\/1\.1 403 /, `navigation ${JSON.stringify(h)} was allowed: ${res.slice(0, 40)}`);
+  }
+  assert.strictEqual((await json('GET', `/api/goals/${goal.id}`)).body.goal.held, true, 'a navigation released it');
+  const ok = await rawRequest('POST', `/api/goals/${goal.id}/release`, {
+    'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty',
+  }, '');
+  assert.match(ok, /^HTTP\/1\.1 200 /, `the console's own shape must be served: ${ok.slice(0, 40)}`);
+});
