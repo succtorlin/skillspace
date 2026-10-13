@@ -389,3 +389,70 @@ test('list orders by createdAt first, and by id only to break a tie', () => {
   assert.deepStrictEqual(goals.list(byTie).map((g) => g.id),
     ['goal-00000000000002-b', 'goal-00000000000001-a'], 'a tie falls to the id, newest first');
 });
+
+function plannedGoal(root, orderIds = ['ord-a']) {
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  return goals.planned(root, g.id, { orderIds, pmAgent: 'c', rawPlan: '[]' });
+}
+
+test('stalled is live: nothing will run it, and a human still can', () => {
+  const root = tmpRoot();
+  const g = plannedGoal(root);
+  assert.strictEqual(goals.markStalled(root, g.id).status, 'stalled');
+  assert.ok(!goals.SETTLED.has('stalled'),
+    'stalled must not be settled - a human retry has to be able to move it');
+  assert.strictEqual(goals.markPlanned(root, g.id).status, 'planned', 'a retry puts work back');
+  goals.markStalled(root, g.id);
+  assert.strictEqual(goals.markRunning(root, g.id).status, 'running', 'a verdict retry is in flight');
+  goals.markStalled(root, g.id);
+  assert.strictEqual(goals.markDone(root, g.id).status, 'done');
+});
+
+test('a goal still being planned cannot be stalled or failed by a verdict', () => {
+  // `planning` has no orders, so neither claim can be true of it, and
+  // failPlanning is the only door out of planning.
+  const root = tmpRoot();
+  const g = goals.create(root, { projectId: 'p', text: 'x' });
+  assert.strictEqual(goals.markStalled(root, g.id).status, 'planning');
+  assert.strictEqual(goals.markFailed(root, g.id, 'nope').status, 'planning');
+});
+
+test('reconcile leaves a stalled goal alone', () => {
+  // Its orders are all settled and nothing is in flight - there is nothing a
+  // restart could have interrupted.
+  const root = tmpRoot();
+  const g = plannedGoal(root);
+  goals.markStalled(root, g.id);
+  assert.strictEqual(goals.reconcile(root), 0);
+  assert.strictEqual(goals.get(root, g.id).status, 'stalled');
+});
+
+test('markFailed settles a goal with the reason and a moment', () => {
+  const root = tmpRoot();
+  const g = plannedGoal(root);
+  const f = goals.markFailed(root, g.id, 'ord-x was rejected with no attempts left');
+  assert.strictEqual(f.status, 'failed');
+  assert.strictEqual(f.error, 'ord-x was rejected with no attempts left');
+  assert.ok(f.finishedAt);
+  assert.strictEqual(goals.markPlanned(root, g.id).status, 'failed', 'failed is settled');
+
+  const h = plannedGoal(root);
+  assert.strictEqual(goals.markFailed(root, h.id, undefined).error, 'unspecified failure',
+    'a nullish reason must not land on disk as "undefined"');
+});
+
+test('addOrder appends without aliasing, once, and only to a live goal', () => {
+  const root = tmpRoot();
+  const g = plannedGoal(root, ['ord-a']);
+  const before = goals.get(root, g.id).orderIds;
+  const a = goals.addOrder(root, g.id, 'ord-b');
+  assert.deepStrictEqual(a.orderIds, ['ord-a', 'ord-b']);
+  assert.deepStrictEqual(before, ['ord-a'], 'the record read earlier was mutated');
+  assert.strictEqual(goals.addOrder(root, g.id, 'ord-b').orderIds.length, 2, 'added twice');
+  assert.throws(() => goals.addOrder(root, g.id, ''), /orderId is required/);
+
+  goals.markDone(root, g.id);
+  assert.deepStrictEqual(goals.addOrder(root, g.id, 'ord-c').orderIds, ['ord-a', 'ord-b'],
+    'a settled goal took a new order');
+  assert.strictEqual(goals.addOrder(root, 'goal-nope', 'ord-c'), null);
+});
