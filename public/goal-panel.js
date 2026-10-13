@@ -111,6 +111,10 @@ function goalPanelRenderDetail(b) {
     goalPanelPollLog(goalPanel.logGen);
     return;
   }
+  // Any branch below means planning is over: retire a PM-log poll still in
+  // flight, so its next read lands on a stale generation and stops.
+  clearTimeout(goalPanel.logTimer);
+  goalPanel = { ...goalPanel, logGen: goalPanel.logGen + 1, logTimer: null };
   // Two writers settle a goal `failed` (plan 2d): a plan that could not be
   // made (rawPlan kept, NO orders) or an order chain rejected with no retry
   // coming (orders exist). The first has no plan to show; the second shows
@@ -183,7 +187,12 @@ async function goalPanelPollLog(gen) {
   if (r.status === 404) return; // the goal is gone; polling it forever helps nobody
   const pre = document.getElementById('gp-pmlog');
   const step = r.ok ? logStep(r.body, r.body && r.body.status === 'planning') : { ok: false };
-  if (step.ok && pre) {
+  // No <pre> means a re-render already moved the goal past planning (the board
+  // poll can see `planned` before this loop sees done): stop, or this loop
+  // re-downloads the PM log once a second for as long as the tab is open.
+  const next = logPollNext(!!pre, step);
+  if (next === 'stop') return;
+  if (step.ok) {
     const stick = shouldStick(pre.scrollTop, pre.clientHeight, pre.scrollHeight);
     // The placeholder is a marker, not log text: it must never be the head of
     // what the PM prints next.
@@ -192,7 +201,7 @@ async function goalPanelPollLog(gen) {
     if (!pre.textContent) { pre.textContent = '（PM 还没有输出）'; pre.dataset.placeholder = '1'; }
     if (stick) pre.scrollTop = pre.scrollHeight;
     goalPanel = { ...goalPanel, logFrom: step.next };
-    if (step.done) { boardRefresh(); return; }
+    if (next === 'done') { boardRefresh(); return; }
   }
   goalPanel = { ...goalPanel, logTimer: setTimeout(() => goalPanelPollLog(gen), GOAL_LOG_POLL_MS) };
 }

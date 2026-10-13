@@ -484,6 +484,16 @@ function logStep(body, live) {
   };
 }
 
+// What a log poll does after one read: 'stop' when the element it writes into
+// is gone (a re-render replaced the view - polling on would re-download the
+// log forever with nowhere to put it), 'done' when the log is settled and
+// drained, else 'again'.
+function logPollNext(hasTarget, step) {
+  if (!hasTarget) return 'stop';
+  if (step && step.ok && step.done) return 'done';
+  return 'again';
+}
+
 // The DOM keeps the last LOG_DOM_CAP characters; the full log stays on disk.
 const LOG_DOM_CAP = 200000;
 function appendCapped(current, chunk, cap) {
@@ -729,7 +739,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fmtDuration, orderElapsed, orderStatusText, exitCodeText, failureView,
     BOARD_GROUPS, boardGroupKey, boardSortFor, groupOrders, localDayKey, ordersToday, boardSignature,
     boardState, goalOrderIds,
-    schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
+    schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, logPollNext, LOG_DOM_CAP,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
     orderRowStatus, skipReasonText, goalReleaseOutcome, planDispatchable,
     verdictOf, verdictPending, verdictView, attemptInfo, attemptLabel, latestOrders, retryOffer,

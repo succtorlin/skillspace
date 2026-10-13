@@ -613,3 +613,18 @@ test('retry outcomes keep the server reason and translate the known ones', () =>
   assert.match(r('verdict', 409, { error: "the order is not part of its goal's plan" }).text, /不在目标的计划里/);
   assert.match(r('retry', 0, null).text, /无法连接/);
 });
+
+// ---------- logPollNext ----------
+test('a log poll stops when the element it writes into is gone, not only when the log is done', () => {
+  // The goal panel's PM-log poll checked only step.done, which it can see only
+  // while #gp-pmlog exists. When the board poll re-rendered the goal as
+  // `planned` first, the <pre> was gone, the done branch was never reached,
+  // and the poll re-downloaded the PM log once a second forever.
+  const live = pure.logStep({ log: { text: 'x', next: 1, size: 1 } }, true);
+  const done = pure.logStep({ log: { text: '', next: 1, size: 1 } }, false);
+  assert.strictEqual(pure.logPollNext(false, live), 'stop', 'no element: nothing to write into');
+  assert.strictEqual(pure.logPollNext(false, { ok: false }), 'stop');
+  assert.strictEqual(pure.logPollNext(true, done), 'done', 'drained and settled');
+  assert.strictEqual(pure.logPollNext(true, live), 'again');
+  assert.strictEqual(pure.logPollNext(true, { ok: false }), 'again', 'a failed read is retried while the element is there');
+});
