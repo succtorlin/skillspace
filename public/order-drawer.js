@@ -23,6 +23,17 @@ function drawerIsOpenFor(id) {
 // Called from board.js and goal-panel.js.
 function openOrderDrawer(id) {
   if (!id) return;
+  if (typeof skillRunLive === 'function' && skillRunLive()) {
+    askConfirm({
+      title: '切换到订单会终止正在运行的 Skill',
+      body: '抽屉里有一个本地 Skill 正在运行。切换过去会断开它的输出流，服务器随即终止那个 agent。',
+      target: '',
+      note: '',
+      okText: '终止并切换',
+      onOk: () => { stopSkillRun(); showOrder(id); },
+    });
+    return;
+  }
   showOrder(id);
 }
 
@@ -188,4 +199,83 @@ function drawerTickElapsed() {
   if (!el || !o || o.status !== 'running') return;
   const ms = orderElapsed(o, Date.now());
   el.textContent = ms === null ? '未运行' : fmtDuration(ms);
+}
+
+function drawerRenderActions(order) {
+  const d = drawerEl('ord-dispatch');
+  const c = drawerEl('ord-cancel');
+  const live = order.status === 'queued' || order.status === 'running';
+  d.hidden = order.status !== 'queued';
+  d.disabled = drawer.pending === 'dispatch';
+  d.setAttribute('aria-busy', drawer.pending === 'dispatch' ? 'true' : 'false');
+  d.textContent = drawer.pending === 'dispatch' ? '派发中…' : '立即派发';
+  c.hidden = !live;
+  c.disabled = drawer.pending === 'cancel';
+  c.setAttribute('aria-busy', drawer.pending === 'cancel' ? 'true' : 'false');
+  c.textContent = drawer.pending === 'cancel' ? '正在终止…' : order.status === 'running' ? '终止运行' : '取消这一单';
+}
+
+// Called from goal-panel.js too. Dispatch spawns a credentialed agent - one
+// door, this one, used by both places that offer it.
+async function dispatchOrder(id) {
+  const agent = document.getElementById('agent');
+  const r = await boardPostJson(`/api/orders/${encodeURIComponent(id)}/dispatch`,
+    agent && agent.value ? { agent: agent.value } : {});
+  const out = orderActionOutcome('dispatch', r.status, r.body);
+  toast(out.text, out.ok ? undefined : 'error');
+  boardRefresh();
+  return out;
+}
+
+drawerEl('ord-dispatch').addEventListener('click', async () => {
+  const order = drawer.order;
+  if (!order || drawer.pending) return;
+  const gen = drawer.gen;
+  drawer = { ...drawer, pending: 'dispatch' };
+  drawerRenderActions(order);
+  const out = await dispatchOrder(order.id);
+  if (drawer.gen !== gen) return;
+  if (!out.ok) drawer = { ...drawer, pending: null };
+  drawerRenderActions(drawer.order);
+  // The route answers with the record still `queued` (runOrder marks it
+  // running after `worktree add`); the log poll's status check clears pending.
+  // A backstop, so a dispatch that never moves does not leave the button dead.
+  setTimeout(() => {
+    if (drawer.gen === gen && drawer.pending === 'dispatch') {
+      drawer = { ...drawer, pending: null };
+      drawerRenderActions(drawer.order);
+    }
+  }, 10000);
+});
+
+drawerEl('ord-cancel').addEventListener('click', () => {
+  const order = drawer.order;
+  if (!order || drawer.pending) return;
+  const running = order.status === 'running';
+  askConfirm({
+    title: running ? `终止${seqSpoken(order)}` : `取消${seqSpoken(order)}`,
+    body: running
+      ? 'agent 会先收到 SIGTERM，5 秒后仍未退出就 SIGKILL。这一单记为「已取消」，不会自动重跑。'
+      : '它还没开始运行。取消后记为「已取消」，调度器不会再领走它，也不能恢复。',
+    target: orderTitle(order),
+    note: '',
+    okText: running ? '终止' : '取消这一单',
+    onOk: () => drawerCancel(order.id),
+  });
+});
+
+async function drawerCancel(id) {
+  const gen = drawer.gen;
+  drawer = { ...drawer, pending: 'cancel' };
+  drawerRenderActions(drawer.order);
+  const r = await boardPostJson(`/api/orders/${encodeURIComponent(id)}/cancel`, {});
+  const out = orderActionOutcome('cancel', r.status, r.body);
+  toast(out.text, out.ok ? undefined : 'error');
+  if (drawer.gen !== gen) return;
+  // A running order is only SIGNALLED; it settles when the process exits, and
+  // the log poll sees that. Pending stays until then. A refusal clears it now.
+  if (!out.ok) drawer = { ...drawer, pending: null };
+  if (drawer.order) drawerRenderActions(drawer.order);
+  await drawerRefreshOrder(gen);
+  boardRefresh();
 }

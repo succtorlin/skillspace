@@ -80,8 +80,14 @@ async function boot() {
 // ---------- 删除二次确认 ----------
 // 所有删除都必须过这里，没有任何一条路径能绕开确认直接删。
 let confirmAction = null;
+// The control that opened the confirm, so closing it - by 取消, by OK or by
+// Escape - puts focus back there. lastTrigger cannot serve: it skips clicks
+// inside the run drawer on purpose, and the order drawer's cancel button is
+// exactly such a click (plan 3, Task 11).
+let confirmReturn = null;
 function askConfirm({ title, body, target, note, okText, onOk }) {
   confirmAction = onOk;
+  confirmReturn = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
   $('#cf-title').textContent = title;
   $('#cf-body').textContent = body;
   $('#cf-target').textContent = target || '';
@@ -94,6 +100,16 @@ function askConfirm({ title, body, target, note, okText, onOk }) {
 function closeConfirm() {
   $('#confirm-modal').style.display = 'none';
   confirmAction = null;
+  const back = confirmReturn;
+  confirmReturn = null;
+  // offsetParent is null for a hidden control (or one inside a hidden
+  // drawer): fall back to lastTrigger rather than focusing nothing.
+  const drawer = $('#run');
+  if (back && document.contains(back) && back.offsetParent !== null && !back.disabled) back.focus();
+  // The opener was in the drawer and is now hidden or busy (a cancel in
+  // flight): stay in the drawer rather than jumping behind it.
+  else if (back && drawer.contains(back) && drawer.style.display !== 'none') $('#run-title').focus();
+  else if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
 }
 $('#cf-cancel').addEventListener('click', closeConfirm);
 $('#cf-ok').addEventListener('click', async () => {
@@ -134,8 +150,8 @@ document.addEventListener('keydown', (e) => {
   const open = openDialogs();
   if (open.length) {
     const top = open[open.length - 1];
-    if (top.id === 'confirm-modal') closeConfirm();
-    else top.style.display = 'none';
+    if (top.id === 'confirm-modal') { closeConfirm(); return; } // it restores focus itself
+    top.style.display = 'none';
     if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
     return;
   }
@@ -703,6 +719,16 @@ function runSkill(agent, skill, task) {
     $('#run-status').className = 'run-status err';
     es.close();
   });
+}
+
+// Called from order-drawer.js. A live /api/run stream is an agent: closing
+// its EventSource makes the server reap it (req.on('close') in server.js), so
+// the order drawer must not take over the shared drawer silently.
+function skillRunLive() {
+  return !!(state.es && state.es.readyState !== EventSource.CLOSED);
+}
+function stopSkillRun() {
+  if (state.es) state.es.close();
 }
 
 $('#run-close').addEventListener('click', () => {

@@ -235,3 +235,9 @@
 .ord-actions:empty { display: none; }
 .ord-log-note { font-size: 12px; color: var(--ink-2); }
 .ord-log-note:empty { display: none; }
+
+/* Dialogs above the drawer. The confirm for cancelling an order is opened FROM
+   the run drawer (z 60), and with the modal mask at style.css's 50 the drawer
+   covered the dialog's own buttons - on a phone, entirely (found in the Task 11
+   browser check: 取消 and 终止 were unclickable). Toasts stay on top at 100. */
+.modal-mask { z-index: 70; }
