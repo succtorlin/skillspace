@@ -551,7 +551,13 @@ body {
 }
 
 /* Designed focus ring — one ring, everywhere, from the accent.
-   Replaces the browser default rather than removing it. */
+   Replaces the browser default rather than removing it.
+
+   No border-radius here. It used to force 6px, which outranked each element's
+   own radius and made the corners jump on focus — .src-item 9px→6px,
+   #theme-toggle 9px→6px, .proj-item 8px→6px. `outline` already follows the
+   element's own radius, so the override bought nothing and cost a visible
+   jitter on every focusable control in the app. */
 a:focus-visible,
 button:focus-visible,
 select:focus-visible,
@@ -561,7 +567,6 @@ summary:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
-  border-radius: 6px;
 }
 
 /* Panel anatomy: hairline separation, ground-scale depth.
@@ -682,3 +687,42 @@ summary:focus-visible,
 @media (max-width: 560px) {
   .topbar, .toolbar { margin-left: 6px; margin-right: 6px; }
 }
+
+/* Project rail — same grammar as the source list, one ground step apart so the
+   two rails read as siblings rather than as one undifferentiated column. */
+.proj-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 9px; border-radius: 8px; cursor: pointer;
+  background: transparent; border: 1px solid transparent;
+  color: var(--ink-2); font-size: 13px; text-align: left;
+}
+.proj-item:hover { background: var(--ground-2); color: var(--ink); }
+.proj-item.active {
+  background: var(--ground-2); color: var(--ink); border-color: var(--hair-lit);
+}
+.proj-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-kind {
+  margin-left: auto; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2);
+}
+.proj-item.active .proj-kind { color: var(--accent); }
+.proj-empty {
+  padding: 7px 9px; font-size: 12px; color: var(--muted); line-height: 1.5;
+}
+.proj-del {
+  flex: none; display: flex; align-items: center; margin-left: 4px;
+  background: transparent; border: none; padding: 0 1px; border-radius: 4px;
+  color: inherit; cursor: pointer; opacity: 0;
+}
+/* Revealed on hover like .src-del, but also on focus — an opacity-only reveal
+   leaves the control unreachable for anyone arriving by keyboard. */
+.proj-item:hover .proj-del { opacity: .7; }
+.proj-del:hover { color: var(--red); opacity: 1; }
+/* Only the reveal: the ring itself comes from the global focus-visible block,
+   so this must not redeclare outline or the two would drift apart. */
+.proj-del:focus-visible { opacity: 1; }
+
+/* The sidebar holds two unbounded lists (sources and projects) above controls
+   that must stay reachable. Without this, overflow pushes 添加本地目录 and the
+   theme toggle off-screen with no way to scroll to them. */
+.sidebar { overflow-y: auto; }

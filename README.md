@@ -15,8 +15,21 @@
 ```bash
 cd skillspace
 node server.js
-# 打开 http://localhost:4177
+# 另开一个终端：npm run open（或打开终端里打印的那条链接）
 ```
+
+**控制台是上锁的。** SkillSpace 能派出 AI agent，而本机任何进程（包括它自己派出去的 agent）都能访问 `localhost:4177`，所以每次启动都会生成一把随机钥匙。打开带钥匙的链接会给浏览器设一个 HttpOnly / SameSite=Strict 的 cookie，之后直接用 `http://localhost:4177` 就行；重启后钥匙换新，需要重新打开新链接。
+
+拿到链接的办法：
+
+- **在 SkillSpace 文件夹里运行 `npm run open`**（任何时候都行）。它读取本次启动写下的链接文件，在 macOS 上直接用浏览器打开，其它系统上把链接打印出来。
+- 在终端里直接 `node server.js` 时，链接也会打印在终端里。stdout 不是终端时（例如 launchd 把它写进 `/tmp/skillspace.log`，那个文件谁都能读），打印出来的链接里钥匙是打码的，只给出链接文件的位置。
+
+链接文件权限是 0600，每次启动覆盖、正常退出时删除，位置在 `~/.skillspace` **之外**（agent 的 worktree 都在那下面）：macOS 是 `~/Library/Application Support/SkillSpace/console-link`，其它系统是 `$XDG_STATE_HOME/skillspace/console-link`（默认 `~/.local/state/skillspace/console-link`）；设置了 `SKILLSPACE_HOME` 时是 `$SKILLSPACE_HOME/console-link`。钥匙不进环境变量，所以 agent 不会被直接递到手里。
+
+脚本或别的程序要调 `/api/*`：从上面那个文件读链接（或自己启动 `server.js`，从 stdout 里那行 `console link: <路径>` 找到文件），之后每个请求带上请求头 `X-SkillSpace-Auth: <钥匙>`（EventSource 这种发不了请求头的，用 GET 查询参数 `auth=<钥匙>`）。唯一的例外是「自动分类」的回传口子 `POST /api/experts/import?token=…`：agent 只拿得到那一次任务的 token。
+
+**它防什么、不防什么，说实话：** 同一个系统用户下运行的任何进程，都能读 0600 的文件，也能读浏览器的历史记录。所以这把钥匙挡住的是网页和盲目的、顺手的本地请求（例如一个被提示注入的 agent 直接 `curl` API），挡不住一个专门冲着 SkillSpace 来、以你的身份运行的攻击者。
 
 ### 2. Skill 从哪来（自动扫描，不用手填路径）
 

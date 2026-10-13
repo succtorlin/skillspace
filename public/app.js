@@ -46,9 +46,11 @@ function paintStaticIcons() {
   $('#reload').innerHTML = icon('refresh');
   $('#exp-auto').innerHTML = icon('spark') + '让 Codex / Claude Code 自动分类';
   $('#exp-manual').innerHTML = icon('plus') + '手动创建专家';
-  const seg = document.querySelectorAll('.seg-item');
-  seg[0].insertAdjacentHTML('afterbegin', icon('deck', 15));
-  seg[1].insertAdjacentHTML('afterbegin', icon('expert', 15));
+  // By view, not by index: the board segment comes first since plan 3, and an
+  // index silently moved both icons one segment to the left.
+  document.querySelector('.seg-item[data-view="board"]').insertAdjacentHTML('afterbegin', icon('layers', 15));
+  document.querySelector('.seg-item[data-view="skills"]').insertAdjacentHTML('afterbegin', icon('deck', 15));
+  document.querySelector('.seg-item[data-view="experts"]').insertAdjacentHTML('afterbegin', icon('expert', 15));
   $('#cf-ico').innerHTML = icon('warn', 20);
 }
 
@@ -63,13 +65,29 @@ async function boot() {
     : '<option value="">未检测到 agent</option>';
   wireNav();
   await loadSources();
+  await loadProjects();
+  // A project is the primary axis: with one active, the console opens on its
+  // board and the source list folds away (it still feeds the card wall).
+  if (localStorage.getItem(PROJECT_KEY)) {
+    switchView('board');
+    const g = document.getElementById('src-group');
+    if (g) g.open = false;
+  }
+  const addProjBtn = document.getElementById('add-project');
+  if (addProjBtn) addProjBtn.addEventListener('click', addProject);
 }
 
 // ---------- 删除二次确认 ----------
 // 所有删除都必须过这里，没有任何一条路径能绕开确认直接删。
 let confirmAction = null;
+// The control that opened the confirm, so closing it - by 取消, by OK or by
+// Escape - puts focus back there. lastTrigger cannot serve: it skips clicks
+// inside the run drawer on purpose, and the order drawer's cancel button is
+// exactly such a click (plan 3, Task 11).
+let confirmReturn = null;
 function askConfirm({ title, body, target, note, okText, onOk }) {
   confirmAction = onOk;
+  confirmReturn = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
   $('#cf-title').textContent = title;
   $('#cf-body').textContent = body;
   $('#cf-target').textContent = target || '';
@@ -82,6 +100,16 @@ function askConfirm({ title, body, target, note, okText, onOk }) {
 function closeConfirm() {
   $('#confirm-modal').style.display = 'none';
   confirmAction = null;
+  const back = confirmReturn;
+  confirmReturn = null;
+  // offsetParent is null for a hidden control (or one inside a hidden
+  // drawer): fall back to lastTrigger rather than focusing nothing.
+  const drawer = $('#run');
+  if (back && document.contains(back) && back.offsetParent !== null && !back.disabled) back.focus();
+  // The opener was in the drawer and is now hidden or busy (a cancel in
+  // flight): stay in the drawer rather than jumping behind it.
+  else if (back && drawer.contains(back) && drawer.style.display !== 'none') $('#run-title').focus();
+  else if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
 }
 $('#cf-cancel').addEventListener('click', closeConfirm);
 $('#cf-ok').addEventListener('click', async () => {
@@ -122,8 +150,8 @@ document.addEventListener('keydown', (e) => {
   const open = openDialogs();
   if (open.length) {
     const top = open[open.length - 1];
-    if (top.id === 'confirm-modal') closeConfirm();
-    else top.style.display = 'none';
+    if (top.id === 'confirm-modal') { closeConfirm(); return; } // it restores focus itself
+    top.style.display = 'none';
     if (lastTrigger && document.contains(lastTrigger)) lastTrigger.focus();
     return;
   }
@@ -221,9 +249,19 @@ function wireNav() {
 }
 function switchView(v) {
   state.view = v;
-  document.querySelectorAll('.seg-item').forEach((el) => el.classList.toggle('active', el.dataset.view === v));
+  document.querySelectorAll('.seg-item').forEach((el) => {
+    const on = el.dataset.view === v;
+    el.classList.toggle('active', on);
+    // The segments were styled as a toggle group with no state exposed to
+    // assistive tech; aria-pressed is what makes "which one is on" audible.
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
   $('#view-skills').hidden = v !== 'skills';
   $('#view-experts').hidden = v !== 'experts';
+  $('#view-board').hidden = v !== 'board';
+  // board.css hides the card-wall source header on the board: it names a
+  // Skill directory, not the project the board is about.
+  document.body.dataset.view = v;
 }
 
 // ---------- Skill 列表 ----------
@@ -349,6 +387,10 @@ function openModal(skill) {
   $('#m-cat').textContent = skill.category;
   $('#m-desc').textContent = skill.description;
   $('#m-task').value = '';
+  $('#m-accept').value = '';
+  const proj = typeof boardCurrent === 'function' ? boardCurrent().project : null;
+  $('#m-order').disabled = !proj;
+  $('#m-order-note').textContent = oneOffNote(proj);
   updatePrompt();
   $('#modal').style.display = 'grid';
 }
@@ -412,6 +454,37 @@ $('#m-run').addEventListener('click', () => {
   const task = $('#m-task').value.trim();
   closeModal();
   runSkill(agent, skill, task);
+});
+
+$('#m-order').addEventListener('click', async () => {
+  const skill = state.current;
+  if (!skill) return;
+  const btn = $('#m-order');
+  btn.disabled = true;
+  try {
+    // The prompt is regenerated 200ms after typing stops; clicking inside that
+    // window would send the previous one. Regenerate now and wait for it.
+    clearTimeout(promptTimer); // the pending debounce would regenerate again behind us
+    await updatePrompt();
+    const task = $('#m-task').value.trim();
+    const res = await composeOneOffOrder({
+      title: task ? `${skill.name} · ${task}` : skill.name,
+      prompt: state.prompt,
+      acceptance: $('#m-accept').value.trim(),
+      agent: $('#agent').value,
+    });
+    if (!res.ok) {
+      toast(res.text, 'error');
+      if (res.reload) loadProjects();
+      return;
+    }
+    toast(res.text);
+    closeModal();
+    switchView('board');
+    openOrderDrawer(res.order.id);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 // ---------- 专家 ----------
@@ -648,6 +721,14 @@ $('#cm-save').addEventListener('click', async () => {
 // ---------- 本地运行抽屉 ----------
 function runSkill(agent, skill, task) {
   if (state.es) state.es.close();
+  // The drawer is shared with order mode (order-drawer.js). A Skill run must
+  // leave it entirely, or the order's facts and its log poll stay underneath.
+  // Deleting orderId is what stops order-drawer.js's poll (drawerIsOpenFor).
+  delete $('#run').dataset.orderId;
+  $('#ord-meta').hidden = true;
+  $('#run-cmd').hidden = false;
+  $('#run-suffix').hidden = false;
+  $('#run-out').removeAttribute('aria-live');
   $('#run').style.display = 'flex';
   // The log is the point of the drawer; focus it so a keyboard user lands on
   // the streamed output rather than having to tab the whole page to reach it.
@@ -658,7 +739,8 @@ function runSkill(agent, skill, task) {
   $('#run-out').textContent = '';
   $('#run-cmd').textContent = '';
   const url = `/api/run?agent=${encodeURIComponent(agent)}&skill=${encodeURIComponent(skill.name)}&folder=${encodeURIComponent(skill.folder)}&dir=${encodeURIComponent(curDir())}&task=${encodeURIComponent(task)}`;
-  const es = new EventSource(url);
+  // ?auth= because EventSource cannot send the header public/auth.js adds.
+  const es = new EventSource(skillspaceAuthUrl(url));
   state.es = es;
   es.addEventListener('start', (e) => { $('#run-cmd').textContent = JSON.parse(e.data).command; });
   es.addEventListener('chunk', (e) => { const out = $('#run-out'); out.textContent += JSON.parse(e.data); out.scrollTop = out.scrollHeight; });
@@ -676,6 +758,16 @@ function runSkill(agent, skill, task) {
     $('#run-status').className = 'run-status err';
     es.close();
   });
+}
+
+// Called from order-drawer.js. A live /api/run stream is an agent: closing
+// its EventSource makes the server reap it (req.on('close') in server.js), so
+// the order drawer must not take over the shared drawer silently.
+function skillRunLive() {
+  return !!(state.es && state.es.readyState !== EventSource.CLOSED);
+}
+function stopSkillRun() {
+  if (state.es) state.es.close();
 }
 
 $('#run-close').addEventListener('click', () => {
@@ -735,8 +827,217 @@ $('#reload').addEventListener('click', async () => {
 });
 $('#search').addEventListener('input', (e) => { state.q = e.target.value; applyFilter(); });
 
-function esc(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// ---------- 项目 ----------
+const PROJECT_KEY = 'skillspace-project';
+
+// esc / escAttr / railState / deleteOutcome now live in public/pure.js,
+// loaded as a classic script before this one. They remain globals.
+//
+// The ordering is currently only a convention: boot() suspends at its first
+// await before anything calls esc(), so loading pure.js afterwards happens to
+// work. That would stop being true the moment an early render became
+// synchronous, and the failure would then surface as a stray
+// "esc is not a function" somewhere deep in a render rather than at load.
+// Fail at load instead, where the cause is obvious.
+if (typeof esc !== 'function' || typeof escAttr !== 'function') {
+  throw new Error('pure.js must be loaded before app.js');
+}
+
+// focusId: the project that was just acted on, if this render was triggered by
+// an explicit selection. Never passed on the boot render, which must not steal
+// focus from the page.
+async function loadProjects(focusId) {
+  const list = document.getElementById('project-list');
+  if (!list) return;
+  let data = null;
+  let ok = false;
+  try {
+    const res = await fetch('/api/projects');
+    ok = res.ok;
+    data = await res.json();
+  } catch (_) {
+    data = null;
+  }
+
+  const st = railState(ok, data);
+  if (st.kind === 'error') {
+    // Deliberately does not touch the stored selection: a failed load is not
+    // evidence the project is gone, and clearing here would discard a valid
+    // selection every time the server hiccups.
+    list.innerHTML = '<div class="proj-empty">项目列表加载失败</div>';
+    return;
+  }
+  const projects = st.projects;
+
+  // A stored id can outlive the project it names — the record may have been
+  // deleted in another tab or by a direct API call. Reconcile BEFORE the
+  // empty-state return: an empty list is exactly the case where a dangling id
+  // has nothing left to overwrite it, so it would survive every reload.
+  let activeId = localStorage.getItem(PROJECT_KEY) || '';
+  if (activeId && !projects.some((p) => p.id === activeId)) {
+    activeId = '';
+    localStorage.removeItem(PROJECT_KEY);
+  }
+
+  // The board follows the rail. Fired on every SUCCESSFUL render rather than
+  // only on a change: board.js de-duplicates by id, and a render after a
+  // delete is exactly when the active project may have become null. Never
+  // fired on the error branch above - a failed load is not evidence the
+  // project is gone (the comment there says why).
+  const activeProject = projects.find((p) => p.id === activeId) || null;
+  document.dispatchEvent(new CustomEvent('skillspace:project', { detail: { project: activeProject } }));
+
+  if (st.kind === 'empty') {
+    list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
+    return;
+  }
+
+  // The row is a plain div holding TWO sibling buttons - select and delete.
+  // It used to be a role="button" div wrapping the delete <button>, which axe
+  // reports as nested-interactive (serious): a screen reader announces the
+  // outer "button" and cannot reach the inner one predictably. A <button> may
+  // not contain another one either, so the select control is its own button
+  // beside the delete one rather than around it (plan 3, Task 7 audit).
+  list.innerHTML = projects
+    .map((p, i) => {
+      // A name can be empty: registering "/" makes basename() return '' and the
+      // row renders zero-width, labelled "移除项目 " and confirmed as 「」.
+      // lib/projects now guarantees a non-empty name, but the path standing in
+      // costs nothing and keeps the row readable if that ever regresses.
+      const label = p.name || p.path;
+      return (
+        // data-id as well as data-i: the index is only meaningful against the
+        // array this render closed over, so a path that outlives the render —
+        // deleting a row, then looking for what replaced it — needs the row to
+        // say which project it is.
+        `<div class="proj-item${p.id === activeId ? ' active' : ''}" data-i="${i}"` +
+        ` data-id="${escAttr(p.id)}" title="${escAttr(p.path)}">` +
+        `<button type="button" class="proj-pick" aria-current="${p.id === activeId ? 'true' : 'false'}">` +
+        `<span class="proj-name">${esc(label)}</span>` +
+        // kind is shown, not hidden: it decides how many agents may run at once
+        `<span class="proj-kind">${esc(p.kind)}</span></button>` +
+        // the glyph is aria-hidden, so the control needs a label of its own
+        `<button class="proj-del" data-del="${i}" title="移除这个项目"` +
+        ` aria-label="移除项目 ${escAttr(label)}">${icon('close', 13)}</button>` +
+        `</div>`
+      );
+    })
+    .join('');
+
+  list.querySelectorAll('.proj-item').forEach((el) => {
+    const select = () => {
+      const id = projects[+el.dataset.i].id;
+      localStorage.setItem(PROJECT_KEY, id);
+      loadProjects(id);
+      switchView('board');
+    };
+    // A real <button> now, so Enter and Space come for free; the keydown
+    // shim the role="button" div needed is gone with it.
+    el.querySelector('.proj-pick').addEventListener('click', select);
+  });
+
+  list.querySelectorAll('.proj-del').forEach((el) =>
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation(); // never let removing a row also select it
+      askDeleteProject(projects[+el.dataset.del]);
+    })
+  );
+
+  // Replacing innerHTML destroys the focused node, so selecting a row dropped
+  // focus to <body> - the keyboard user was returned to the top of the page
+  // after every selection, which defeats the point of making the row operable
+  // by keyboard at all. Same document.contains staleness guard the dialog
+  // machinery uses for lastTrigger.
+  if (focusId) {
+    const idx = projects.findIndex((p) => p.id === focusId);
+    const row = idx >= 0 ? list.querySelectorAll('.proj-pick')[idx] : null;
+    if (row && document.contains(row)) row.focus();
+  }
+}
+
+// Deleting a row destroys the node the keyboard user was standing on, so focus
+// falls to <body> and they restart from the top of the document. Selection
+// already restores focus; deletion has to as well or the rail is only half
+// operable by keyboard. Land on whatever took the row's place, the last row if
+// it was the last one, and the add button if nothing is left.
+function focusAfterDelete(rowIndex) {
+  if (rowIndex < 0) return;
+  const rows = document.querySelectorAll('.proj-pick');
+  const next = rows.length ? rows[Math.min(rowIndex, rows.length - 1)] : null;
+  const target = next || document.getElementById('add-project');
+  if (target && document.contains(target)) target.focus();
+}
+
+// 删项目：只摘掉记录，磁盘上的目录一个文件都不会动。
+// 接口回的 filesKept: true 就是这件事，所以确认框里必须把它讲明白。
+function askDeleteProject(project) {
+  if (!project) return;
+  // Same empty-name fallback as the row: 删除项目「」 names nothing.
+  const label = project.name || project.path;
+  askConfirm({
+    title: `删除项目「${label}」`,
+    body: '只从列表里移除这条记录，磁盘上的文件不会被删除。',
+    target: project.path,
+    note: '',
+    okText: '移除记录',
+    onOk: async () => {
+      // Captured before the re-render destroys the row. loadProjects' focusId
+      // cannot help here — the project it would name no longer exists.
+      const rowIndex = [...document.querySelectorAll('.proj-item')].findIndex(
+        (el) => el.dataset.id === project.id
+      );
+      // null means no body at all — the network case, which deleteOutcome
+      // reports in Chinese rather than leaking a raw "Failed to fetch".
+      const body = await fetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' })
+        .then((x) => x.json())
+        .catch(() => null);
+      const outcome = deleteOutcome(body);
+      if (!outcome.ok) {
+        toast(outcome.message, 'error');
+        // A 404 means the record is already gone: the view is stale, not the
+        // request. Reconcile so the phantom row disappears instead of failing
+        // again on every retry.
+        if (outcome.shouldReload) await loadProjects();
+        return;
+      }
+      if (localStorage.getItem(PROJECT_KEY) === project.id) localStorage.removeItem(PROJECT_KEY);
+      toast(`已移除项目：${label}（磁盘文件没动）`);
+      await loadProjects();
+      focusAfterDelete(rowIndex);
+    },
+  });
+}
+
+async function addProject() {
+  // /api/pick-dir shells out to osascript, so it yields nothing on Linux or
+  // Windows and the button would appear broken. Fall back to typing a path.
+  let dir = null;
+  try {
+    const picked = await fetch('/api/pick-dir?for=project').then((r) => r.json());
+    dir = picked && picked.dir ? picked.dir : null;
+  } catch (_) { /* fall through to the prompt */ }
+  if (!dir) {
+    dir = (window.prompt('项目目录的完整路径：') || '').trim();
+    if (!dir) return;
+  }
+  let r;
+  try {
+    r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: dir }),
+    }).then((x) => x.json());
+  } catch (_) {
+    return toast('添加项目失败：无法连接服务器', 'error');
+  }
+  if (!r || r.error) return toast('添加项目失败：' + ((r && r.error) || '未知错误'), 'error');
+  localStorage.setItem(PROJECT_KEY, r.project.id);
+  // Same fallback the row and the confirm dialog use. This was the one site
+  // that missed it, so a project whose name came out empty produced a toast
+  // that named nothing at all.
+  toast('已添加项目：' + (r.project.name || r.project.path));
+  loadProjects();
+  switchView('board');
 }
 
 boot();

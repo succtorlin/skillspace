@@ -6,10 +6,12 @@
     "skillspace": "server.js"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "open": "node scripts/open-console.mjs",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=21"
   },
   "license": "MIT",
   "main": "server.js",

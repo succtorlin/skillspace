@@ -6,6 +6,7 @@
 <title>SkillSpace · 技控台</title>
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('skillspace-theme')||localStorage.getItem('skilldeck-theme')||'dark';}catch(e){}</script>
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/board.css">
 </head>
 <body>
   <div class="app">
@@ -18,9 +19,14 @@
           <div class="brand-sub">技控台</div>
         </div>
       </div>
-      <div class="side-label">Skill 来源</div>
-      <nav class="nav" id="src-list"></nav>
-      <button id="pick" class="add-dir">添加本地目录</button>
+      <div class="side-label">项目</div>
+      <nav class="nav" id="project-list" aria-label="项目列表"></nav>
+      <button id="add-project" class="add-dir">添加项目</button>
+      <details class="side-group" id="src-group" open>
+        <summary class="side-label">Skill 来源</summary>
+        <nav class="nav" id="src-list" aria-label="Skill 来源"></nav>
+        <button id="pick" class="add-dir">添加本地目录</button>
+      </details>
       <div class="sidebar-foot">
         <button id="theme-toggle" class="theme-toggle"><span id="theme-label">深色</span></button>
       </div>
@@ -34,8 +40,9 @@
           <div id="src-path" class="src-path"></div>
         </div>
         <div class="seg" id="seg">
-          <button class="seg-item active" data-view="skills">技能 <span id="seg-skills-n" class="seg-n"></span></button>
-          <button class="seg-item" data-view="experts">专家 <span id="seg-experts-n" class="seg-n"></span></button>
+          <button class="seg-item" data-view="board" aria-pressed="false">看板 <span id="seg-board-n" class="seg-n"></span></button>
+          <button class="seg-item active" data-view="skills" aria-pressed="true">技能 <span id="seg-skills-n" class="seg-n"></span></button>
+          <button class="seg-item" data-view="experts" aria-pressed="false">专家 <span id="seg-experts-n" class="seg-n"></span></button>
         </div>
         <div class="agent-box">
           <label class="agent-label" for="agent">本地 Agent</label>
@@ -43,6 +50,45 @@
         </div>
         <button id="reload" class="btn icon-btn" title="重新扫描当前目录"></button>
       </header>
+
+      <!-- 视图：看板（plan 3） -->
+      <section id="view-board" class="view view-board" hidden aria-labelledby="board-title">
+        <header class="bd-panel bd-head">
+          <div class="bd-eyebrow">项目看板</div>
+          <h1 class="bd-title-h" id="board-title">没有选中项目</h1>
+          <p class="bd-kind"><span id="board-kind" class="bd-kind-tag"></span><span id="board-kind-why" class="bd-kind-why"></span></p>
+          <div id="board-path" class="bd-path"></div>
+          <div id="board-sched" class="bd-sched" data-kind="unknown"></div>
+        </header>
+        <section class="bd-panel bd-compose" aria-labelledby="goal-eyebrow">
+          <form id="goal-form" class="gp-form" novalidate>
+            <label id="goal-eyebrow" class="bd-eyebrow" for="goal-text">说一个目标</label>
+            <textarea id="goal-text" class="modal-task gp-text" rows="3" placeholder="例如：给设置页加一个导出 CSV 的按钮，并补上测试"></textarea>
+            <label class="gp-hold-opt"><input type="checkbox" id="goal-hold" checked> 先审后跑 <span>计划落地后先停住，读完再放行</span></label>
+            <p id="goal-mode-note" class="gp-note"></p>
+            <p id="goal-error" class="gp-error" role="alert" hidden></p>
+            <div class="gp-actions">
+              <span id="goal-agent-note" class="cmd-chars"></span>
+              <button type="submit" id="goal-submit" class="btn primary" disabled>交给 PM 拆解</button>
+            </div>
+          </form>
+          <!-- The selected goal's plan comes BEFORE the list: with a dozen goals
+               the list pushed the plan you just asked for below the fold. -->
+          <div id="goal-detail" class="gp-detail" hidden></div>
+          <div id="goal-list" class="gp-list-host"></div>
+        </section>
+        <section class="bd-panel bd-orders" aria-labelledby="orders-eyebrow">
+          <h2 id="orders-eyebrow" class="bd-eyebrow">订单</h2>
+          <div id="board-filter" class="bd-filter" hidden></div>
+          <div id="board-groups" class="bd-groups"></div>
+          <p id="board-live" class="srOnly" role="status" aria-live="polite"></p>
+        </section>
+        <aside class="bd-panel bd-budget-panel" aria-labelledby="budget-eyebrow">
+          <h2 id="budget-eyebrow" class="bd-eyebrow">结构性限制</h2>
+          <dl id="board-budget" class="bd-budget"></dl>
+          <p id="board-caveat" class="bd-caveat"></p>
+        </aside>
+      </section>
 
       <!-- 视图：Skill -->
       <section id="view-skills" class="view">
@@ -79,15 +125,22 @@
         </div>
         <button class="modal-x" id="m-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
       </div>
-      <div class="modal-desc" id="m-desc"></div>
+      <div class="modal-desc" id="m-desc" tabindex="0" role="region" aria-label="Skill 说明"></div>
       <label class="modal-label">补充说明 / 具体任务（可留空）</label>
       <textarea id="m-task" class="modal-task" placeholder="例如：帮我给这篇讲 Loop 工程的文章起 10 个标题"></textarea>
       <div class="modal-mode">
         <label class="mode-opt"><input type="radio" name="m-mode" value="path" checked> 路径口令<span class="mode-hint">指名 Skill + 补充说明 + SKILL.md 地址，Codex 自己读（推荐）</span></label>
         <label class="mode-opt"><input type="radio" name="m-mode" value="inject"> 完整口令<span class="mode-hint">把说明书整篇注入，换机器 / 读不到路径时用</span></label>
       </div>
+      <details class="modal-order" id="m-order-box">
+        <summary class="modal-label">派给项目（一次性订单）</summary>
+        <p class="modal-order-note" id="m-order-note"></p>
+        <label class="modal-label" for="m-accept">验收标准（可留空）</label>
+        <textarea id="m-accept" class="modal-task" rows="2" placeholder="例如：npm test 全绿，README 里写了新命令"></textarea>
+        <button class="btn" id="m-order" type="button">派给当前项目</button>
+      </details>
       <div class="modal-cmd-label">复制这段口令，粘贴到 Codex 对话框发送 <span id="m-chars" class="cmd-chars"></span></div>
-      <pre class="modal-cmd" id="m-cmd"></pre>
+      <pre class="modal-cmd" id="m-cmd" tabindex="0" role="region" aria-label="口令"></pre>
       <div class="modal-actions">
         <button class="btn ghost" id="m-cancel">取消</button>
         <button class="btn ghost" id="m-run">本地运行</button>
@@ -193,18 +246,44 @@
     </div>
   </div>
 
-  <!-- 本地运行输出抽屉 -->
-  <div id="run" class="run-drawer" style="display:none" role="complementary" aria-labelledby="run-skill">
+  <!-- 本地运行输出抽屉；plan 3 起也是订单抽屉（order mode） -->
+  <div id="run" class="run-drawer" style="display:none" role="complementary" aria-labelledby="run-title">
     <div class="run-head">
-      <div class="run-title"><span id="run-skill"></span> · 运行结果</div>
+      <h2 class="run-title" id="run-title" tabindex="-1"><span id="run-skill"></span><span id="run-suffix"> · 运行结果</span></h2>
       <div class="run-status" id="run-status" role="status" aria-live="polite">运行中…</div>
       <button class="run-x" id="run-close" aria-label="关闭"><span aria-hidden="true">×</span></button>
     </div>
     <div class="run-cmd" id="run-cmd"></div>
+    <div id="ord-meta" class="ord-meta" hidden>
+      <dl id="ord-facts" class="ord-facts"></dl>
+      <div id="ord-failure" class="ord-failure" hidden></div>
+      <div id="ord-verdict" class="ord-verdict" hidden></div>
+      <div id="ord-attempts" class="ord-attempts" hidden></div>
+      <details class="ord-sec">
+        <summary>指令 <span id="ord-prompt-n" class="cmd-chars"></span></summary>
+        <pre id="ord-prompt" class="ord-pre" tabindex="0"></pre>
+      </details>
+      <details class="ord-sec" open>
+        <summary>验收标准</summary>
+        <pre id="ord-acceptance" class="ord-pre" tabindex="0"></pre>
+      </details>
+      <div id="ord-actions" class="ord-actions">
+        <button type="button" class="btn" id="ord-dispatch" hidden>立即派发</button>
+        <button type="button" class="btn ghost" id="ord-cancel" hidden>取消这一单</button>
+        <button type="button" class="btn" id="ord-retry" hidden>重试（新建一单）</button>
+        <button type="button" class="btn ghost" id="ord-verdict-retry" hidden>重新验收</button>
+      </div>
+      <p id="ord-log-note" class="ord-log-note"></p>
+    </div>
     <pre class="run-out" id="run-out" tabindex="0" role="log" aria-label="运行输出"></pre>
   </div>
 
+  <script src="/auth.js"></script>
+  <script src="/pure.js"></script>
   <script src="/icons.js"></script>
+  <script src="/board.js"></script>
+  <script src="/order-drawer.js"></script>
+  <script src="/goal-panel.js"></script>
   <script src="/app.js"></script>
   <div id="toast" class="toast" role="status" aria-live="polite" style="display:none"></div>
 </body>

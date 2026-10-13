@@ -1,0 +1,366 @@
+/* ============================================================
+   Board, order drawer, goal composer — plan 3.
+   READS TOKENS ONLY. Every colour is var(--…) from style.css; there are no
+   hex/rgb literals and no ID selectors here (test/board-css.test.js).
+   Depth: page --ground-0 → panel --ground-1 → row hover --ground-2.
+   NEVER --ground-3 under text: --muted measures 4.34:1 (dark) and 4.25:1
+   (light) there, and light --accent 4.34:1 — all below AA.
+   ============================================================ */
+
+/* ---------- panel anatomy: hairline + one ground step, eyebrow header ---------- */
+.bd-panel {
+  background: var(--ground-1);
+  border: 1px solid var(--hair);
+  border-radius: 14px;
+  padding: 16px;
+  min-width: 0;
+}
+.bd-eyebrow {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--face-mono); font-size: 10px; font-weight: 400;
+  letter-spacing: .22em; text-transform: uppercase; color: var(--accent);
+  margin: 0 0 12px;
+}
+.bd-eyebrow::before { content: ""; width: 14px; height: 1px; background: var(--accent); flex: none; opacity: .8; }
+
+/* ---------- bracket numeral: the .jb-num grammar, for an order's seq ----------
+   The brackets are decoration, so they carry empty alt text (`content: x / ""`)
+   where supported; the first declaration is the fallback for engines without
+   alt-text syntax. Without it VoiceOver reads ⌐ as "not sign". */
+.seq {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; font-weight: 600; color: var(--ink-2);
+}
+.seq::before { content: "⌐"; content: "⌐" / ""; opacity: .55; }
+.seq::after { content: "¬"; content: "¬" / ""; opacity: .55; }
+
+/* ---------- status dot: the .jb-dot grammar, one per state ----------
+   Never the only signal - every dot sits beside its status words. Non-text
+   contrast vs --ground-1 (1.4.11 ≥ 3:1): muted 5.36/5.18, danger 5.42/5.43,
+   ink-2 8.87/7.77, accent 11.99/5.29 (dark/light). */
+.sdot {
+  flex: none; display: inline-block; width: 8px; height: 8px;
+  border-radius: 50%; border: 1.5px solid transparent; background: transparent;
+}
+.sdot[data-state="queued"],
+.sdot[data-state="goal-planned"],
+.sdot[data-state="sched-off"],
+.sdot[data-state="sched-unknown"],
+.sdot[data-state="unknown"],
+.sdot[data-state="sched-held"] { border-color: var(--muted); }
+.sdot[data-state="running"],
+.sdot[data-state="goal-planning"],
+.sdot[data-state="goal-running"],
+.sdot[data-state="sched-working"] { background: var(--accent); animation: jb-pulse 1.2s ease-in-out infinite; }
+.sdot[data-state="succeeded"],
+.sdot[data-state="goal-done"],
+.sdot[data-state="sched-idle"] { background: var(--ink-2); }
+.sdot[data-state="failed"],
+.sdot[data-state="interrupted"],
+.sdot[data-state="goal-failed"],
+.sdot[data-state="sched-erroring"],
+.sdot[data-state="sched-stalled"] { background: var(--danger); }
+.sdot[data-state="sched-paused"],
+.sdot[data-state="sched-blocked"],
+.sdot[data-state="goal-stalled"] { border-color: var(--danger); }
+/* cancelled is a dash, not a dot: "stopped", not "failed" */
+.sdot[data-state="cancelled"] { width: 9px; height: 2px; border-radius: 1px; background: var(--muted); border: 0; }
+/* A frozen pulse is worse than none (the .jb-dot note in style.css). */
+@media (prefers-reduced-motion: reduce) {
+  /* [data-state] matches the specificity of the state rules above; a bare
+     .sdot here LOST to .sdot[data-state="running"] and the dot kept pulsing
+     under reduced motion (measured in the Task 14 audit). */
+  .sdot[data-state] { animation: none; opacity: 1; }
+}
+
+/* ---------- empty / filtered / failed / loading ---------- */
+.bd-state { padding: 32px 16px; text-align: center; color: var(--ink-2); font-size: 13px; line-height: 1.7; }
+.bd-state-title { font-family: var(--face-display); font-weight: 500; font-size: 16px; color: var(--ink); margin-bottom: 4px; }
+.bd-state .btn { margin-top: 12px; }
+.bd-skel { display: grid; gap: 8px; padding: 8px 0; }
+.bd-skel span { display: block; height: 12px; border-radius: 4px; background: var(--ground-2); }
+.bd-skel span:nth-child(2) { width: 82%; }
+.bd-skel span:nth-child(3) { width: 64%; }
+.bd-stale {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 12px; border-radius: 10px;
+  border: 1px solid var(--danger); background: var(--ground-2);
+  font-size: 12.5px; color: var(--ink);
+}
+
+/* ---------- the board view: orders primary, composer and limits beside ---------- */
+.view-board {
+  display: grid; gap: 12px; margin: 12px 10px 40px; align-items: start;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  grid-template-areas: "head head" "orders compose" "orders budget";
+  /* the last row takes the slack, so the limits panel sits under the
+     composer instead of floating halfway down a long orders column */
+  grid-template-rows: auto auto 1fr;
+}
+.bd-head { grid-area: head; }
+.bd-orders { grid-area: orders; }
+.bd-compose { grid-area: compose; }
+.bd-budget-panel { grid-area: budget; }
+.bd-title-h {
+  font-family: var(--face-display); font-weight: 500; font-size: 22px;
+  letter-spacing: -.01em; color: var(--ink); text-wrap: balance;
+}
+.bd-kind { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-top: 8px; font-size: 12.5px; color: var(--ink-2); }
+.bd-kind-tag { font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .12em; color: var(--accent); }
+.bd-path {
+  margin-top: 4px; font-family: var(--face-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; color: var(--muted); word-break: break-all;
+}
+
+/* Sources folded under the rail. The summary keeps .side-label's look. */
+.side-group > summary { cursor: pointer; list-style: none; margin-top: 16px; min-height: 24px; } /* 2.5.8 target size */
+.side-group > summary::-webkit-details-marker { display: none; }
+.side-group > summary::after { content: "＋"; content: "＋" / ""; margin-left: auto; color: var(--muted); letter-spacing: 0; }
+.side-group[open] > summary::after { content: "－"; content: "－" / ""; }
+
+@media (max-width: 1024px) {
+  .view-board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "compose" "orders" "budget"; grid-template-rows: none; }
+}
+@media (max-width: 560px) {
+  .view-board { margin-left: 6px; margin-right: 6px; }
+  .bd-panel { padding: 12px; }
+}
+
+/* The hidden attribute must win over every display rule above. The board's
+   filter chip, goal detail, drawer facts and error lines are all toggled with
+   it, and a class like .bd-filter { display: flex } otherwise beats the UA's
+   [hidden] { display: none } and shows an empty, stale box. */
+:is(.view-board, .run-drawer, .modal) [hidden] { display: none; }
+
+/* ---------- project rail: select and delete are sibling buttons ----------
+   The row was a role="button" div around the delete <button> (axe:
+   nested-interactive, serious). The row keeps its look from style.css; the
+   select button fills it, and delete gets a 24px target (WCAG 2.5.8). */
+.proj-item { padding: 0 4px 0 0; }
+.proj-pick {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border: 0; border-radius: 8px; background: transparent;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.proj-del { min-width: 24px; min-height: 24px; justify-content: center; margin-left: 0; }
+
+/* ---------- groups and rows ---------- */
+.bd-groups { display: grid; gap: 4px; }
+.bd-group-head {
+  display: flex; align-items: center; gap: 8px; padding: 12px 8px 4px;
+  font-family: var(--face-mono); font-size: 11px; font-weight: 400;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2);
+}
+.bd-n { font-variant-numeric: tabular-nums; color: var(--muted); letter-spacing: 0; }
+.bd-rows { list-style: none; display: grid; gap: 2px; }
+.bd-row {
+  display: grid; align-items: center; gap: 12px; width: 100%;
+  grid-template-columns: 6ch minmax(0, 1fr) 9ch 15ch 8ch;
+  grid-template-areas: "seq title agent status dur";
+  padding: 8px; border-radius: 8px; border: 1px solid transparent;
+  background: transparent; color: var(--ink); font: inherit; font-size: 13.5px;
+  text-align: left; cursor: pointer;
+}
+.bd-row:hover { background: var(--ground-2); border-color: var(--hair); }
+.bd-row:active { border-color: var(--hair-lit); }
+.bd-row .seq { grid-area: seq; }
+.bd-title { grid-area: title; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-agent, .bd-dur {
+  font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--ink-2);
+}
+.bd-agent { grid-area: agent; }
+.bd-dur { grid-area: dur; text-align: right; }
+.bd-status { grid-area: status; display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.bd-filter {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+  font-size: 12.5px; color: var(--ink-2);
+}
+@media (max-width: 560px) {
+  .bd-row {
+    grid-template-columns: 6ch minmax(0, 1fr) auto;
+    grid-template-areas: "seq title status" "seq agent dur";
+    row-gap: 2px;
+  }
+  .bd-dur { text-align: right; }
+}
+
+/* ---------- scheduler strip ---------- */
+.bd-sched {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  margin-top: 12px; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid var(--hair); background: var(--ground-2);
+  font-size: 12.5px; color: var(--ink);
+}
+.bd-sched[data-kind="erroring"], .bd-sched[data-kind="stalled"],
+.bd-sched[data-kind="paused"], .bd-sched[data-kind="blocked"] { border-color: var(--danger); }
+.bd-sched-text { font-family: var(--face-mono); font-size: 11.5px; letter-spacing: .04em; }
+.bd-sched-detail { color: var(--ink-2); }
+.bd-sched-err { flex-basis: 100%; color: var(--ink-2); font-family: var(--face-mono); font-size: 11px; word-break: break-word; }
+
+/* ---------- structural limits ---------- */
+.bd-budget { display: grid; gap: 12px; }
+.bd-limit { display: grid; grid-template-columns: auto 1fr; column-gap: 12px; row-gap: 2px; }
+.bd-limit dt { font-size: 12.5px; color: var(--ink-2); }
+.bd-limit-v { font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); text-align: right; }
+.bd-limit-v.is-over { color: var(--danger-ink); }
+.bd-limit-note { grid-column: 1 / -1; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.bd-caveat {
+  margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hair);
+  font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch;
+}
+
+/* ---------- order mode of the run drawer ---------- */
+.ord-meta { padding: 12px 18px; border-bottom: 1px solid var(--hair); display: grid; gap: 12px; overflow-y: auto; max-height: 52vh; }
+.ord-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 16px; }
+.ord-facts dt { font-family: var(--face-mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+.ord-facts dd { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink); min-width: 0; }
+.ord-path { font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); word-break: break-all; }
+.ord-limit { color: var(--muted); font-family: var(--face-mono); font-size: 11px; }
+.ord-failure {
+  padding: 8px 12px; border-left: 2px solid var(--danger); border-radius: 0 8px 8px 0;
+  background: var(--ground-2); font-size: 12.5px; line-height: 1.6; color: var(--ink);
+}
+.ord-failure-title { display: block; color: var(--danger-ink); font-weight: 600; }
+.ord-failure[data-kind="cancelled"] { border-left-color: var(--hair-lit); }
+.ord-failure[data-kind="cancelled"] .ord-failure-title { color: var(--ink); }
+.ord-sec > summary {
+  cursor: pointer; font-family: var(--face-mono); font-size: 10.5px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2);
+}
+.ord-pre {
+  margin-top: 8px; padding: 8px 12px; max-height: 180px; overflow-y: auto;
+  background: var(--ground-0); border: 1px solid var(--hair); border-radius: 8px;
+  font-family: var(--face-mono); font-size: 12px; line-height: 1.6;
+  color: var(--ink); white-space: pre-wrap; word-break: break-word;
+}
+.ord-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ord-actions:empty { display: none; }
+.ord-log-note { font-size: 12px; color: var(--ink-2); }
+.ord-log-note:empty { display: none; }
+
+/* Dialogs above the drawer. The confirm for cancelling an order is opened FROM
+   the run drawer (z 60), and with the modal mask at style.css's 50 the drawer
+   covered the dialog's own buttons - on a phone, entirely (found in the Task 11
+   browser check: 取消 and 终止 were unclickable). Toasts stay on top at 100. */
+.modal-mask { z-index: 70; }
+
+/* ---------- goal composer and panel ---------- */
+.gp-form { display: grid; gap: 8px; }
+.gp-text { min-height: 72px; resize: vertical; }
+.gp-note { font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch; }
+.gp-error { font-size: 12.5px; color: var(--danger-ink); }
+.gp-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gp-list-head { margin-top: 16px; }
+.gp-list { list-style: none; display: grid; gap: 2px; max-height: 240px; overflow-y: auto; }
+.gp-goal {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "dot text" ". status";
+  gap: 2px 8px; align-items: center; width: 100%; padding: 8px; text-align: left;
+  border: 1px solid transparent; border-radius: 8px; background: transparent;
+  color: var(--ink); font: inherit; font-size: 13px; cursor: pointer;
+}
+.gp-goal:hover { background: var(--ground-2); border-color: var(--hair); }
+.gp-goal.is-on { background: var(--ground-2); border-color: var(--hair-lit); }
+.gp-goal .sdot { grid-area: dot; }
+.gp-goal-text { grid-area: text; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-goal-status { grid-area: status; font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); }
+.gp-detail { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--hair); display: grid; gap: 12px; }
+.gp-pmlog { max-height: 220px; }
+.gp-plan { list-style: none; display: grid; gap: 8px; }
+.gp-step {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; align-items: center;
+  padding: 8px; border: 1px solid var(--hair); border-radius: 8px;
+}
+.gp-step-open {
+  display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0;
+  background: none; border: 0; color: var(--ink); font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.gp-step-open:hover .gp-step-title { text-decoration: underline; text-underline-offset: 3px; }
+.gp-step-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-accept { grid-column: 1 / -1; font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+.gp-accept-k {
+  margin-right: 8px; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+}
+.gp-dispatch { grid-column: 2; justify-self: end; }
+.gp-hold-opt { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); cursor: pointer; }
+.gp-hold-opt input { margin-top: 4px; accent-color: var(--accent); }
+.gp-hold-opt span { color: var(--ink-2); }
+.gp-held {
+  display: grid; gap: 8px; padding: 12px; border-radius: 10px;
+  border: 1px solid var(--hair-lit); background: var(--ground-2);
+  font-size: 12.5px; line-height: 1.6; color: var(--ink);
+}
+.gp-held .btn { justify-self: start; }
+
+
+/* ---------- one-off order box in the Skill modal ---------- */
+.modal-order { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hair); }
+.modal-order > summary { cursor: pointer; }
+.modal-order-note { margin: 8px 0; font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch; }
+.modal-order .btn { margin-top: 8px; }
+
+/* On the board the topbar's source header (a Skill directory) and its rescan
+   button are about the card wall, not the project on screen; the board header
+   says which project this is. The agent picker stays - goals and dispatch use it.
+   (.icon-btn, not the id: board.css carries no ID selectors.) */
+body[data-view="board"] .topbar .src-head,
+body[data-view="board"] .topbar .icon-btn { display: none; }
+
+/* Three segments since the board joined them: at 320px the segmented control
+   ran 12px past the viewport (WCAG 1.4.10, Task 14 audit). Let it fill the row
+   and let each segment shrink instead. */
+@media (max-width: 420px) {
+  .seg { max-width: 100%; min-width: 0; }
+  .seg-item { padding-left: 10px; padding-right: 10px; min-width: 0; }
+}
+
+/* ---------- verdict badges (plan 2d) ----------
+   VERIFIED is a solid --ink slab with --ground-1 text (15.66:1 dark,
+   17.68:1 light). EXIT-0-AWAITING is hollow with a DASHED --hair-lit border
+   and --ink-2 text (8.87/7.77 on ground-1, 8.06/6.88 on a hovered row): a
+   claim nobody has checked yet. REJECTED and an ERRORED verdict wear the
+   danger hairline with --danger-ink text (8.08/7.06). They stay apart in
+   grayscale - fill vs no fill, solid vs dashed, ✓ vs ○ vs ✕ - and none
+   borrows the mint accent, which means "actionable". */
+.vbadge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px; border: 1px solid transparent;
+  font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .04em; white-space: nowrap;
+}
+.bd-status .vbadge, .gp-step .vbadge { margin-left: 8px; }
+.vbadge[data-kind="verified"] { background: var(--ink); color: var(--ground-1); border-color: var(--ink); font-weight: 700; }
+.vbadge[data-kind="awaiting"] { background: transparent; color: var(--ink-2); border: 1px dashed var(--hair-lit); }
+.vbadge[data-kind="none"] { background: transparent; color: var(--ink-2); border: 1px dotted var(--hair-lit); }
+.vbadge[data-kind="judging"] { background: transparent; color: var(--ink); border-color: var(--hair-lit); }
+.vbadge[data-kind="rejected"],
+.vbadge[data-kind="error"] { background: transparent; color: var(--danger-ink); border-color: var(--danger); }
+.vbadge[data-kind="unknown"] { color: var(--ink-2); border-color: var(--hair-lit); }
+.sdot[data-state="verified"] { background: var(--ink); }
+.sdot[data-state="attention"] { border-color: var(--danger); }
+.ord-verdict { display: grid; gap: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+.ord-verdict-k {
+  margin-right: 8px; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2);
+}
+/* the verdict column on a board row */
+.bd-row { grid-template-columns: 6ch minmax(0, 1fr) 9ch 15ch 16ch 8ch; grid-template-areas: "seq title agent status verdict dur"; }
+.bd-verdict { grid-area: verdict; min-width: 0; }
+@media (max-width: 560px) {
+  .bd-row { grid-template-columns: 6ch minmax(0, 1fr) auto; grid-template-areas: "seq title dur" "seq status verdict"; }
+  .bd-agent { display: none; }
+}
+
+/* ---------- attempts (plan 2d) ---------- */
+.bd-attempt { margin-right: 4px; font-family: var(--face-mono); font-size: 10.5px; color: var(--ink-2); white-space: nowrap; }
+.bd-superseded { margin-top: 8px; }
+.ord-attempts { display: grid; gap: 4px; }
+.ord-attempts-head { font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); }
+.ord-attempt-list { list-style: none; display: grid; gap: 2px; }
+.ord-attempt {
+  width: 100%; min-height: 24px; text-align: left; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid transparent; background: transparent; color: var(--ink-2);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.ord-attempt:hover { background: var(--ground-2); color: var(--ink); }
+.ord-attempt.is-on { border-color: var(--hair-lit); color: var(--ink); }
