@@ -659,3 +659,15 @@ test('verdictRetryOffer never opens on a superseded attempt', () => {
   assert.strictEqual(pure.verdictRetryOffer(judged({}), g, off, ['claude'], old), null);
   assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'error' }), g, off, ['claude'], head).label, '重新验收');
 });
+
+test('the attempts note says what happens at the cap, not that a human retry ignores it', () => {
+  // A human retry skips the cap check, but only while the goal is open - and
+  // the loop records the capped rejection as final and settles the goal
+  // `failed` one tick later, after which every retry is refused, a human's
+  // included (reproduced: 'the goal is failed').
+  const p = { kind: 'git', concurrency: 2, budget: { maxOrdersPerGoal: 12, orderTimeoutMs: 900000, maxOrdersPerDay: 100, maxAttemptsPerOrder: 3 } };
+  const note = pure.budgetView(p, [], Date.now()).rows.find((r) => r.key === 'attempts').note;
+  assert.doesNotMatch(note, /不受它限制/, 'the old claim was false once the cap is reached');
+  assert.match(note, /目标随即记为失败/);
+  assert.match(note, /包括手动/);
+});

@@ -426,7 +426,10 @@ function budgetView(project, orders, now) {
       {
         key: 'attempts', label: '每单尝试',
         value: n(b.maxAttemptsPerOrder) ? `≤ ${b.maxAttemptsPerOrder} 次` : '未设上限',
-        note: '被驳回后自动重试的上限；你手动点「重试」不受它限制，但仍受上面两个上限约束。', over: false,
+        // What is TRUE at the cap: the loop records that rejection as final and
+        // the goal settles failed on its next tick, after which the server
+        // refuses every retry under it - a human's included.
+        note: '被驳回后自动重试的上限。次数用完时，那次驳回就是最终结论：目标随即记为失败，之后谁都不能再在它下面重试，包括手动。用完之前你手动点「重试」不占这个次数，但仍算进每个目标的单数。', over: false,
       },
       {
         key: 'timeout', label: '每单时长',
