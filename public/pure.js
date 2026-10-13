@@ -693,9 +693,13 @@ function retryOffer(order, chain, goal) {
 // not judging, or because the goal's PM is no longer installed (the loop's
 // judgeFor answers "not now" for that, forever). `installed` is the list of
 // agent ids /api/config reports; without it the PM is assumed present.
+// `chain` is the order's attempt chain: never on a superseded attempt, which
+// the server refuses (and which would read as the chain's answer).
 // Returns { label, pmMissing } or null.
-function verdictRetryOffer(order, goal, cur, installed) {
+function verdictRetryOffer(order, goal, cur, installed, chain) {
   if (!verdictPending(order) || verdictOf(order)) return null;
+  const info = attemptInfo(chain);
+  if (info && !info.latest) return null;
   if (goal && GOAL_SETTLED_STATES.includes(goal.status)) return null;
   const vs = order.verdictState === undefined ? null : order.verdictState;
   if (vs === 'error') return { label: '重新验收', pmMissing: false };

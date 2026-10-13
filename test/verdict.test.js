@@ -392,3 +392,26 @@ test('an order still being wrapped up is refused by judge() and skipped by pass(
   }).done;
   assert.strictEqual(done.verdictReason, `${N} files on the branch`, 'the judge saw a branch without the work');
 });
+
+test('a superseded attempt is never judged, even when a human asks', () => {
+  // Its successor is the attempt the goal counts; a verdict on the old one is
+  // a run spent on work the chain has already moved past - and a 'verified'
+  // there would read as the chain's answer.
+  const { root, project } = gitSetup();
+  const tally = path.join(tmpDir(), 'tally');
+  const agent = shimAgent(tallying(tally, 0, '{"verdict":"verified","reason":"x"}'));
+  const { goal, order } = finishedOrder(root, project);
+  // A successor that supersedes it, named by the goal - the shape a retry
+  // leaves (the old one's verdict errored, so a human could otherwise ask).
+  orders.recordVerdict(root, order.id, { verdictState: 'error', verdictError: 'judge: boom' });
+  const next = orders.create(root, { projectId: project.id, prompt: 'again', supersedes: order.id });
+  orders.attachToGoal(root, next.id, goal.id, 0);
+  goals.addOrder(root, goal.id, next.id);
+  const r = verdict.judge(root, {
+    order: orders.get(root, order.id), goal: goals.get(root, goal.id), project, agent,
+    childEnv: testEnv, allowFrom: [null, 'error'],
+  });
+  assert.strictEqual(r.kind, 'conflict');
+  assert.match(r.refused, new RegExp(`^already superseded by ${next.id}`));
+  assert.deepStrictEqual(pidsIn(tally), [], 'a judge was spawned');
+});

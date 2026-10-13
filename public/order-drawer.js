@@ -238,7 +238,7 @@ function drawerRenderActions(order) {
   const vr = drawerEl('ord-verdict-retry');
   const picker = document.getElementById('agent');
   const installed = picker ? [...picker.options].map((o) => o.value).filter(Boolean) : [];
-  const offer = verdictRetryOffer(order, goal, b.sched, installed);
+  const offer = verdictRetryOffer(order, goal, b.sched, installed, drawer.chain);
   vr.hidden = !offer;
   vr.disabled = drawer.pending === 'verdict';
   vr.textContent = drawer.pending === 'verdict' ? '交给 PM…' : offer ? offer.label : '重新验收';

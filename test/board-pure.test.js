@@ -647,3 +647,15 @@ test('verdictRetryOffer: the door opens when the goal\'s PM is no longer install
 test('skipReasonText words a missing judge', () => {
   assert.match(pure.skipReasonText('no judge available'), /PM/);
 });
+
+test('verdictRetryOffer never opens on a superseded attempt', () => {
+  // The server refuses it (already superseded); offering the button there is
+  // a trap, the way retryOffer already treats it.
+  const off = { scheduler: { running: false, judging: true } };
+  const g = { status: 'stalled', pmAgent: 'claude' };
+  const head = chain({ ids: ['a', 'b'], attempts: 2, headId: 'b', supersededBy: null, attempt: 2 });
+  const old = chain({ ids: ['a', 'b'], attempts: 2, headId: 'b', supersededBy: 'b', attempt: 1 });
+  assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'error' }), g, off, ['claude'], old), null);
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, off, ['claude'], old), null);
+  assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'error' }), g, off, ['claude'], head).label, '重新验收');
+});
