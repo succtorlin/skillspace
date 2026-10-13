@@ -584,6 +584,132 @@ function planDispatchable(goal, cur) {
   return !!s && typeof s === 'object' && s.running === false;
 }
 
+// ---------- verdicts and attempts (plan 2d, as implemented) ----------
+// Spec §3: succeeded = exited 0; verified = the PM checked it against its
+// acceptance and accepted it. 2d stores the verdict BESIDE status
+// (`verdict`), with `verdictState` saying where the judgement is - so the
+// two are read separately and rendered together, never collapsed. Records
+// written before 2d carry none of these keys: absent reads as null.
+function verdictOf(order) {
+  const v = order && order.verdict;
+  return v === undefined || v === null || v === '' ? null : v;
+}
+// Mirror of lib/chains.judgeable (null = this order WILL get a verdict).
+function verdictPending(order) {
+  if (!order || typeof order.goalId !== 'string' || !order.goalId) return false;
+  if (order.status === 'succeeded') return true;
+  return order.status === 'failed' && !!order.startedAt;
+}
+function verdictView(order) {
+  if (!order) return null;
+  const v = verdictOf(order);
+  const vs = order.verdictState === undefined ? null : order.verdictState;
+  const reason = typeof order.verdictReason === 'string' && order.verdictReason.trim() ? order.verdictReason.trim() : null;
+  if (v === 'verified') return { kind: 'verified', label: '已验收', glyph: '✓', detail: reason };
+  if (v === 'rejected') return { kind: 'rejected', label: '驳回', glyph: '✕', detail: reason || '没有记录驳回理由' };
+  if (v) return { kind: 'unknown', label: `验收结果无法识别（${String(v)}）`, glyph: '?', detail: null };
+  if (vs === 'judging') return { kind: 'judging', label: 'PM 验收中', glyph: '…', detail: null };
+  if (vs === 'error') {
+    const why = typeof order.verdictError === 'string' && order.verdictError ? order.verdictError : '原因没有记录';
+    return { kind: 'error', label: '验收出错', glyph: '!', detail: `PM 没有给出可读的结论：${why}` };
+  }
+  if (verdictPending(order)) {
+    return {
+      kind: 'awaiting', label: order.status === 'succeeded' ? '退出 0 · 待验收' : '待验收', glyph: '○',
+      detail: '进程结束了，但 PM 还没有对照验收标准检查结果。',
+    };
+  }
+  if (order.status === 'succeeded') {
+    return { kind: 'none', label: '退出 0 · 没有 PM 验收', glyph: '–', detail: '一次性订单不属于任何目标，没有 PM 来验收。' };
+  }
+  return null;
+}
+
+// The server derives chains and sends them BESIDE the records
+// ({ [id]: chain | null }); null means the family could not be established
+// and the order is shown without numbering. Nothing is derived here.
+function attemptInfo(chain) {
+  if (!chain || typeof chain !== 'object') return null;
+  if (!Number.isInteger(chain.attempt) || !Number.isInteger(chain.attempts) || chain.attempt < 1) return null;
+  return {
+    attempt: chain.attempt, of: chain.attempts, rootId: chain.rootId || null,
+    latest: !chain.supersededBy, supersedes: chain.supersedes || null, supersededBy: chain.supersededBy || null,
+  };
+}
+function attemptLabel(info, rootOrder) {
+  if (!info) return '';
+  const from = rootOrder ? ` · 源自 ⌐${seqLabel(rootOrder)}¬` : '';
+  return `第 ${info.attempt} 次尝试 · 共 ${info.of} 次${from}`;
+}
+// The board's default view: each chain's latest attempt, plus every order
+// whose chain is unknown (never hidden for want of a chain).
+function latestOrders(orders, chains) {
+  const map = chains && typeof chains === 'object' ? chains : {};
+  return (Array.isArray(orders) ? orders : []).filter((o) => {
+    if (!o) return false;
+    const info = attemptInfo(map[o.id]);
+    return !info || info.latest;
+  });
+}
+
+// Whether to offer 重试 (POST /api/orders/:id/retry). The server is the
+// authority; this mirrors its refusals so the button is not a trap, and
+// never offers it on a superseded attempt (that would fork the chain).
+function retryOffer(order, chain, goal) {
+  if (!order || !ORDER_SETTLED_STATES.includes(order.status)) return false;
+  const v = verdictOf(order);
+  const vs = order.verdictState === undefined ? null : order.verdictState;
+  if (v === 'verified' || vs === 'judging') return false;
+  const info = attemptInfo(chain);
+  if (info && !info.latest) return false;
+  if (vs === null && v === null && verdictPending(order)) return false; // awaiting its verdict
+  if (order.goalId && goal && (GOAL_SETTLED_STATES.includes(goal.status) || goal.status === 'planning')) return false;
+  return order.status !== 'succeeded' || v === 'rejected' || vs === 'error';
+}
+
+// Whether to offer the verdict door (POST …/verdict/retry): an errored
+// verdict, or a result nothing will ever judge because the loop is off or
+// not judging. Returns { label } or null.
+function verdictRetryOffer(order, goal, cur) {
+  if (!verdictPending(order) || verdictOf(order)) return null;
+  if (goal && GOAL_SETTLED_STATES.includes(goal.status)) return null;
+  const vs = order.verdictState === undefined ? null : order.verdictState;
+  if (vs === 'error') return { label: '重新验收' };
+  if (vs !== null) return null;
+  const s = cur && cur.scheduler;
+  const loopJudges = !!s && s.running === true && s.judging !== false;
+  return loopJudges ? null : { label: '请 PM 验收' };
+}
+
+const RETRY_REASON_TEXT = [
+  [/^the order is awaiting its verdict/, '它还在等验收，先别重试（会和 PM 抢）'],
+  [/^the order is being judged/, 'PM 正在验收它'],
+  [/^already being judged/, 'PM 正在验收它'],
+  [/^the order was verified/, '它已经验收通过，没有可重试的'],
+  [/^already superseded by/, '它已经重试过了，去看最新的那一次'],
+  [/^no attempts left/, '尝试次数已用完'],
+  [/^the goal has used its/, '目标的订单数已到上限'],
+  [/^the goal is (\w+)/, '目标已经结束或还在拆解'],
+  [/^the order's goal cannot be read/, '读不到它的目标'],
+  [/^the order is not part of its goal's plan/, '它不在目标的计划里'],
+  [/^the order's project/, '它的项目不存在了'],
+  [/^the order is still/, '它还没结束'],
+  [/^an order outside a goal/, '一次性订单没有 PM 来验收'],
+  [/^project busy/, '项目里有别的 agent 在跑（未隔离的目录一次只能跑一个）'],
+];
+function retryOutcome(kind, status, body) {
+  const err = body && typeof body.error === 'string' ? body.error : '';
+  const verb = kind === 'verdict' ? '重新验收' : '重试';
+  if (status === 0) return { ok: false, text: '无法连接服务器' };
+  if (status === 200 && body && body.order) {
+    return { ok: true, order: body.order, chain: body.chain || null, text: kind === 'verdict' ? '已交给 PM 验收' : '已新建一次尝试' };
+  }
+  if (status === 404) return { ok: false, text: '这一单不存在了' };
+  if (status === 429) return { ok: false, text: /agents running/.test(err) ? `同时运行的 agent 已满，稍后再试（${err}）` : `${verb}不了：${err}` };
+  const hit = RETRY_REASON_TEXT.find(([re]) => re.test(err));
+  return { ok: false, text: `${verb}不了：${hit ? `${hit[1]}（${err}）` : err || `HTTP ${status}`}` };
+}
+
 // Inert in the browser: a classic script has no `module`, so the typeof guard
 // short-circuits and the declarations above simply stay globals.
 if (typeof module !== 'undefined' && module.exports) {
@@ -596,5 +722,7 @@ if (typeof module !== 'undefined' && module.exports) {
     schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
     orderRowStatus, skipReasonText, goalReleaseOutcome, planDispatchable,
+    verdictOf, verdictPending, verdictView, attemptInfo, attemptLabel, latestOrders, retryOffer,
+    verdictRetryOffer, retryOutcome,
   };
 }

@@ -481,3 +481,118 @@ test('planDispatchable: a held goal\'s steps can be approved one by one', () => 
   assert.strictEqual(pure.planDispatchable({ held: false }, sOff), true);
   assert.strictEqual(pure.planDispatchable({}, null), false, 'unknown fails closed: no second door');
 });
+
+// ---------- verdicts and attempt chains (plan 2d, as implemented) ----------
+// Shapes are 2d's real ones: verdict beside status, verdictState saying where
+// the judgement is, chains derived on the server and sent BESIDE the records.
+const judged = (over) => order({ goalId: 'g1', status: 'succeeded', exitCode: 0, startedAt: 'x', finishedAt: 'y',
+  verdict: null, verdictState: null, verdictReason: null, verdictError: null, verdictRaw: null, verdictRuns: 0, retryRefused: null, ...over });
+const chain = (over) => ({ rootId: 'a', headId: 'a', ids: ['a'], attempt: 1, attempts: 1, supersedes: null, supersededBy: null, ...over });
+
+test('verified, exit-0-awaiting and rejected are three different claims', () => {
+  const v = pure.verdictView(judged({ verdict: 'verified', verdictState: 'judged', verdictReason: 'tests pass' }));
+  const u = pure.verdictView(judged({}));
+  const r = pure.verdictView(judged({ verdict: 'rejected', verdictState: 'judged', verdictReason: 'wrong file' }));
+  assert.deepStrictEqual([v.kind, u.kind, r.kind], ['verified', 'awaiting', 'rejected']);
+  assert.notStrictEqual(v.glyph, u.glyph);
+  assert.doesNotMatch(u.label, /验收通过|已验收/, 'exit 0 must never read as verified');
+  assert.strictEqual(r.detail, 'wrong file');
+  assert.match(pure.verdictView(judged({ status: 'failed', exitCode: 3, verdict: 'rejected', verdictState: 'judged' })).detail, /没有记录/);
+});
+
+test('a record written before plan 2d reads as no verdict yet', () => {
+  const old = order({ goalId: 'g1', status: 'succeeded', exitCode: 0, startedAt: 'x' });
+  delete old.verdict;
+  assert.strictEqual(pure.verdictView(old).kind, 'awaiting');
+  assert.strictEqual(pure.verdictView(order({ status: 'running' })), null);
+});
+
+test('judging and an errored verdict are states of their own', () => {
+  assert.strictEqual(pure.verdictView(judged({ verdictState: 'judging' })).kind, 'judging');
+  const e = pure.verdictView(judged({ verdictState: 'error', verdictError: 'no verdict in the reply' }));
+  assert.strictEqual(e.kind, 'error');
+  assert.match(e.detail, /no verdict in the reply/);
+});
+
+test('an order no PM will judge says so, and an unknown verdict is shown', () => {
+  const oneOff = pure.verdictView(order({ status: 'succeeded', exitCode: 0, startedAt: 'x' }));
+  assert.strictEqual(oneOff.kind, 'none');
+  assert.doesNotMatch(oneOff.label, /已验收/);
+  assert.strictEqual(pure.verdictView(judged({ status: 'cancelled' })), null);
+  assert.strictEqual(pure.verdictView(judged({ verdict: 'maybe', verdictState: 'judged' })).kind, 'unknown');
+});
+
+test('attempt info comes from the server chain, and null means unknown', () => {
+  const c = chain({ rootId: 'a', headId: 'c', ids: ['a', 'b', 'c'], attempt: 2, attempts: 3, supersedes: 'a', supersededBy: 'c' });
+  const i = pure.attemptInfo(c);
+  assert.deepStrictEqual([i.attempt, i.of, i.latest], [2, 3, false]);
+  assert.strictEqual(pure.attemptInfo(null), null);
+  assert.strictEqual(pure.attemptInfo({ attempt: 'x' }), null, 'a malformed chain is not numbered');
+  assert.match(pure.attemptLabel(i, order({ seq: 6 })), /第 2 次尝试 · 共 3 次 · 源自 ⌐07¬/);
+  assert.match(pure.attemptLabel(i, null), /^第 2 次尝试 · 共 3 次$/);
+});
+
+test('latestOrders hides superseded attempts and keeps orders with no chain', () => {
+  const list = [order({ id: 'a' }), order({ id: 'b' }), order({ id: 'z' }), order({ id: 'q' })];
+  const chains = {
+    a: chain({ headId: 'b', ids: ['a', 'b'], attempts: 2, supersededBy: 'b' }),
+    b: chain({ headId: 'b', ids: ['a', 'b'], attempt: 2, attempts: 2, supersedes: 'a' }),
+    z: chain({ rootId: 'z', headId: 'z', ids: ['z'] }),
+    q: null,
+  };
+  assert.deepStrictEqual(pure.latestOrders(list, chains).map((o) => o.id), ['b', 'z', 'q']);
+  assert.deepStrictEqual(pure.latestOrders(list, undefined).map((o) => o.id), ['a', 'b', 'z', 'q']);
+});
+
+test('retryOffer mirrors the server\'s refusals, and never forks a chain', () => {
+  const head = chain({});
+  const off = (o, c = head, g = { status: 'running' }) => pure.retryOffer(o, c, g);
+  assert.strictEqual(off(judged({ verdict: 'rejected', verdictState: 'judged' })), true);
+  assert.strictEqual(off(judged({ verdict: 'verified', verdictState: 'judged' })), false, 'verified: nothing to retry');
+  assert.strictEqual(off(judged({})), false, 'awaiting its verdict: retrying would race the judge');
+  // A FAILED result is judged too (spec §10): exit 3 awaiting its verdict is
+  // not retryable yet. This case is what kills the mutant that drops the
+  // awaiting check - a succeeded one is refused by the last line anyway.
+  assert.strictEqual(off(judged({ status: 'failed', exitCode: 3 })), false, 'a failed result awaiting its verdict');
+  assert.strictEqual(off(judged({ verdictState: 'judging' })), false);
+  assert.strictEqual(off(judged({ verdictState: 'error' })), true, 'an errored verdict will never come; a human may retry past it');
+  assert.strictEqual(off(judged({ status: 'cancelled' })), true);
+  assert.strictEqual(off(judged({ status: 'interrupted' })), true);
+  assert.strictEqual(off(judged({ status: 'failed', startedAt: null })), true, 'never started');
+  assert.strictEqual(off(judged({ status: 'running' })), false);
+  assert.strictEqual(off(judged({ verdict: 'rejected', verdictState: 'judged' }), chain({ supersededBy: 'b' })), false, 'superseded');
+  assert.strictEqual(off(judged({ verdict: 'rejected', verdictState: 'judged' }), head, { status: 'failed' }), false, 'goal settled');
+  assert.strictEqual(off(judged({ verdict: 'rejected', verdictState: 'judged' }), head, { status: 'planning' }), false);
+  // A one-off order has no PM: a failure can be retried, a clean exit is not offered one.
+  assert.strictEqual(pure.retryOffer(order({ status: 'failed', exitCode: 3, startedAt: 'x' }), head, null), true);
+  assert.strictEqual(pure.retryOffer(order({ status: 'succeeded', exitCode: 0, startedAt: 'x' }), head, null), false);
+});
+
+test('verdictRetryOffer: an errored verdict, or one nothing will ever give', () => {
+  const g = { status: 'stalled' };
+  const on = { scheduler: { running: true, judging: true } };
+  const off = { scheduler: { running: false, judging: true } };
+  assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'error' }), g, on).label, '重新验收');
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, on), null, 'the loop will judge it');
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, off).label, '请 PM 验收');
+  assert.strictEqual(pure.verdictRetryOffer(judged({}), g, { scheduler: { running: true, judging: false } }).label, '请 PM 验收');
+  assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'judged', verdict: 'rejected' }), g, off), null);
+  assert.strictEqual(pure.verdictRetryOffer(judged({ status: 'cancelled' }), g, off), null, 'no result to judge');
+  assert.strictEqual(pure.verdictRetryOffer(order({ status: 'succeeded', startedAt: 'x' }), null, off), null, 'no PM for a one-off');
+  assert.strictEqual(pure.verdictRetryOffer(judged({ verdictState: 'error' }), { status: 'done' }, off), null, 'goal settled');
+});
+
+test('retry outcomes keep the server reason and translate the known ones', () => {
+  const r = pure.retryOutcome;
+  assert.strictEqual(r('retry', 200, { order: { id: 'n' }, chain: null }).ok, true);
+  assert.strictEqual(r('retry', 200, {}).ok, false);
+  assert.match(r('retry', 409, { error: 'the order is awaiting its verdict' }).text, /还在等验收/);
+  assert.match(r('retry', 409, { error: 'already superseded by ord-x', supersededBy: 'ord-x' }).text, /已经重试过/);
+  assert.match(r('retry', 409, { error: 'no attempts left (3 of 3)' }).text, /尝试次数/);
+  assert.match(r('retry', 409, { error: 'the goal has used its 12 orders' }).text, /12/);
+  assert.match(r('retry', 429, { error: 'daily limit reached (100 orders)' }).text, /daily limit/);
+  assert.match(r('verdict', 400, { error: '未知的 agent：x（可用：claude）' }).text, /未知的 agent/);
+  assert.match(r('verdict', 429, { error: 'too many agents running (4)' }).text, /已满/);
+  assert.match(r('verdict', 409, { error: "the order is not part of its goal's plan" }).text, /不在目标的计划里/);
+  assert.match(r('retry', 0, null).text, /无法连接/);
+});
