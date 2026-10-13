@@ -404,6 +404,11 @@ function reviewMode(cur, hold) {
   return { kind: 'manual', submitLabel: '交给 PM 拆解', note: '调度器已关闭：计划落地后订单停在排队，你逐单点「派发」才会运行。' };
 }
 
+// The server's default for maxAttemptsPerOrder (lib/projects.js DEFAULT_BUDGET),
+// which it enforces for a project registered before the key existed. Mirrored
+// here because the browser cannot require lib/; a test pins the two together.
+const DEFAULT_ATTEMPTS_PER_ORDER = 3;
+
 // Spec §8a, in the terms the dispatcher actually controls. Nothing here is a
 // spend figure, and the caveat says why.
 function budgetView(project, orders, now) {
@@ -425,7 +430,7 @@ function budgetView(project, orders, now) {
       },
       {
         key: 'attempts', label: '每单尝试',
-        value: n(b.maxAttemptsPerOrder) ? `≤ ${b.maxAttemptsPerOrder} 次` : '未设上限',
+        value: n(b.maxAttemptsPerOrder) ? `≤ ${b.maxAttemptsPerOrder} 次` : `≤ ${DEFAULT_ATTEMPTS_PER_ORDER} 次（默认）`,
         // What is TRUE at the cap: the loop records that rejection as final and
         // the goal settles failed on its next tick, after which the server
         // refuses every retry under it - a human's included.
@@ -769,6 +774,7 @@ function retryOutcome(kind, status, body) {
 // short-circuits and the declarations above simply stay globals.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    DEFAULT_ATTEMPTS_PER_ORDER,
     esc, escAttr, railState, deleteOutcome,
     ORDER_SETTLED_STATES, GOAL_SETTLED_STATES, boardQuery, seqLabel, seqSpoken, orderTitle,
     fmtDuration, orderElapsed, orderStatusText, exitCodeText, failureView,
