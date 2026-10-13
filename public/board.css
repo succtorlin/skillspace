@@ -350,3 +350,17 @@ body[data-view="board"] .topbar .icon-btn { display: none; }
   .bd-row { grid-template-columns: 6ch minmax(0, 1fr) auto; grid-template-areas: "seq title dur" "seq status verdict"; }
   .bd-agent { display: none; }
 }
+
+/* ---------- attempts (plan 2d) ---------- */
+.bd-attempt { margin-right: 4px; font-family: var(--face-mono); font-size: 10.5px; color: var(--ink-2); white-space: nowrap; }
+.bd-superseded { margin-top: 8px; }
+.ord-attempts { display: grid; gap: 4px; }
+.ord-attempts-head { font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); }
+.ord-attempt-list { list-style: none; display: grid; gap: 2px; }
+.ord-attempt {
+  width: 100%; min-height: 24px; text-align: left; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid transparent; background: transparent; color: var(--ink-2);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.ord-attempt:hover { background: var(--ground-2); color: var(--ink); }
+.ord-attempt.is-on { border-color: var(--hair-lit); color: var(--ink); }

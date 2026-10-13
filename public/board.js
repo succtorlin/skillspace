@@ -5,7 +5,7 @@
 // POLLED, NOT STREAMED: see docs/plans/2026-10-12-board.md, "Live updates".
 
 let board = {
-  project: null, orders: null, chains: {}, goals: [], sched: null, prevSched: null,
+  project: null, orders: null, chains: {}, goals: [], sched: null, prevSched: null, showSuperseded: false,
   goalFilter: null, sig: '', okAt: 0, error: null, inFlight: false, timer: null, ticker: null,
 };
 
@@ -142,7 +142,9 @@ function boardRowHtml(o) {
   const live = o.status === 'running' && o.startedAt ? ` data-started="${escAttr(o.startedAt)}"` : '';
   return `<li><button type="button" class="bd-row" data-order-id="${escAttr(o.id)}">` +
     `<span class="seq">${esc(seqLabel(o))}</span>` +
-    `<span class="bd-title">${esc(orderTitle(o))}</span>` +
+    // The attempt tag LEADS the title: the title ellipsizes, and at 320px a
+    // trailing tag was the part cut off (Task 17 check).
+    `<span class="bd-title">${boardAttemptTag(o)}${esc(orderTitle(o))}</span>` +
     `<span class="bd-agent">${esc(o.agent || '—')}</span>` +
     `<span class="bd-status"><span class="sdot" data-state="${escAttr(rs.dot)}" aria-hidden="true"></span>${esc(rs.text)}</span>` +
     `<span class="bd-verdict">${boardVerdictBadge(o)}</span>` +
@@ -182,7 +184,7 @@ function boardRender() {
   }
   const ids = board.goalFilter ? goalOrderIds(board.goals, board.goalFilter) : null;
   const st = boardState(true, { orders: board.orders }, ids);
-  const sig = [boardSignature(st.orders), st.kind, board.goalFilter || '', board.error ? 'stale' : ''].join('#');
+  const sig = [boardSignature(st.orders), st.kind, board.goalFilter || '', board.error ? 'stale' : '', board.showSuperseded].join('#');
   // Standing question 4: an identical poll must not destroy the focused row.
   if (sig === board.sig) return;
   board = { ...board, sig };
@@ -195,7 +197,16 @@ function boardRender() {
   } else if (st.kind === 'filtered') {
     host.innerHTML = banner + boardStateBlock('这个目标下还没有订单', 'PM 拆解完成前，目标下没有订单。', 'clear-filter');
   } else {
-    host.innerHTML = banner + groupOrders(st.orders).map(boardGroupHtml).join('');
+    // Plan 2d / spec §12: each chain's LATEST attempt by default; the
+    // superseded ones are one click away, never gone. An order whose chain the
+    // server could not establish is always shown.
+    const shown = board.showSuperseded ? st.orders : latestOrders(st.orders, board.chains);
+    const hidden = st.orders.length - shown.length;
+    host.innerHTML = banner + groupOrders(shown).map(boardGroupHtml).join('') +
+      (hidden || board.showSuperseded
+        ? `<button type="button" class="btn ghost bd-superseded" data-act="toggle-superseded" aria-pressed="${board.showSuperseded ? 'true' : 'false'}">` +
+          `${board.showSuperseded ? '隐藏被接替的尝试' : `显示被接替的 ${String(hidden)} 次尝试`}</button>`
+        : '');
   }
   boardWire(host);
   if (focused) {
@@ -213,6 +224,12 @@ function boardWire(host) {
     if (act === 'retry') boardRefresh();
     if (act === 'compose') { const t = boardEl('goal-text'); if (t) t.focus(); }
     if (act === 'clear-filter') boardClearFilter();
+    if (act === 'toggle-superseded') {
+      board = { ...board, showSuperseded: !board.showSuperseded, sig: '' };
+      boardRender();
+      const again = boardEl('board-groups').querySelector('[data-act="toggle-superseded"]');
+      if (again) again.focus(); // the press re-rendered the button under the keyboard
+    }
   }));
 }
 
@@ -318,4 +335,11 @@ function boardVerdictBadge(o) {
   const v = verdictView(o);
   if (!v) return '';
   return `<span class="vbadge" data-kind="${escAttr(v.kind)}"><span aria-hidden="true">${esc(v.glyph)}</span>${esc(v.label)}</span>`;
+}
+
+// "第 2/3 次" on a row whose chain has more than one attempt. From the
+// server's chain, beside the record; nothing is derived here.
+function boardAttemptTag(o) {
+  const info = attemptInfo(board.chains && board.chains[o.id]);
+  return info && info.of > 1 ? `<span class="bd-attempt">第 ${String(info.attempt)}/${String(info.of)} 次</span> ` : '';
 }

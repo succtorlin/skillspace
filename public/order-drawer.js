@@ -113,6 +113,7 @@ function drawerRenderOrder(order) {
     fb.innerHTML = `<strong class="ord-failure-title">${esc(f.title)}</strong><p>${esc(f.detail)}</p>`;
   }
   drawerRenderVerdict(order);
+  drawerRenderAttempts(order);
   drawerEl('ord-prompt').textContent = order.prompt || '';
   drawerEl('ord-prompt-n').textContent = `· ${String(Array.from(order.prompt || '').length)} 字`;
   drawerEl('ord-acceptance').textContent = order.acceptance ||
@@ -172,7 +173,10 @@ async function drawerPollLog(gen) {
   note.textContent = drawerLogNote(step, status);
   drawerTickElapsed();
   if (!drawer.order || status !== drawer.order.status) await drawerRefreshOrder(gen);
-  if (step.done) return; // settled and drained: nothing more will ever arrive
+  // Settled and drained: no more log will arrive. A verdict still may (plan
+  // 2d judges AFTER the order settles, and never touches its status), so an
+  // order awaiting or under judgement keeps its record refreshing.
+  if (step.done) { drawerWatchVerdict(gen); return; }
   if (drawer.gen !== gen) return;
   // While catching up on a long log, do not wait a full second between slices.
   drawer = { ...drawer, timer: setTimeout(() => drawerPollLog(gen), step.more ? 0 : DRAWER_POLL_MS) };
@@ -222,6 +226,20 @@ function drawerRenderActions(order) {
   c.disabled = drawer.pending === 'cancel';
   c.setAttribute('aria-busy', drawer.pending === 'cancel' ? 'true' : 'false');
   c.textContent = drawer.pending === 'cancel' ? '正在终止…' : order.status === 'running' ? '终止运行' : '取消这一单';
+  // Plan 2d's two doors. Offered only where the server would accept them
+  // (retryOffer / verdictRetryOffer mirror its refusals); it still decides.
+  const b = boardCurrent();
+  const goal = order.goalId ? (b.goals || []).find((g) => g && g.id === order.goalId) || null : null;
+  const r = drawerEl('ord-retry');
+  r.hidden = !retryOffer(order, drawer.chain, goal);
+  r.disabled = drawer.pending === 'retry';
+  r.setAttribute('aria-busy', drawer.pending === 'retry' ? 'true' : 'false');
+  r.textContent = drawer.pending === 'retry' ? '新建中…' : '重试（新建一单）';
+  const vr = drawerEl('ord-verdict-retry');
+  const offer = verdictRetryOffer(order, goal, b.sched);
+  vr.hidden = !offer;
+  vr.disabled = drawer.pending === 'verdict';
+  vr.textContent = drawer.pending === 'verdict' ? '交给 PM…' : offer ? offer.label : '重新验收';
 }
 
 // Called from goal-panel.js too. Dispatch spawns a credentialed agent - one
@@ -312,3 +330,92 @@ function drawerRenderVerdict(order) {
   box.dataset.kind = v ? v.kind : '';
   box.innerHTML = parts.join('');
 }
+
+// The attempt history: every order in this order's chain (the server's
+// `chain.ids`, oldest first), each one click away. Orders the board has not
+// loaded are listed by number only.
+function drawerRenderAttempts(order) {
+  const box = drawerEl('ord-attempts');
+  const info = attemptInfo(drawer.chain);
+  const ids = drawer.chain && Array.isArray(drawer.chain.ids) ? drawer.chain.ids : [];
+  if (!info || ids.length < 2) { box.hidden = true; box.innerHTML = ''; return; }
+  const byId = new Map((boardCurrent().orders || []).map((o) => [o.id, o]));
+  const root = byId.get(drawer.chain.rootId) || null;
+  box.hidden = false;
+  box.innerHTML = `<div class="ord-attempts-head">${esc(attemptLabel(info, root))}</div><ol class="ord-attempt-list">` +
+    ids.map((id, i) => {
+      const o = id === order.id ? order : byId.get(id);
+      const v = o ? verdictView(o) : null;
+      const f = o ? failureView(o, null) : null;
+      const what = !o ? '记录不在这个看板上' : v ? v.label : f ? f.title : orderStatusText(o.status);
+      const why = v && v.kind === 'rejected' && v.detail ? ` · ${v.detail}` : '';
+      const me = id === order.id;
+      return `<li><button type="button" class="ord-attempt${me ? ' is-on' : ''}" data-order-id="${escAttr(id)}"${me ? ' aria-current="true"' : ''}>` +
+        `第 ${String(i + 1)} 次 · ${esc(what)}${esc(why)}</button></li>`;
+    }).join('') + '</ol>';
+  box.querySelectorAll('.ord-attempt').forEach((el) => el.addEventListener('click', () => {
+    if (el.dataset.orderId !== drawer.id) openOrderDrawer(el.dataset.orderId);
+  }));
+}
+
+const DRAWER_VERDICT_POLL_MS = 2000;
+function drawerWatchVerdict(gen) {
+  const v = verdictView(drawer.order);
+  if (!v || (v.kind !== 'judging' && v.kind !== 'awaiting')) return;
+  drawer = { ...drawer, timer: setTimeout(async () => {
+    if (drawer.gen !== gen || !drawerIsOpenFor(drawer.id)) return;
+    const before = drawer.order && drawer.order.verdictState;
+    await drawerRefreshOrder(gen);
+    if (drawer.gen !== gen) return;
+    if (drawer.order && drawer.order.verdictState !== before) boardRefresh();
+    drawerWatchVerdict(gen);
+  }, DRAWER_VERDICT_POLL_MS) };
+}
+
+drawerEl('ord-retry').addEventListener('click', async () => {
+  const order = drawer.order;
+  if (!order || drawer.pending) return;
+  const gen = drawer.gen;
+  drawer = { ...drawer, pending: 'retry' };
+  drawerRenderActions(order);
+  // Spec §7/§12: a NEW order with supersedes set; the original keeps its
+  // status, log and verdict for good. 2d's retry does NOT dispatch: the loop
+  // runs the new attempt, or with the loop off a human dispatches it.
+  const r = await boardPostJson(`/api/orders/${encodeURIComponent(order.id)}/retry`, {});
+  const out = retryOutcome('retry', r.status, r.body);
+  if (drawer.gen !== gen) return;
+  drawer = { ...drawer, pending: null };
+  if (out.ok) {
+    const s = boardCurrent().sched && boardCurrent().sched.scheduler;
+    const n = out.chain && Number.isInteger(out.chain.attempt) ? `第 ${String(out.chain.attempt)} 次尝试` : '新的一次尝试';
+    toast(`已新建${n}` + (s && s.running ? '，调度器会运行它' : '，它在排队：派发它才会运行'));
+    boardRefresh();
+    openOrderDrawer(out.order.id);
+    return;
+  }
+  toast(out.text, 'error');
+  drawerRenderActions(drawer.order);
+  await drawerRefreshOrder(gen);
+});
+
+drawerEl('ord-verdict-retry').addEventListener('click', async () => {
+  const order = drawer.order;
+  if (!order || drawer.pending) return;
+  const gen = drawer.gen;
+  drawer = { ...drawer, pending: 'verdict' };
+  drawerRenderActions(order);
+  // The goal's PM judges by default. Only when that agent is no longer
+  // installed is the topbar agent named - the way out 2d built this door for.
+  const goal = (boardCurrent().goals || []).find((g) => g && g.id === order.goalId);
+  const picker = document.getElementById('agent');
+  const installed = picker ? [...picker.options].map((o) => o.value).filter(Boolean) : [];
+  const body = goal && goal.pmAgent && !installed.includes(goal.pmAgent) && picker && picker.value ? { agent: picker.value } : {};
+  const r = await boardPostJson(`/api/orders/${encodeURIComponent(order.id)}/verdict/retry`, body);
+  const out = retryOutcome('verdict', r.status, r.body);
+  if (drawer.gen !== gen) return;
+  drawer = { ...drawer, pending: null };
+  toast(out.text, out.ok ? undefined : 'error');
+  await drawerRefreshOrder(gen);
+  if (out.ok) { boardRefresh(); drawerWatchVerdict(gen); }
+});
+
