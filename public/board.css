@@ -241,3 +241,52 @@
    covered the dialog's own buttons - on a phone, entirely (found in the Task 11
    browser check: 取消 and 终止 were unclickable). Toasts stay on top at 100. */
 .modal-mask { z-index: 70; }
+
+/* ---------- goal composer and panel ---------- */
+.gp-form { display: grid; gap: 8px; }
+.gp-text { min-height: 72px; resize: vertical; }
+.gp-note { font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch; }
+.gp-error { font-size: 12.5px; color: var(--danger-ink); }
+.gp-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gp-list-head { margin-top: 16px; }
+.gp-list { list-style: none; display: grid; gap: 2px; max-height: 240px; overflow-y: auto; }
+.gp-goal {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "dot text" ". status";
+  gap: 2px 8px; align-items: center; width: 100%; padding: 8px; text-align: left;
+  border: 1px solid transparent; border-radius: 8px; background: transparent;
+  color: var(--ink); font: inherit; font-size: 13px; cursor: pointer;
+}
+.gp-goal:hover { background: var(--ground-2); border-color: var(--hair); }
+.gp-goal.is-on { background: var(--ground-2); border-color: var(--hair-lit); }
+.gp-goal .sdot { grid-area: dot; }
+.gp-goal-text { grid-area: text; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-goal-status { grid-area: status; font-family: var(--face-mono); font-size: 11px; color: var(--ink-2); }
+.gp-detail { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--hair); display: grid; gap: 12px; }
+.gp-pmlog { max-height: 220px; }
+.gp-plan { list-style: none; display: grid; gap: 8px; }
+.gp-step {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; align-items: center;
+  padding: 8px; border: 1px solid var(--hair); border-radius: 8px;
+}
+.gp-step-open {
+  display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0;
+  background: none; border: 0; color: var(--ink); font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.gp-step-open:hover .gp-step-title { text-decoration: underline; text-underline-offset: 3px; }
+.gp-step-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-accept { grid-column: 1 / -1; font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+.gp-accept-k {
+  margin-right: 8px; font-family: var(--face-mono); font-size: 10px;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--muted);
+}
+.gp-dispatch { grid-column: 2; justify-self: end; }
+.gp-hold-opt { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; line-height: 1.6; color: var(--ink); cursor: pointer; }
+.gp-hold-opt input { margin-top: 4px; accent-color: var(--accent); }
+.gp-hold-opt span { color: var(--ink-2); }
+.gp-held {
+  display: grid; gap: 8px; padding: 12px; border-radius: 10px;
+  border: 1px solid var(--hair-lit); background: var(--ground-2);
+  font-size: 12.5px; line-height: 1.6; color: var(--ink);
+}
+.gp-held .btn { justify-self: start; }
+

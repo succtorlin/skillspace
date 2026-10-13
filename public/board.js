@@ -283,3 +283,11 @@ function boardRenderBudget() {
     `<dd class="bd-limit-note">${esc(r.note)}</dd></div>`).join('');
   cav.textContent = v.caveat;
 }
+
+// Called from goal-panel.js: show a goal the moment POST answers, before the
+// next poll brings it.
+function boardAddGoal(goal) {
+  if (!goal || !board.project || goal.projectId !== board.project.id) return;
+  board = { ...board, goals: [goal, ...board.goals.filter((g) => g.id !== goal.id)] };
+  boardRefresh();
+}

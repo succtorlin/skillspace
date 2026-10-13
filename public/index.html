@@ -64,6 +64,7 @@
           <form id="goal-form" class="gp-form" novalidate>
             <label id="goal-eyebrow" class="bd-eyebrow" for="goal-text">说一个目标</label>
             <textarea id="goal-text" class="modal-task gp-text" rows="3" placeholder="例如：给设置页加一个导出 CSV 的按钮，并补上测试"></textarea>
+            <label class="gp-hold-opt"><input type="checkbox" id="goal-hold" checked> 先审后跑 <span>计划落地后先停住，读完再放行</span></label>
             <p id="goal-mode-note" class="gp-note"></p>
             <p id="goal-error" class="gp-error" role="alert" hidden></p>
             <div class="gp-actions">
@@ -71,8 +72,10 @@
               <button type="submit" id="goal-submit" class="btn primary" disabled>交给 PM 拆解</button>
             </div>
           </form>
-          <div id="goal-list" class="gp-list-host"></div>
+          <!-- The selected goal's plan comes BEFORE the list: with a dozen goals
+               the list pushed the plan you just asked for below the fold. -->
           <div id="goal-detail" class="gp-detail" hidden></div>
+          <div id="goal-list" class="gp-list-host"></div>
         </section>
         <section class="bd-panel bd-orders" aria-labelledby="orders-eyebrow">
           <h2 id="orders-eyebrow" class="bd-eyebrow">订单</h2>
@@ -249,11 +252,11 @@
       <div id="ord-failure" class="ord-failure" hidden></div>
       <details class="ord-sec">
         <summary>指令 <span id="ord-prompt-n" class="cmd-chars"></span></summary>
-        <pre id="ord-prompt" class="ord-pre"></pre>
+        <pre id="ord-prompt" class="ord-pre" tabindex="0"></pre>
       </details>
       <details class="ord-sec" open>
         <summary>验收标准</summary>
-        <pre id="ord-acceptance" class="ord-pre"></pre>
+        <pre id="ord-acceptance" class="ord-pre" tabindex="0"></pre>
       </details>
       <div id="ord-actions" class="ord-actions">
         <button type="button" class="btn" id="ord-dispatch" hidden>立即派发</button>

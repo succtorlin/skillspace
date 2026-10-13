@@ -558,6 +558,32 @@ function orderRowStatus(order, budget) {
   return { text: f ? f.title : orderStatusText(st), dot: known ? st : 'unknown' };
 }
 
+// POST /api/goals/:id/release, in the console's language. A 409 "not held"
+// is ok:true - another tab (or a second click) released it, and the goal runs
+// either way.
+function goalReleaseOutcome(status, body) {
+  const err = body && typeof body.error === 'string' ? body.error : '';
+  if (status === 200 && body && body.goal) return { ok: true, goal: body.goal, text: '已放行' };
+  if (status === 0) return { ok: false, text: '无法连接服务器，没有放行' };
+  if (status === 409 && /^goal is not held/.test(err)) return { ok: true, text: '这个目标已经放行过了' };
+  if (status === 409) {
+    const m = /^goal is already (\w+)$/.exec(err);
+    return { ok: false, text: m ? `目标已经是「${goalStatusText(m[1])}」，没有可放行的了` : `放行不了：${err}` };
+  }
+  if (status === 404) return { ok: false, text: '这个目标不存在了' };
+  return { ok: false, text: `放行失败：${err || `HTTP ${status}`}` };
+}
+
+// Whether the plan list offers 派发 on each queued step. A held goal is
+// approved step by step whatever the loop does; an unheld one only when the
+// loop is off (otherwise it is about to run anyway, and a second door onto
+// the same dispatch is a race). Unknown scheduler state fails closed.
+function planDispatchable(goal, cur) {
+  if (goal && goal.held === true) return true;
+  const s = cur && cur.scheduler;
+  return !!s && typeof s === 'object' && s.running === false;
+}
+
 // Inert in the browser: a classic script has no `module`, so the typeof guard
 // short-circuits and the declarations above simply stay globals.
 if (typeof module !== 'undefined' && module.exports) {
@@ -569,6 +595,6 @@ if (typeof module !== 'undefined' && module.exports) {
     boardState, goalOrderIds,
     schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
-    orderRowStatus, skipReasonText,
+    orderRowStatus, skipReasonText, goalReleaseOutcome, planDispatchable,
   };
 }

@@ -458,3 +458,26 @@ test('schedulerView: a skip says whose order it was, and in the console\'s words
   assert.match(heldElsewhere.detail, /别的项目/);
   assert.strictEqual(pure.schedulerView(null, s('goal held for review'), T, 'p1', new Set(['ord-mine'])).kind, 'held');
 });
+
+// ---------- release (Task 0's hold) ----------
+test('goalReleaseOutcome: released, already released, settled, gone, offline', () => {
+  const r = pure.goalReleaseOutcome;
+  assert.strictEqual(r(200, { goal: { id: 'g', held: false } }).ok, true);
+  assert.strictEqual(r(200, {}).ok, false, 'a 200 without the goal is not a release');
+  const twice = r(409, { error: 'goal is not held' });
+  assert.strictEqual(twice.ok, true, 'someone else released it: the goal is running either way');
+  assert.match(twice.text, /已经放行/);
+  assert.match(r(409, { error: 'goal is already failed' }).text, /失败/);
+  assert.match(r(404, { error: 'no such goal' }).text, /不存在/);
+  assert.match(r(0, null).text, /无法连接/);
+  assert.match(r(403, { error: 'x' }).text, /x/);
+});
+
+test('planDispatchable: a held goal\'s steps can be approved one by one', () => {
+  const sOn = { scheduler: { running: true, intervalMs: 1000 } };
+  const sOff = { scheduler: { running: false } };
+  assert.strictEqual(pure.planDispatchable({ held: true }, sOn), true);
+  assert.strictEqual(pure.planDispatchable({ held: false }, sOn), false, 'the loop will run it anyway');
+  assert.strictEqual(pure.planDispatchable({ held: false }, sOff), true);
+  assert.strictEqual(pure.planDispatchable({}, null), false, 'unknown fails closed: no second door');
+});
