@@ -269,6 +269,14 @@ function classify(name, desc) {
   return '其它';
 }
 
+// A skill folder may be a symlink (e.g. ~/.claude/skills/x -> ~/.agents/skills/x).
+// Dirent.isDirectory() is false for links, so follow the link before deciding.
+function isDirEntry(dir, ent) {
+  if (ent.isDirectory()) return true;
+  if (!ent.isSymbolicLink()) return false;
+  try { return fs.statSync(path.join(dir, ent.name)).isDirectory(); } catch (_) { return false; }
+}
+
 function readSkills(dir) {
   const skills = [];
   let entries = [];
@@ -278,7 +286,7 @@ function readSkills(dir) {
     return { error: `无法读取目录：${dir}（${e.code}）`, skills: [] };
   }
   for (const ent of entries) {
-    if (!ent.isDirectory()) continue;
+    if (!isDirEntry(dir, ent)) continue;
     const skillDir = path.join(dir, ent.name);
     // 兼容 SKILL.md / skill.md
     const candidate = ['SKILL.md', 'skill.md', 'Skill.md']
