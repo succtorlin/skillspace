@@ -300,7 +300,8 @@ module.exports = (deps) => {
       const status = order.status;
       let log;
       try {
-        log = logs.readSlice(logs.logPath(root, id), u.searchParams.get('from'));
+        // tail= places the first read near the end (lib/logs says why).
+        log = logs.readSlice(logs.logPath(root, id), u.searchParams.get('from'), undefined, u.searchParams.get('tail'));
       } catch (e) {
         sendJson(res, 500, { error: errorMessage(e) });
         return true;

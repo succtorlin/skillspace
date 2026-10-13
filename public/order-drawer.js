@@ -11,7 +11,10 @@
 // changes are announced once, through #run-status.
 
 const DRAWER_POLL_MS = 1000;
-let drawer = { id: null, order: null, chain: null, from: 0, dropped: 0, timer: null, pending: null, gen: 0 };
+// `first`: the next log read is the first for this order, so it asks for the
+// tail rather than byte 0. `skipped`: bytes before the tail that were never
+// fetched.
+let drawer = { id: null, order: null, chain: null, from: 0, first: true, skipped: 0, dropped: 0, timer: null, pending: null, gen: 0 };
 
 function drawerEl(id) { return document.getElementById(id); }
 
@@ -41,7 +44,7 @@ async function showOrder(id) {
   const run = drawerEl('run');
   clearTimeout(drawer.timer);
   const gen = drawer.gen + 1;
-  drawer = { id, order: null, chain: null, from: 0, dropped: 0, timer: null, pending: null, gen };
+  drawer = { id, order: null, chain: null, from: 0, first: true, skipped: 0, dropped: 0, timer: null, pending: null, gen };
   run.dataset.orderId = id;
   run.style.display = 'flex';
   drawerEl('run-cmd').hidden = true;
@@ -135,9 +138,14 @@ async function drawerRefreshOrder(gen) {
 function drawerLogNote(step, status) {
   const parts = [];
   if (!step.exists) {
-    parts.push(status === 'queued' ? '还没开始运行，没有日志。' : '这一单没有日志（它没有启动）。');
+    // The record, not just the log route's status: whether it ever started
+    // decides the wording (pure.noLogText).
+    parts.push(noLogText({ ...(drawer.order || {}), status }));
   }
-  if (drawer.dropped > 0) {
+  if (drawer.skipped > 0) {
+    const kb = Math.max(1, Math.round(drawer.skipped / 1024));
+    parts.push(`只取了日志末尾，前面约 ${String(kb)} KB 没有加载；完整日志在 SkillSpace 数据目录的 logs/${drawer.id}.log。`);
+  } else if (drawer.dropped > 0) {
     // Under a thousand, "约 0 千字" says nothing was dropped: count exactly.
     const n = drawer.dropped;
     const amount = n < 1000 ? `${String(n)} 字` : `约 ${String(Math.round(n / 1000))} 千字`;
@@ -150,7 +158,7 @@ function drawerLogNote(step, status) {
 async function drawerPollLog(gen) {
   if (drawer.gen !== gen || !drawerIsOpenFor(drawer.id)) return;
   const id = drawer.id;
-  const r = await boardGetJson(`/api/orders/${encodeURIComponent(id)}/log?from=${String(drawer.from)}`);
+  const r = await boardGetJson(orderLogQuery(id, drawer.from, drawer.first));
   if (drawer.gen !== gen || !drawerIsOpenFor(id)) return;
   const status = r.body && r.body.status;
   const step = r.ok ? logStep(r.body, status === 'queued' || status === 'running') : { ok: false };
@@ -162,7 +170,12 @@ async function drawerPollLog(gen) {
   }
   const out = drawerEl('run-out');
   const stick = shouldStick(out.scrollTop, out.clientHeight, out.scrollHeight);
-  if (step.reset) { out.textContent = ''; drawer = { ...drawer, dropped: 0 }; }
+  if (drawer.first) {
+    // The tail read: whatever it skipped was never fetched.
+    const from = r.body && r.body.log && Number.isSafeInteger(r.body.log.from) ? r.body.log.from : 0;
+    drawer = { ...drawer, first: false, skipped: from };
+  }
+  if (step.reset) { out.textContent = ''; drawer = { ...drawer, dropped: 0, skipped: 0 }; }
   if (step.text) {
     const capped = appendCapped(out.textContent, step.text, LOG_DOM_CAP);
     out.textContent = capped.text;

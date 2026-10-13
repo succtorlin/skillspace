@@ -511,6 +511,26 @@ function appendCapped(current, chunk, cap) {
   return { text: joined.slice(cut), dropped: cut };
 }
 
+// The drawer's first log read asks for the tail: enough bytes to fill
+// LOG_DOM_CAP even if every character is 3 bytes (CJK), and nothing it would
+// throw away. Later reads resume from the offset the server returned.
+const LOG_TAIL_BYTES = LOG_DOM_CAP * 3;
+function orderLogQuery(id, from, first) {
+  const base = `/api/orders/${encodeURIComponent(id)}/log`;
+  return first ? `${base}?tail=${String(LOG_TAIL_BYTES)}` : `${base}?from=${String(from)}`;
+}
+
+// Why an order has no log, in words that are true of THIS order. startedAt is
+// the field that means "an agent actually ran" (lib/orders), so 没有启动 is
+// said only when it is null.
+function noLogText(order) {
+  const o = order || {};
+  if (o.status === 'queued') return '还没开始运行，没有日志。';
+  if (!o.startedAt) return '这一单没有日志（它没有启动）。';
+  if (o.status === 'running') return 'agent 已经启动，还没有输出。';
+  return '日志文件不在了（它运行过，但日志文件已被移走或清理）。';
+}
+
 function shouldStick(scrollTop, clientHeight, scrollHeight) {
   return scrollHeight - (scrollTop + clientHeight) <= 24;
 }
@@ -754,7 +774,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fmtDuration, orderElapsed, orderStatusText, exitCodeText, failureView,
     BOARD_GROUPS, boardGroupKey, boardSortFor, groupOrders, localDayKey, ordersToday, boardSignature,
     boardState, goalOrderIds,
-    schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, logPollNext, LOG_DOM_CAP,
+    schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, logPollNext, LOG_DOM_CAP, LOG_TAIL_BYTES, orderLogQuery, noLogText,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
     orderRowStatus, skipReasonText, goalReleaseOutcome, planDispatchable,
     verdictOf, verdictPending, verdictView, attemptInfo, attemptLabel, latestOrders, retryOffer,

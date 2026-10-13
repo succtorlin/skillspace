@@ -71,3 +71,12 @@ test("GET /api/goals/:id/log serves the PM's output with the goal status", async
   assert.strictEqual(r.body.status, 'planning');
   assert.strictEqual((await get('/api/goals/goal-nope/log')).status, 404);
 });
+
+test('GET /api/orders/:id/log?tail=N starts the first read near the end', async () => {
+  const o = orders.create(srv.store, { projectId: 'p1', prompt: 'x' });
+  writeLog(o.id, 'x'.repeat(500000) + 'END\n');
+  const a = await get(`/api/orders/${o.id}/log?tail=1000`);
+  assert.strictEqual(a.status, 200);
+  assert.strictEqual(a.body.log.from, 500004 - 1000);
+  assert.ok(a.body.log.text.endsWith('END\n'));
+});

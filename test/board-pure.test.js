@@ -671,3 +671,27 @@ test('the attempts note says what happens at the cap, not that a human retry ign
   assert.match(note, /目标随即记为失败/);
   assert.match(note, /包括手动/);
 });
+
+// ---------- order log: tail on the first read, and honest no-log wording ----------
+test('orderLogQuery asks for the tail on the first read only', () => {
+  assert.strictEqual(pure.orderLogQuery('ord-1', 0, true), `/api/orders/ord-1/log?tail=${String(pure.LOG_TAIL_BYTES)}`);
+  assert.strictEqual(pure.orderLogQuery('ord-1', 4096, false), '/api/orders/ord-1/log?from=4096');
+  assert.strictEqual(pure.orderLogQuery('a b', 0, false), '/api/orders/a%20b/log?from=0');
+  // Enough bytes to fill the DOM cap even when every character is 3 bytes.
+  assert.ok(pure.LOG_TAIL_BYTES >= pure.LOG_DOM_CAP * 3);
+});
+
+test('noLogText says "it did not start" only when it did not', () => {
+  // The drawer said 它没有启动 for every non-queued order without a log -
+  // including a running one that has not printed yet and a settled one whose
+  // log file is gone. startedAt is the field that means "this actually ran".
+  assert.match(pure.noLogText({ status: 'queued', startedAt: null }), /还没开始运行/);
+  assert.match(pure.noLogText({ status: 'failed', startedAt: null }), /没有启动/);
+  assert.match(pure.noLogText({ status: 'cancelled', startedAt: null }), /没有启动/);
+  const running = pure.noLogText({ status: 'running', startedAt: '2026-10-13T00:00:00Z' });
+  assert.doesNotMatch(running, /没有启动/);
+  assert.match(running, /还没有输出/);
+  const settled = pure.noLogText({ status: 'succeeded', startedAt: '2026-10-13T00:00:00Z' });
+  assert.doesNotMatch(settled, /没有启动/);
+  assert.match(settled, /日志文件/);
+});

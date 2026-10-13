@@ -80,3 +80,23 @@ test('a garbage or negative offset reads from zero without claiming a reset', ()
 test('logPath confines the id to logs/ under the root', () => {
   assert.strictEqual(logs.logPath('/r', 'ord-1'), path.join('/r', 'logs', 'ord-1.log'));
 });
+
+test('a tail read starts near the end, on a character boundary', () => {
+  // The drawer keeps only the last LOG_DOM_CAP characters, so downloading a
+  // long log from byte 0 in 64 KiB steps fetched megabytes it then threw away.
+  const body = 'a'.repeat(1000) + '中'.repeat(100); // 1000 + 300 bytes
+  const f = file(body);
+  const s = logs.readSlice(f, null, undefined, '200');
+  // 1300 - 200 = 1100 lands one byte into a 3-byte character (1000 + 3k + 1
+  // for k = 33): the start moves forward to the next boundary, 1102.
+  assert.strictEqual(s.from, 1102);
+  assert.strictEqual(s.text, '中'.repeat(66));
+  assert.strictEqual(s.next, 1300);
+  assert.strictEqual(s.reset, false);
+  // A tail longer than the file is the whole file.
+  assert.strictEqual(logs.readSlice(f, null, undefined, '99999').from, 0);
+  // An explicit offset wins: tail only places the FIRST read.
+  assert.strictEqual(logs.readSlice(f, '10', undefined, '200').from, 10);
+  // Garbage tails are ignored.
+  for (const bad of ['-5', 'x', '0', '']) assert.strictEqual(logs.readSlice(f, null, undefined, bad).from, 0, bad);
+});
