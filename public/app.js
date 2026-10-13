@@ -46,9 +46,11 @@ function paintStaticIcons() {
   $('#reload').innerHTML = icon('refresh');
   $('#exp-auto').innerHTML = icon('spark') + '让 Codex / Claude Code 自动分类';
   $('#exp-manual').innerHTML = icon('plus') + '手动创建专家';
-  const seg = document.querySelectorAll('.seg-item');
-  seg[0].insertAdjacentHTML('afterbegin', icon('deck', 15));
-  seg[1].insertAdjacentHTML('afterbegin', icon('expert', 15));
+  // By view, not by index: the board segment comes first since plan 3, and an
+  // index silently moved both icons one segment to the left.
+  document.querySelector('.seg-item[data-view="board"]').insertAdjacentHTML('afterbegin', icon('layers', 15));
+  document.querySelector('.seg-item[data-view="skills"]').insertAdjacentHTML('afterbegin', icon('deck', 15));
+  document.querySelector('.seg-item[data-view="experts"]').insertAdjacentHTML('afterbegin', icon('expert', 15));
   $('#cf-ico').innerHTML = icon('warn', 20);
 }
 
@@ -63,7 +65,14 @@ async function boot() {
     : '<option value="">未检测到 agent</option>';
   wireNav();
   await loadSources();
-  loadProjects();
+  await loadProjects();
+  // A project is the primary axis: with one active, the console opens on its
+  // board and the source list folds away (it still feeds the card wall).
+  if (localStorage.getItem(PROJECT_KEY)) {
+    switchView('board');
+    const g = document.getElementById('src-group');
+    if (g) g.open = false;
+  }
   const addProjBtn = document.getElementById('add-project');
   if (addProjBtn) addProjBtn.addEventListener('click', addProject);
 }
@@ -224,9 +233,16 @@ function wireNav() {
 }
 function switchView(v) {
   state.view = v;
-  document.querySelectorAll('.seg-item').forEach((el) => el.classList.toggle('active', el.dataset.view === v));
+  document.querySelectorAll('.seg-item').forEach((el) => {
+    const on = el.dataset.view === v;
+    el.classList.toggle('active', on);
+    // The segments were styled as a toggle group with no state exposed to
+    // assistive tech; aria-pressed is what makes "which one is on" audible.
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
   $('#view-skills').hidden = v !== 'skills';
   $('#view-experts').hidden = v !== 'experts';
+  $('#view-board').hidden = v !== 'board';
 }
 
 // ---------- Skill 列表 ----------
@@ -790,14 +806,25 @@ async function loadProjects(focusId) {
     localStorage.removeItem(PROJECT_KEY);
   }
 
+  // The board follows the rail. Fired on every SUCCESSFUL render rather than
+  // only on a change: board.js de-duplicates by id, and a render after a
+  // delete is exactly when the active project may have become null. Never
+  // fired on the error branch above - a failed load is not evidence the
+  // project is gone (the comment there says why).
+  const activeProject = projects.find((p) => p.id === activeId) || null;
+  document.dispatchEvent(new CustomEvent('skillspace:project', { detail: { project: activeProject } }));
+
   if (st.kind === 'empty') {
     list.innerHTML = '<div class="proj-empty">还没有项目。添加一个目录或 Git 仓库开始。</div>';
     return;
   }
 
-  // The row is a div, not a button, for the reason renderSources() documents:
-  // a <button> may not contain another one, and the delete affordance has to be
-  // focusable to be reachable by keyboard. Same structure as .src-item.
+  // The row is a plain div holding TWO sibling buttons - select and delete.
+  // It used to be a role="button" div wrapping the delete <button>, which axe
+  // reports as nested-interactive (serious): a screen reader announces the
+  // outer "button" and cannot reach the inner one predictably. A <button> may
+  // not contain another one either, so the select control is its own button
+  // beside the delete one rather than around it (plan 3, Task 7 audit).
   list.innerHTML = projects
     .map((p, i) => {
       // A name can be empty: registering "/" makes basename() return '' and the
@@ -810,12 +837,12 @@ async function loadProjects(focusId) {
         // array this render closed over, so a path that outlives the render —
         // deleting a row, then looking for what replaced it — needs the row to
         // say which project it is.
-        `<div class="proj-item${p.id === activeId ? ' active' : ''}" role="button" tabindex="0" data-i="${i}"` +
-        ` data-id="${escAttr(p.id)}"` +
-        ` aria-current="${p.id === activeId ? 'true' : 'false'}" title="${escAttr(p.path)}">` +
+        `<div class="proj-item${p.id === activeId ? ' active' : ''}" data-i="${i}"` +
+        ` data-id="${escAttr(p.id)}" title="${escAttr(p.path)}">` +
+        `<button type="button" class="proj-pick" aria-current="${p.id === activeId ? 'true' : 'false'}">` +
         `<span class="proj-name">${esc(label)}</span>` +
         // kind is shown, not hidden: it decides how many agents may run at once
-        `<span class="proj-kind">${esc(p.kind)}</span>` +
+        `<span class="proj-kind">${esc(p.kind)}</span></button>` +
         // the glyph is aria-hidden, so the control needs a label of its own
         `<button class="proj-del" data-del="${i}" title="移除这个项目"` +
         ` aria-label="移除项目 ${escAttr(label)}">${icon('close', 13)}</button>` +
@@ -829,18 +856,11 @@ async function loadProjects(focusId) {
       const id = projects[+el.dataset.i].id;
       localStorage.setItem(PROJECT_KEY, id);
       loadProjects(id);
+      switchView('board');
     };
-    el.addEventListener('click', select);
-    // role="button" on a div gets no Enter/Space activation for free. The row
-    // was a real <button> until the delete control had to live inside it, so
-    // without this the conversion would have cost the keyboard its selection.
-    // Guarded on target: a keypress on the nested delete button is its own.
-    el.addEventListener('keydown', (ev) => {
-      if (ev.target !== el) return;
-      if (ev.key !== 'Enter' && ev.key !== ' ') return;
-      ev.preventDefault();
-      select();
-    });
+    // A real <button> now, so Enter and Space come for free; the keydown
+    // shim the role="button" div needed is gone with it.
+    el.querySelector('.proj-pick').addEventListener('click', select);
   });
 
   list.querySelectorAll('.proj-del').forEach((el) =>
@@ -857,7 +877,7 @@ async function loadProjects(focusId) {
   // machinery uses for lastTrigger.
   if (focusId) {
     const idx = projects.findIndex((p) => p.id === focusId);
-    const row = idx >= 0 ? list.querySelectorAll('.proj-item')[idx] : null;
+    const row = idx >= 0 ? list.querySelectorAll('.proj-pick')[idx] : null;
     if (row && document.contains(row)) row.focus();
   }
 }
@@ -869,7 +889,7 @@ async function loadProjects(focusId) {
 // it was the last one, and the add button if nothing is left.
 function focusAfterDelete(rowIndex) {
   if (rowIndex < 0) return;
-  const rows = document.querySelectorAll('.proj-item');
+  const rows = document.querySelectorAll('.proj-pick');
   const next = rows.length ? rows[Math.min(rowIndex, rows.length - 1)] : null;
   const target = next || document.getElementById('add-project');
   if (target && document.contains(target)) target.focus();
@@ -944,6 +964,7 @@ async function addProject() {
   // that named nothing at all.
   toast('已添加项目：' + (r.project.name || r.project.path));
   loadProjects();
+  switchView('board');
 }
 
 boot();

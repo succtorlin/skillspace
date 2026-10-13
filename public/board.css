@@ -85,3 +85,56 @@
   border: 1px solid var(--danger); background: var(--ground-2);
   font-size: 12.5px; color: var(--ink);
 }
+
+/* ---------- the board view: orders primary, composer and limits beside ---------- */
+.view-board {
+  display: grid; gap: 12px; margin: 12px 10px 40px; align-items: start;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  grid-template-areas: "head head" "orders compose" "orders budget";
+}
+.bd-head { grid-area: head; }
+.bd-orders { grid-area: orders; }
+.bd-compose { grid-area: compose; }
+.bd-budget-panel { grid-area: budget; }
+.bd-title-h {
+  font-family: var(--face-display); font-weight: 500; font-size: 22px;
+  letter-spacing: -.01em; color: var(--ink); text-wrap: balance;
+}
+.bd-kind { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-top: 8px; font-size: 12.5px; color: var(--ink-2); }
+.bd-kind-tag { font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .12em; color: var(--accent); }
+.bd-path {
+  margin-top: 4px; font-family: var(--face-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; color: var(--muted); word-break: break-all;
+}
+
+/* Sources folded under the rail. The summary keeps .side-label's look. */
+.side-group > summary { cursor: pointer; list-style: none; margin-top: 16px; min-height: 24px; } /* 2.5.8 target size */
+.side-group > summary::-webkit-details-marker { display: none; }
+.side-group > summary::after { content: "＋"; content: "＋" / ""; margin-left: auto; color: var(--muted); letter-spacing: 0; }
+.side-group[open] > summary::after { content: "－"; content: "－" / ""; }
+
+@media (max-width: 1024px) {
+  .view-board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "compose" "orders" "budget"; }
+}
+@media (max-width: 560px) {
+  .view-board { margin-left: 6px; margin-right: 6px; }
+  .bd-panel { padding: 12px; }
+}
+
+/* The hidden attribute must win over every display rule above. The board's
+   filter chip, goal detail, drawer facts and error lines are all toggled with
+   it, and a class like .bd-filter { display: flex } otherwise beats the UA's
+   [hidden] { display: none } and shows an empty, stale box. */
+:is(.view-board, .run-drawer, .modal) [hidden] { display: none; }
+
+/* ---------- project rail: select and delete are sibling buttons ----------
+   The row was a role="button" div around the delete <button> (axe:
+   nested-interactive, serious). The row keeps its look from style.css; the
+   select button fills it, and delete gets a 24px target (WCAG 2.5.8). */
+.proj-item { padding: 0 4px 0 0; }
+.proj-pick {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border: 0; border-radius: 8px; background: transparent;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.proj-del { min-width: 24px; min-height: 24px; justify-content: center; margin-left: 0; }
