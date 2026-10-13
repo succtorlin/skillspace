@@ -259,6 +259,9 @@ function switchView(v) {
   $('#view-skills').hidden = v !== 'skills';
   $('#view-experts').hidden = v !== 'experts';
   $('#view-board').hidden = v !== 'board';
+  // board.css hides the card-wall source header on the board: it names a
+  // Skill directory, not the project the board is about.
+  document.body.dataset.view = v;
 }
 
 // ---------- Skill 列表 ----------

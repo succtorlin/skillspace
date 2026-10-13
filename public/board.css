@@ -68,7 +68,10 @@
 .sdot[data-state="cancelled"] { width: 9px; height: 2px; border-radius: 1px; background: var(--muted); border: 0; }
 /* A frozen pulse is worse than none (the .jb-dot note in style.css). */
 @media (prefers-reduced-motion: reduce) {
-  .sdot { animation: none; opacity: 1; }
+  /* [data-state] matches the specificity of the state rules above; a bare
+     .sdot here LOST to .sdot[data-state="running"] and the dot kept pulsing
+     under reduced motion (measured in the Task 14 audit). */
+  .sdot[data-state] { animation: none; opacity: 1; }
 }
 
 /* ---------- empty / filtered / failed / loading ---------- */
@@ -296,3 +299,18 @@
 .modal-order > summary { cursor: pointer; }
 .modal-order-note { margin: 8px 0; font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch; }
 .modal-order .btn { margin-top: 8px; }
+
+/* On the board the topbar's source header (a Skill directory) and its rescan
+   button are about the card wall, not the project on screen; the board header
+   says which project this is. The agent picker stays - goals and dispatch use it.
+   (.icon-btn, not the id: board.css carries no ID selectors.) */
+body[data-view="board"] .topbar .src-head,
+body[data-view="board"] .topbar .icon-btn { display: none; }
+
+/* Three segments since the board joined them: at 320px the segmented control
+   ran 12px past the viewport (WCAG 1.4.10, Task 14 audit). Let it fill the row
+   and let each segment shrink instead. */
+@media (max-width: 420px) {
+  .seg { max-width: 100%; min-width: 0; }
+  .seg-item { padding-left: 10px; padding-right: 10px; min-width: 0; }
+}
