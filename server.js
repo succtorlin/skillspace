@@ -809,6 +809,13 @@ function denyNavigation(res, what) {
   res.end(`forbidden: ${what} is not a navigable URL`);
 }
 
+// The console's own files. A Set, not a chain of ===, so adding one is one
+// edit; anything not named here is not served, whatever is in public/.
+const CONSOLE_ASSETS = new Set([
+  '/app.js', '/icons.js', '/pure.js', '/style.css',
+  '/board.css', '/board.js', '/order-drawer.js', '/goal-panel.js',
+]);
+
 function serveStatic(res, file) {
   const full = path.join(PUBLIC, file);
   if (!full.startsWith(PUBLIC) || !fs.existsSync(full)) {
@@ -816,7 +823,7 @@ function serveStatic(res, file) {
   }
   const ext = path.extname(full);
   const type = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml' }[ext] || 'text/plain';
-  res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` });
+  res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-cache' });
   fs.createReadStream(full).pipe(res);
 }
 
@@ -881,7 +888,7 @@ const attemptRoutes = makeAttemptRoutes(routeDeps);
 
 async function route(req, res, u, p) {
   if (p === '/' ) return serveStatic(res, 'index.html');
-  if (p === '/app.js' || p === '/icons.js' || p === '/pure.js' || p === '/style.css') return serveStatic(res, p.slice(1));
+  if (CONSOLE_ASSETS.has(p)) return serveStatic(res, p.slice(1));
   // Marketing surface. Deliberately a separate direction from the console:
   // the app is an instrument, this page sells the idea of it.
   if (p === '/landing' || p === '/landing.html') return serveStatic(res, 'landing.html');

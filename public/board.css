@@ -1,0 +1,8 @@
+/* ============================================================
+   Board, order drawer, goal composer — plan 3.
+   READS TOKENS ONLY. Every colour is var(--…) from style.css; there are no
+   hex/rgb literals and no ID selectors here (test/board-css.test.js).
+   Depth: page --ground-0 → panel --ground-1 → row hover --ground-2.
+   NEVER --ground-3 under text: --muted measures 4.34:1 (dark) and 4.25:1
+   (light) there, and light --accent 4.34:1 — all below AA.
+   ============================================================ */
