@@ -212,3 +212,219 @@ test('boardSortFor sorts a copy, never the list it was handed', () => {
   assert.deepStrictEqual(sorted.map((o) => o.id), ['ord-1', 'ord-2']);
   assert.deepStrictEqual(list.map((o) => o.id), ['ord-2', 'ord-1']);
 });
+
+// ---------- scheduler ----------
+const sched = (over) => ({ scheduler: {
+  ticks: 10, offered: 0, started: 0, refused: 0, failedToStart: 0, errors: 0, skipped: 0,
+  inFlight: 0, lastSkip: null, running: true, intervalMs: 1000, startedAt: '2026-10-12T10:00:00Z',
+  lastTickAt: '2026-10-12T10:00:10Z', lastError: null, lastErrorAt: null, pausedProjects: 0, ...over,
+} });
+const T = Date.parse('2026-10-12T10:00:11Z');
+
+test('schedulerView: off, unknown, idle, working', () => {
+  assert.strictEqual(pure.schedulerView(null, null, T).kind, 'unknown');
+  assert.strictEqual(pure.schedulerView(null, sched({ running: false }), T).kind, 'off');
+  assert.strictEqual(pure.schedulerView(null, sched(), T).kind, 'idle');
+  const w = pure.schedulerView(null, sched({ inFlight: 2 }), T);
+  assert.strictEqual(w.kind, 'working');
+  assert.match(w.detail, /手动派发/, 'inFlight counts only the loop\'s own dispatches, and says so');
+});
+
+test('schedulerView: `running` with no recent tick is stalled, not green', () => {
+  // routes/scheduler.js: running means the timer is armed, not that the loop
+  // is making progress.
+  assert.strictEqual(pure.schedulerView(null, sched({ lastTickAt: '2026-10-12T09:59:00Z' }), T).kind, 'stalled');
+  assert.strictEqual(pure.schedulerView(null, sched({ lastTickAt: null }), T).kind, 'stalled');
+});
+
+test('schedulerView: an old lastError is history, a rising count is now', () => {
+  // lastError is never cleared; only lastErrorAt says whether it is current.
+  const old = sched({ errors: 1, lastError: 'ENOENT', lastErrorAt: '2026-10-12T09:00:00Z' });
+  const v = pure.schedulerView(sched({ errors: 1 }), old, T);
+  assert.strictEqual(v.kind, 'idle');
+  assert.strictEqual(v.lastError.message, 'ENOENT');
+  assert.match(v.lastError.ago, /前$/);
+  assert.strictEqual(pure.schedulerView(sched({ errors: 1 }), sched({ errors: 2, lastError: 'x', lastErrorAt: '2026-10-12T09:00:00Z' }), T).kind, 'erroring');
+  assert.strictEqual(pure.schedulerView(null, sched({ errors: 1, lastError: 'x', lastErrorAt: '2026-10-12T10:00:10Z' }), T).kind, 'erroring');
+});
+
+test('schedulerView: paused projects and a fresh skip are surfaced', () => {
+  assert.strictEqual(pure.schedulerView(null, sched({ pausedProjects: 1 }), T).kind, 'paused');
+  // Since Task 0 the route names WHICH project: the board's own is said so,
+  // another project's pause is not blamed on this one.
+  const until = '2026-10-12T10:01:00Z';
+  const mine = pure.schedulerView(null, sched({ pausedProjects: 1, pausedProjectIds: [{ id: 'p1', until, consecutive: 3 }] }), T, 'p1');
+  assert.strictEqual(mine.kind, 'paused');
+  assert.match(mine.text, /这个项目/);
+  assert.match(mine.detail, /3 单/);
+  const theirs = pure.schedulerView(null, sched({ pausedProjects: 1, pausedProjectIds: [{ id: 'p2', until, consecutive: 3 }] }), T, 'p1');
+  assert.strictEqual(theirs.kind, 'idle', 'another project\'s pause turned this board red');
+  assert.match(theirs.detail, /别的项目/);
+  const b = pure.schedulerView(null, sched({ lastSkip: { reason: 'goal still being planned', orderId: 'o', at: '2026-10-12T10:00:10Z' } }), T);
+  assert.strictEqual(b.kind, 'blocked');
+  assert.match(b.detail, /goal still being planned/);
+  assert.strictEqual(pure.schedulerView(null, sched({ lastSkip: { reason: 'x', orderId: 'o', at: '2026-10-12T09:00:00Z' } }), T).kind, 'idle');
+  // A hold is a choice, not a fault: never the danger hairline.
+  const held = pure.schedulerView(null, sched({ lastSkip: { reason: 'goal held for review', orderId: 'o', at: '2026-10-12T10:00:10Z' } }), T);
+  assert.strictEqual(held.kind, 'held');
+  assert.match(held.text, /等你放行/);
+});
+
+test('schedulerView says when nothing is judging results (plan 2d)', () => {
+  assert.match(pure.schedulerView(null, sched({ judging: false }), T).detail || '', /验收没有开启/);
+  assert.strictEqual(pure.schedulerView(null, sched({ judging: true }), T).detail, null);
+});
+
+// ---------- review mode ----------
+test('reviewMode never promises a review window the backend does not give', () => {
+  // Since Task 0 the backend HAS a window - a goal posted with hold:true -
+  // so the auto note points at it instead of at restarting the server.
+  const auto = pure.reviewMode(sched(), false);
+  assert.strictEqual(auto.kind, 'auto');
+  assert.match(auto.note, /自动运行/);
+  assert.match(auto.note, /先审后跑/);
+  assert.doesNotMatch(auto.note, /SKILLSPACE_SCHEDULER=0/);
+  const manual = pure.reviewMode(sched({ running: false }), false);
+  assert.strictEqual(manual.kind, 'manual');
+  assert.match(manual.note, /派发/);
+  // Fail closed: unknown is not "manual".
+  assert.strictEqual(pure.reviewMode(null, false).kind, 'unknown');
+  assert.match(pure.reviewMode(null, false).note, /无法确定/);
+});
+
+test('reviewMode with the hold on promises a stop, and only what release does', () => {
+  for (const cur of [sched(), sched({ running: false }), null]) {
+    const h = pure.reviewMode(cur, true);
+    assert.strictEqual(h.kind, 'held');
+    assert.match(h.note, /开始运行/);
+    assert.match(h.submitLabel, /先审后跑/);
+  }
+  // With the loop off, release changes nothing by itself; the note says so.
+  assert.match(pure.reviewMode(sched({ running: false }), true).note, /调度器关闭/);
+});
+
+// ---------- budgets ----------
+test('budgetView states the structural limits and never mentions money as covered', () => {
+  const p = { kind: 'git', concurrency: 2, budget: { maxOrdersPerGoal: 12, orderTimeoutMs: 900000, maxOrdersPerDay: 100 } };
+  const v = pure.budgetView(p, [], Date.now());
+  assert.match(v.concurrency.value, /2/);
+  assert.deepStrictEqual(v.rows.map((r) => r.key), ['perGoal', 'attempts', 'timeout', 'daily']);
+  assert.match(v.rows[2].value, /15m/);
+  assert.match(v.rows[3].note, /按创建计数/);
+  assert.match(v.rows[0].note, /重试也算/, 'plan 2d: retries count against the goal cap');
+  assert.match(v.caveat, /不是花费/);
+  assert.doesNotMatch(JSON.stringify(v), /[$¥]|美元|人民币|费用上限/);
+});
+
+test('budgetView explains why a directory runs one order at a time', () => {
+  const v = pure.budgetView({ kind: 'dir', concurrency: 1, budget: {} }, [], Date.now());
+  assert.match(v.concurrency.value, /1 单/);
+  assert.match(v.concurrency.note, /无法隔离/);
+});
+
+test('budgetView flags a reached daily cap, and what it does', () => {
+  const now = Date.now();
+  const p = { kind: 'git', concurrency: 2, budget: { maxOrdersPerDay: 1 } };
+  const v = pure.budgetView(p, [{ id: 'a', createdAt: new Date(now).toISOString() }], now);
+  const daily = v.rows.find((r) => r.key === 'daily');
+  assert.strictEqual(daily.over, true);
+  assert.match(daily.note, /明天/);
+});
+
+test('budgetView treats a missing cap as unlimited, and says so', () => {
+  const v = pure.budgetView({ kind: 'git', concurrency: 2, budget: {} }, [], Date.now());
+  assert.match(v.rows.find((r) => r.key === 'perGoal').value, /未设上限/);
+});
+
+// ---------- transitions ----------
+test('orderTransitions reports changes and arrivals, not unchanged rows', () => {
+  const prev = [order({ id: 'a', status: 'running' }), order({ id: 'b', status: 'queued' })];
+  const next = [order({ id: 'a', status: 'failed', error: 'timeout', startedAt: 'x' }), order({ id: 'b', status: 'queued' }), order({ id: 'c' })];
+  const t = pure.orderTransitions(prev, next);
+  assert.deepStrictEqual(t.map((x) => [x.id, x.from, x.to]), [['a', 'running', 'failed'], ['c', null, 'queued']]);
+  const msg = pure.announcement(t);
+  assert.match(msg, /新增 1 单/);
+  assert.match(msg, /超时/);
+  assert.strictEqual(pure.announcement([]), '');
+  assert.deepStrictEqual(pure.orderTransitions(null, next), []);
+});
+
+test('announcement stays one sentence when many rows move at once', () => {
+  const prev = [1, 2, 3, 4, 5].map((i) => order({ id: 'o' + i, status: 'running' }));
+  const next = prev.map((o) => ({ ...o, status: 'succeeded' }));
+  assert.match(pure.announcement(pure.orderTransitions(prev, next)), /另有 2 单/);
+});
+
+// ---------- log ----------
+test('logStep: stop only when the order is settled AND the log is drained', () => {
+  const live = pure.logStep({ log: { text: 'a', next: 1, size: 1, exists: true }, status: 'running' }, true);
+  assert.deepStrictEqual([live.ok, live.done, live.more], [true, false, false]);
+  const behind = pure.logStep({ log: { text: 'a', next: 1, size: 5, exists: true }, status: 'succeeded' }, false);
+  assert.deepStrictEqual([behind.done, behind.more], [false, true]);
+  const done = pure.logStep({ log: { text: '', next: 5, size: 5, exists: true }, status: 'succeeded' }, false);
+  assert.strictEqual(done.done, true);
+  assert.strictEqual(pure.logStep({ log: { next: -1 } }, true).ok, false);
+  assert.strictEqual(pure.logStep(null, true).ok, false);
+  assert.strictEqual(pure.logStep({ log: { text: '', next: 0, size: 0, reset: true } }, true).reset, true);
+});
+
+test('appendCapped keeps the tail and never starts on half a surrogate pair', () => {
+  assert.deepStrictEqual(pure.appendCapped('ab', 'cd', 10), { text: 'abcd', dropped: 0 });
+  assert.deepStrictEqual(pure.appendCapped('abcdef', 'gh', 4), { text: 'efgh', dropped: 4 });
+  const r = pure.appendCapped('a😀', 'b', 2);   // 'a', '\ud83d', '\ude00', 'b'
+  assert.strictEqual(r.text, 'b');
+  assert.strictEqual(r.dropped, 3);
+});
+
+test('shouldStick follows the tail only when the reader is already there', () => {
+  assert.strictEqual(pure.shouldStick(900, 100, 1000), true);
+  assert.strictEqual(pure.shouldStick(880, 100, 1000), true);
+  assert.strictEqual(pure.shouldStick(500, 100, 1000), false);
+});
+
+// ---------- action outcomes ----------
+test('orderActionOutcome maps every route answer to honest copy', () => {
+  const o = pure.orderActionOutcome;
+  assert.strictEqual(o('dispatch', 200, { order: {} }).ok, true);
+  assert.strictEqual(o('cancel', 200, { order: {} }).ok, true);
+  const raced = o('dispatch', 409, { error: 'order is already being dispatched' });
+  assert.strictEqual(raced.ok, true, 'losing the claim to the scheduler is not a failure: the order runs');
+  assert.match(raced.text, /调度器/);
+  assert.match(o('dispatch', 409, { error: 'order is already running', order: { status: 'running' } }).text, /运行中/);
+  assert.match(o('cancel', 409, { error: 'order is already succeeded' }).text, /退出 0/);
+  assert.match(o('dispatch', 409, { error: '该项目已有任务在运行（未隔离的目录一次只能跑一个）' }).text, /未隔离/);
+  assert.match(o('dispatch', 429, { error: 'too many orders running (4)' }).text, /已满/);
+  assert.match(o('dispatch', 404, {}).text, /不存在/);
+  assert.match(o('dispatch', 0, null).text, /无法连接/);
+  assert.match(o('dispatch', 400, { error: '未知的 agent：x' }).text, /未知的 agent/);
+});
+
+test('goalSubmitOutcome keeps the server reason and translates the English ones', () => {
+  const g = pure.goalSubmitOutcome;
+  assert.strictEqual(g(200, { goal: { id: 'g' } }).ok, true);
+  assert.strictEqual(g(200, {}).ok, false, 'a 200 without a goal is not a success');
+  assert.match(g(400, { error: 'text is required' }).text, /不能为空/);
+  assert.match(g(400, { error: 'text is too long (100001 > 100000)' }).text, /太长/);
+  assert.match(g(404, { error: 'no such project' }).text, /项目不存在/);
+  assert.match(g(429, { error: 'too many agents running (4)' }).text, /已满/);
+  assert.match(g(0, null).text, /无法连接/);
+  assert.match(g(500, { error: 'EACCES' }).text, /EACCES/);
+});
+
+test('goalStatusText: done is verified now, and stalled asks for a human', () => {
+  // Plan 2d changed what `done` means: every chain's latest attempt was
+  // VERIFIED. The plan-3 text "不代表都成功" was true before 2d and is false now.
+  assert.match(pure.goalStatusText('done'), /已验收/);
+  assert.match(pure.goalStatusText('stalled'), /需要你/);
+  assert.strictEqual(pure.goalStatusText('planning'), 'PM 拆解中');
+  assert.match(pure.goalStatusText('nope'), /未知状态/);
+  assert.match(pure.goalStatusText('planned', { held: true }), /等你放行/);
+  assert.doesNotMatch(pure.goalStatusText('planned', { held: false }), /放行/);
+});
+
+test('oneOffNote says a directory project is edited in place', () => {
+  assert.match(pure.oneOffNote({ name: 'x', kind: 'dir' }), /直接改动/);
+  assert.match(pure.oneOffNote({ name: 'x', kind: 'git' }), /worktree/);
+  assert.match(pure.oneOffNote(null), /先在左侧选一个项目/);
+  assert.match(pure.oneOffNote({ name: 'x', kind: 'git' }), /不经过 PM/);
+});

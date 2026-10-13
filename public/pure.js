@@ -260,6 +260,268 @@ function goalOrderIds(goals, goalId) {
   return new Set(g && Array.isArray(g.orderIds) ? g.orderIds.filter((id) => typeof id === 'string') : []);
 }
 
+// The scheduler, read the way routes/scheduler.js says it must be read:
+// `running` is "timer armed", not progress (lastTickAt answers that), and
+// lastError is never cleared, so only a rising `errors` count or a fresh
+// lastErrorAt means "erroring now". `prev` is the previous poll, or null.
+// `projectId` is the board's project: since plan 3 Task 0 the route names the
+// paused projects, so this board's own pause is said so and another
+// project's is not blamed on it.
+function schedulerView(prev, cur, now, projectId) {
+  const s = cur && cur.scheduler;
+  if (!s || typeof s !== 'object') {
+    return { kind: 'unknown', text: '读不到调度器状态', detail: '订单会不会自动开始，现在无法确定。', lastError: null };
+  }
+  const errAt = Date.parse(s.lastErrorAt || '');
+  const lastError = s.lastError && Number.isFinite(errAt)
+    ? { message: String(s.lastError), ago: fmtDuration(now - errAt) + '前' }
+    : null;
+  if (!s.running) {
+    return { kind: 'off', text: '调度器关闭', detail: '订单停在排队，逐单点「派发」才会运行。', lastError };
+  }
+  const interval = Number.isFinite(s.intervalMs) && s.intervalMs > 0 ? s.intervalMs : 1000;
+  const tickAt = Date.parse(s.lastTickAt || '');
+  if (!Number.isFinite(tickAt) || now - tickAt > Math.max(10000, interval * 10)) {
+    return {
+      kind: 'stalled', text: '调度器没有在轮询',
+      detail: Number.isFinite(tickAt) ? `上次轮询在 ${fmtDuration(now - tickAt)}前。` : '启动后还没轮询过。',
+      lastError,
+    };
+  }
+  const p = prev && prev.scheduler;
+  const rising = !!p && Number.isFinite(p.errors) && Number.isFinite(s.errors) && s.errors > p.errors;
+  const fresh = Number.isFinite(errAt) && now - errAt < interval * 3;
+  if (rising || fresh) {
+    return { kind: 'erroring', text: '调度器在报错', detail: String(s.lastError || '没有记录错误内容'), lastError };
+  }
+  const pausedIds = Array.isArray(s.pausedProjectIds) ? s.pausedProjectIds.filter((x) => x && x.id) : null;
+  const mine = pausedIds && projectId ? pausedIds.find((x) => x.id === projectId) : null;
+  if (mine) {
+    const untilMs = Date.parse(mine.until || '');
+    return {
+      kind: 'paused', text: '这个项目暂停中',
+      detail: `连续 ${Number.isFinite(mine.consecutive) ? mine.consecutive : '几'} 单没能启动（通常是建不了 worktree），` +
+        (Number.isFinite(untilMs) ? `${fmtDuration(untilMs - now)}后再试。` : '一分钟后再试。'),
+      lastError,
+    };
+  }
+  // An older server sends only the count; then this board cannot tell, and
+  // says so rather than guessing either way.
+  if (!pausedIds && Number.isFinite(s.pausedProjects) && s.pausedProjects > 0) {
+    return {
+      kind: 'paused', text: `${s.pausedProjects} 个项目暂停中`,
+      detail: '连续几单没能启动，暂停一分钟后再试。状态接口没有说是哪个项目。',
+      lastError,
+    };
+  }
+  const othersPaused = pausedIds ? pausedIds.length : 0;
+  const skipAt = s.lastSkip ? Date.parse(s.lastSkip.at || '') : NaN;
+  const freshSkip = Number.isFinite(skipAt) && now - skipAt < interval * 3;
+  // A hold is the human's own choice (Task 0), not a fault: no danger colour.
+  if (freshSkip && s.lastSkip.reason === 'goal held for review') {
+    return { kind: 'held', text: '调度器运行中 · 有目标等你放行', detail: '审阅它的计划后，点「开始运行」。', lastError };
+  }
+  if (freshSkip) {
+    return {
+      kind: 'blocked', text: '有订单被挡住',
+      detail: `${String(s.lastSkip.reason || '')}（可能是别的项目的订单）`,
+      lastError,
+    };
+  }
+  // Plan 2d: `judging` false means no verdicts are being given at all, so an
+  // exit 0 will stay "awaiting a verdict" forever. Said once, beside the rest.
+  const notes = [];
+  if (s.judging === false) notes.push('验收没有开启：退出 0 的订单不会被 PM 判定。');
+  if (othersPaused) notes.push(`别的项目有 ${othersPaused} 个暂停中。`);
+  const n = Number.isFinite(s.inFlight) ? s.inFlight : 0;
+  if (n > 0) {
+    return { kind: 'working', text: `调度器运行中 · 它派出的 ${n} 单在跑`, detail: ['手动派发的订单不计在内。', ...notes].join(' '), lastError };
+  }
+  return { kind: 'idle', text: '调度器运行中 · 空闲', detail: notes.length ? notes.join(' ') : null, lastError };
+}
+
+// What submitting a goal will actually do. Since plan 3 Task 0 a goal can be
+// posted HELD: its orders wait for a release whatever the scheduler is doing.
+// Without the hold and with the scheduler on, a planned goal's orders start on
+// its next tick. Unknown fails CLOSED - it is not read as "manual".
+function reviewMode(cur, hold) {
+  const s = cur && cur.scheduler;
+  const known = !!s && typeof s === 'object';
+  if (hold === true) {
+    return {
+      kind: 'held', submitLabel: '交给 PM 拆解（先审后跑）',
+      note: '计划落地后先停住：订单留在排队，你读完计划点「开始运行」，或逐单派发。' +
+        (known && !s.running ? '调度器关闭时，「开始运行」只是解除暂停，订单仍要逐单派发。' : ''),
+    };
+  }
+  if (!known) {
+    return { kind: 'unknown', submitLabel: '交给 PM 拆解', note: '读不到调度器状态：计划落地后订单会不会自动开始，现在无法确定。想先读计划，勾选「先审后跑」。' };
+  }
+  if (s.running) {
+    const secs = Number.isFinite(s.intervalMs) && s.intervalMs > 0 ? Math.max(1, Math.round(s.intervalMs / 1000)) : 1;
+    return {
+      kind: 'auto', submitLabel: '交给 PM 拆解并自动运行',
+      note: `调度器在运行：计划一落地，约 ${secs} 秒后订单就开始自动运行（受并发上限约束），不等你看。想先读计划，勾选「先审后跑」。`,
+    };
+  }
+  return { kind: 'manual', submitLabel: '交给 PM 拆解', note: '调度器已关闭：计划落地后订单停在排队，你逐单点「派发」才会运行。' };
+}
+
+// Spec §8a, in the terms the dispatcher actually controls. Nothing here is a
+// spend figure, and the caveat says why.
+function budgetView(project, orders, now) {
+  const b = (project && project.budget) || {};
+  const isGit = !!project && project.kind === 'git';
+  const n = (v) => Number.isFinite(v);
+  const today = ordersToday(orders, now);
+  const over = n(b.maxOrdersPerDay) && today >= b.maxOrdersPerDay;
+  return {
+    concurrency: {
+      value: isGit ? `最多同时 ${project.concurrency} 单` : '同时 1 单',
+      note: isGit ? '每单在自己的 git worktree 里运行，互不干扰。' : '普通目录无法隔离，两个 agent 同时改会互相覆盖，所以这里一次只跑一单。',
+    },
+    rows: [
+      {
+        key: 'perGoal', label: '每个目标',
+        value: n(b.maxOrdersPerGoal) ? `≤ ${b.maxOrdersPerGoal} 单` : '未设上限',
+        note: 'PM 的计划超过上限会被整份拒绝，不会截断成前几单执行。驳回后的重试也算在里面。', over: false,
+      },
+      {
+        key: 'attempts', label: '每单尝试',
+        value: n(b.maxAttemptsPerOrder) ? `≤ ${b.maxAttemptsPerOrder} 次` : '未设上限',
+        note: '被驳回后自动重试的上限；你手动点「重试」不受它限制，但仍受上面两个上限约束。', over: false,
+      },
+      {
+        key: 'timeout', label: '每单时长',
+        value: n(b.orderTimeoutMs) ? `≤ ${fmtDuration(b.orderTimeoutMs)}` : '未设上限',
+        note: '到点先 SIGTERM，5 秒后 SIGKILL，记为「超时」。', over: false,
+      },
+      {
+        key: 'daily', label: '今日已创建',
+        value: n(b.maxOrdersPerDay) ? `${today} / ${b.maxOrdersPerDay}` : String(today),
+        note: over
+          ? '已到上限：调度器让排队的订单等到明天；手动派发会直接记为失败。'
+          : '按创建计数，不是按运行计数；本地日期零点重置。',
+        over,
+      },
+    ],
+    caveat: '这些限制约束的是订单的数量和时长，不是花费。SkillSpace 看不到 token 或金额，单个订单在时限内仍可能很贵。',
+  };
+}
+
+function orderTransitions(prev, next) {
+  if (!Array.isArray(prev) || !Array.isArray(next)) return [];
+  const before = new Map(prev.filter(Boolean).map((o) => [o.id, o.status]));
+  const out = [];
+  for (const o of next) {
+    if (!o) continue;
+    if (!before.has(o.id)) out.push({ id: o.id, from: null, to: o.status, order: o });
+    else if (before.get(o.id) !== o.status) out.push({ id: o.id, from: before.get(o.id), to: o.status, order: o });
+  }
+  return out;
+}
+
+// ONE polite sentence per poll, never a sentence per row: a five-order goal
+// settling at once must not queue five announcements behind each other.
+function announcement(transitions) {
+  if (!Array.isArray(transitions) || !transitions.length) return '';
+  const added = transitions.filter((t) => t.from === null).length;
+  const moved = transitions.filter((t) => t.from !== null);
+  const parts = moved.slice(0, 3).map((t) => {
+    const f = failureView(t.order, null);
+    return `${seqSpoken(t.order)}「${orderTitle(t.order)}」${f ? f.title : orderStatusText(t.to)}`;
+  });
+  if (moved.length > 3) parts.push(`另有 ${moved.length - 3} 单状态变化`);
+  if (added) parts.unshift(`新增 ${added} 单`);
+  return parts.join('；');
+}
+
+// Done means settled AND drained: a settled order may still have bytes the
+// client has not fetched (the route reads status before the slice for this).
+function logStep(body, live) {
+  const log = body && body.log;
+  if (!log || typeof log !== 'object' || !Number.isSafeInteger(log.next) || log.next < 0) return { ok: false };
+  const size = Number.isSafeInteger(log.size) ? log.size : log.next;
+  const more = log.next < size;
+  return {
+    ok: true, text: typeof log.text === 'string' ? log.text : '', next: log.next,
+    reset: log.reset === true, exists: log.exists !== false, more, done: !live && !more,
+  };
+}
+
+// The DOM keeps the last LOG_DOM_CAP characters; the full log stays on disk.
+const LOG_DOM_CAP = 200000;
+function appendCapped(current, chunk, cap) {
+  const max = Number.isInteger(cap) && cap > 0 ? cap : LOG_DOM_CAP;
+  const joined = String(current == null ? '' : current) + String(chunk == null ? '' : chunk);
+  if (joined.length <= max) return { text: joined, dropped: 0 };
+  let cut = joined.length - max;
+  const code = joined.charCodeAt(cut);
+  if (code >= 0xdc00 && code <= 0xdfff) cut += 1; // never begin on the low half of a pair
+  return { text: joined.slice(cut), dropped: cut };
+}
+
+function shouldStick(scrollTop, clientHeight, scrollHeight) {
+  return scrollHeight - (scrollTop + clientHeight) <= 24;
+}
+
+// Every answer the dispatch and cancel routes give, in the console's language.
+// Losing the claim to the scheduler is ok:true - the order runs either way.
+function orderActionOutcome(action, status, body) {
+  const err = body && typeof body.error === 'string' ? body.error : '';
+  const verb = action === 'cancel' ? '取消' : '派发';
+  if (status === 0) return { ok: false, text: '无法连接服务器' };
+  if (status === 200) return { ok: true, text: action === 'cancel' ? '已发出取消' : '已派发，等它开始运行' };
+  if (status === 404) return { ok: false, text: '这一单不存在了' };
+  if (status === 409 && /already being dispatched/.test(err)) return { ok: true, text: '调度器已经领走了这一单' };
+  if (status === 409 && body && body.order && body.order.status) {
+    return { ok: false, text: `这一单已经是「${orderStatusText(body.order.status)}」了` };
+  }
+  if (status === 409) {
+    const m = /^order is already (\w+)$/.exec(err);
+    return { ok: false, text: m ? `这一单已经是「${orderStatusText(m[1])}」了` : `${verb}不了：${err || '状态冲突'}` };
+  }
+  if (status === 429) return { ok: false, text: `同时运行的 agent 已满，稍后再试（${err}）` };
+  return { ok: false, text: `${verb}失败：${err || `HTTP ${status}`}` };
+}
+
+function goalSubmitOutcome(status, body) {
+  const err = body && typeof body.error === 'string' ? body.error : '';
+  if (status === 200 && body && body.goal && body.goal.id) return { ok: true, goal: body.goal, text: '已交给 PM' };
+  if (status === 0) return { ok: false, text: '无法连接服务器，目标没有提交' };
+  if (status === 400 && /^text is required/.test(err)) return { ok: false, text: '目标不能为空' };
+  if (status === 400 && /^text is too long/.test(err)) return { ok: false, text: `目标太长：${err}` };
+  if (status === 404) return { ok: false, text: '这个项目不存在了（可能在别的标签页里被移除）' };
+  if (status === 413) return { ok: false, text: '目标太长，请求被拒绝' };
+  if (status === 429) return { ok: false, text: `同时运行的 agent 已满，稍后再试（${err}）` };
+  return { ok: false, text: `提交失败：${err || `HTTP ${status}`}` };
+}
+
+// Plan 2d changed `done`: every chain's latest attempt was VERIFIED. `failed`
+// is either a plan that could not be made or a rejection with no retry
+// coming - goal.error says which. `stalled` is live and means "needs you".
+const GOAL_STATUS_TEXT = {
+  planning: 'PM 拆解中', planned: '已拆解 · 待运行', running: '运行中',
+  stalled: '停住了 · 需要你处理', done: '完成 · 每单都已验收', failed: '失败',
+};
+function goalStatusText(status, goal) {
+  if (status === 'planned' && goal && goal.held === true) return '已拆解 · 等你放行';
+  return Object.prototype.hasOwnProperty.call(GOAL_STATUS_TEXT, status)
+    ? GOAL_STATUS_TEXT[status]
+    : `未知状态（${String(status)}）`;
+}
+
+// POST /api/orders creates AND dispatches - no PM, no scheduler, no review.
+// The modal says so before the click, and says what it touches.
+function oneOffNote(project) {
+  if (!project) return '先在左侧选一个项目，才能把 Skill 派给它。';
+  const where = project.kind === 'git'
+    ? '在一个独立的 git worktree 里运行'
+    : '直接改动这个目录（普通目录无法隔离）';
+  return `会立刻在「${project.name || project.path}」里${where}。不经过 PM，也不经过调度器。` +
+    '路径口令里的 SKILL.md 在项目外，agent 读不到时改用「完整口令」。';
+}
+
 // Inert in the browser: a classic script has no `module`, so the typeof guard
 // short-circuits and the declarations above simply stay globals.
 if (typeof module !== 'undefined' && module.exports) {
@@ -269,5 +531,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fmtDuration, orderElapsed, orderStatusText, exitCodeText, failureView,
     BOARD_GROUPS, boardGroupKey, boardSortFor, groupOrders, localDayKey, ordersToday, boardSignature,
     boardState, goalOrderIds,
+    schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
+    appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
   };
 }
