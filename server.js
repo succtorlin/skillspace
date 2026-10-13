@@ -16,6 +16,7 @@ const orders = require('./lib/orders');
 const goals = require('./lib/goals');
 const dispatch = require('./lib/dispatch');
 const plan = require('./lib/plan');
+const verdict = require('./lib/verdict');
 // For reap() only. It carries the pid guard this file's own inline version
 // lacked: when spawn fails asynchronously the handle's pid is undefined, so
 // -pid is NaN, process.kill throws, and the fallback child.kill() reaches a
@@ -352,12 +353,14 @@ const MAX_CONCURRENT_RUNS = Number(process.env.SKILLSPACE_MAX_RUNS) || 4;
 // through here. RUNNING holds this route's SSE children, which shutdown reaps
 // directly; dispatch owns the orders' claims because it owns the release.
 function agentsRunning() {
-  // Three pools, because there are three spawn paths: /api/run's SSE children,
-  // dispatch's orders, and lib/plan's PMs. A PM is an agent - it holds a slot
-  // in the ceiling and it holds the shutdown drain open until its goal is
-  // written. Leaving it out of this count was how the fourth spawn path would
-  // have escaped shutdown the way the third one did.
-  return RUNNING.size + dispatch.inFlightCount() + plan.inFlightCount();
+  // FOUR pools since plan 2d: /api/run's SSE children, dispatch's orders,
+  // lib/plan's planning PMs, and lib/verdict's judging PMs. A PM is an agent -
+  // it holds a slot in the ceiling and it holds the shutdown drain open until
+  // its goal is written. Leaving it out of this count was how the fourth spawn
+  // path would have escaped shutdown the way the third one did, and a judge is
+  // the fifth: it holds a slot and holds the drain open until its verdict (or
+  // its cancellation) is written.
+  return RUNNING.size + dispatch.inFlightCount() + plan.inFlightCount() + verdict.inFlightCount();
 }
 
 // ONE ceiling, written once and asked in three places: /api/run's gate, the
@@ -1183,6 +1186,19 @@ try {
   console.warn('[server] could not reconcile goals:', e.message);
 }
 
+// A judgement still `judging` lost its judge with the previous process. It is
+// recorded as an error - not reset for the loop to re-run - and a human
+// retries it. BEFORE scheduler.start(): the first tick reads an unclaimed
+// `judging` as "awaiting a verdict", and its goal would stall at `planned` with
+// nothing ever going to finish it. Pinned by 'a judgement interrupted by a
+// restart is recorded, not resumed'.
+try {
+  const n = orders.reconcileVerdicts(SKILLSPACE_HOME);
+  if (n) console.log(`  reconciled ${n} interrupted verdict(s)`);
+} catch (e) {
+  console.warn('[server] could not reconcile verdicts:', e.message);
+}
+
 // AFTER BOTH RECONCILES ABOVE. start() runs its first tick SYNCHRONOUSLY, and
 // that tick is the startup sweep - so it must not run until orders.reconcile()
 // has turned a killed process's `running` orders into `interrupted`, or the
@@ -1202,6 +1218,9 @@ try {
 //             refuses per order and lib/plan per goal; this refuses at boot.
 //   agentFor  which agent runs an order. Picking one would run a human's
 //             prompt through a tool they did not choose.
+//
+// A third, judgeFor, is optional to lib/scheduler - its absence turns verdicts
+// off visibly rather than leaking anything - and this file always passes it.
 //
 // A throw from start() is therefore NOT caught the way the two reconciles above
 // are. Both are configuration faults in this file, and a console that booted
@@ -1249,6 +1268,13 @@ if (process.env.SKILLSPACE_SCHEDULER === '0') {
     // rather than indexing AGENTS here: a throwing agentFor costs a warnOnce and
     // a skipped candidate on every tick, forever.
     agentFor: (order) => resolveAgent(AGENTS, order).agent,
+    // WHICH AGENT JUDGES: the goal's own PM - the agent that wrote the
+    // acceptance criteria is the one that reads the result against them.
+    // Resolved through resolveAgent for agentFor's reasons; an uninstalled PM
+    // is "not now", and the order waits for its verdict rather than being
+    // judged by an agent nobody chose. A human can name another through
+    // POST /api/orders/:id/verdict/retry.
+    judgeFor: (goal) => resolveAgent(AGENTS, { agent: goal.pmAgent }).agent,
   });
 }
 
@@ -1267,7 +1293,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     // orders as settled, takes the next queued ones, and spawns fresh
     // credentialed agents after "cancelling N running agent(s)" has printed.
     //
-    // Being FIRST rather than second is not itself what matters - the three
+    // Being FIRST rather than second is not itself what matters - the four
     // reap calls below are synchronous, so no tick can interleave between them,
     // and swapping the lines is an equivalent mutant. What matters is that
     // stop() is called at all, and before anything that yields past the point
@@ -1278,7 +1304,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     // It does not cancel anything already in flight. It stops picking new work;
     // cancelAll() on the next line is what reaps what is running.
     scheduler.stop();
-    const n = dispatch.cancelAll() + reapRunning('SIGTERM') + plan.cancelAll();
+    const n = dispatch.cancelAll() + reapRunning('SIGTERM') + plan.cancelAll() + verdict.cancelAll();
     if (n) console.log(`\n  cancelling ${n} running agent(s)…`);
     // Exit once the socket is closed AND every cancelled order has recorded
     // its outcome.

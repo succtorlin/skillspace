@@ -10,6 +10,7 @@ const net = require('net');
 const store = require('../lib/store');
 const goals = require('../lib/goals');
 const orders = require('../lib/orders');
+const { VERDICT_OPENING } = require('../lib/pm');
 
 // The wired scheduler, from the outside: a server process with the loop running
 // in it, driven only over HTTP and the store. lib/scheduler's own unit tests
@@ -75,11 +76,17 @@ function freePort() {
 // An ORDER whose prompt has no marker therefore prints the plan text and exits
 // 0, which is a `succeeded` order. That is all the deliverable test needs from
 // it: the point is who dispatched it, not what it wrote.
+//
+// A VERDICT prompt (it opens with pm.VERDICT_OPENING) answers verified - checked
+// first, because a verdict prompt embeds the order's own prompt.
 let fakeBin, fakeHome;
 const SLOW_MARK = 'SLOW-AGENT';
 const SLOW_SECONDS = 30;
 
 const SHIM = `#!/bin/sh
+case "$2" in
+  *"${VERDICT_OPENING}"*) printf '%s\\n' '{"verdict":"verified","reason":"the shim approves"}'; exit 0 ;;
+esac
 case "$2" in
   *${SLOW_MARK}*) sleep ${SLOW_SECONDS} ;;
 esac
@@ -550,6 +557,9 @@ test('a goal posted over HTTP runs to completion with nobody dispatching', async
     assert.notStrictEqual(o.cwd, project.path, "the agent ran in the user's own tree");
     assert.match(o.cwd, /worktrees/);
     assert.strictEqual(o.goalId, goalId, 'the order lost its goal');
+    // Since plan 2d `done` is reachable only through a verdict - so this also
+    // proves server.js wired judgeFor.
+    assert.strictEqual(o.verdict, 'verified', `an order reached a done goal unjudged: ${JSON.stringify(o)}`);
   }
 
   // WHO ran them. Every assertion above would also hold if a human had
