@@ -438,3 +438,17 @@ test('a project at the filesystem root still gets a name', () => {
   assert.strictEqual(typeof p.name, 'string');
   assert.ok(p.name.length > 0);
 });
+
+test('maxAttemptsPerOrder defaults to three and is bounded like every budget key', () => {
+  const root = tmpRoot();
+  assert.strictEqual(projects.DEFAULT_BUDGET.maxAttemptsPerOrder, 3);
+  assert.strictEqual(projects.create(root, { path: tmpDir() }).budget.maxAttemptsPerOrder, 3);
+  assert.strictEqual(
+    projects.create(root, { path: tmpDir(), budget: { maxAttemptsPerOrder: 1 } }).budget.maxAttemptsPerOrder, 1);
+  assert.strictEqual(
+    projects.create(root, { path: tmpDir(), budget: { maxAttemptsPerOrder: 0 } }).budget.maxAttemptsPerOrder, 3,
+    'an unusable value on the way in takes the default, as every other key does');
+  assert.strictEqual(
+    projects.create(root, { path: tmpDir(), budget: { maxAttemptsPerOrder: 1e9 } }).budget.maxAttemptsPerOrder, 10,
+    'bounded above: an unbounded retry loop is bounded only by maxOrdersPerGoal');
+});

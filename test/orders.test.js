@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const orders = require('../lib/orders');
+const store = require('../lib/store');
 
 const created = [];
 function tmpRoot() {
@@ -353,4 +354,130 @@ test('attachToGoal refuses a link it could only write as "not attached"', () => 
   }
   assert.strictEqual(orders.get(root, o.id).goalId, null, 'a refused link still wrote');
   assert.strictEqual(orders.get(root, o.id).seq, null, 'a refused link still wrote');
+});
+
+// A settled order with a real startedAt, the shape a dispatched one has.
+function settledOrder(root, exitCode = 0) {
+  const o = orders.create(root, { projectId: 'p', prompt: 'x', acceptance: 'y' });
+  orders.markRunning(root, o.id, { cwd: '/tmp/w', agent: 'fake' });
+  return orders.markFinished(root, o.id, { exitCode });
+}
+
+test('a new order carries an empty verdict, not a missing one', () => {
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  for (const k of ['verdict', 'verdictReason', 'verdictState', 'verdictError', 'verdictRaw',
+    'verdictAgent', 'verdictLog', 'verdictStartedAt', 'verdictAt', 'retryRefused', 'supersedes']) {
+    assert.strictEqual(o[k], null, `${k} must start null`);
+  }
+  assert.strictEqual(o.verdictRuns, 0);
+});
+
+test('supersedes is accepted at creation and validated, never coerced', () => {
+  const root = tmpRoot();
+  const a = orders.create(root, { projectId: 'p', prompt: 'x' });
+  const b = orders.create(root, { projectId: 'p', prompt: 'x', supersedes: a.id });
+  assert.strictEqual(orders.get(root, b.id).supersedes, a.id, 'not persisted');
+  assert.strictEqual(orders.create(root, { projectId: 'p', prompt: 'x', supersedes: null }).supersedes, null);
+  // A path, a flag, a number: each would otherwise become a chain edge a reader
+  // follows into store.abs() - which THROWS on '../', taking a GET down with it.
+  for (const bad of [5, {}, '../escape', '-flag', 'has space', '']) {
+    assert.throws(
+      () => orders.create(root, { projectId: 'p', prompt: 'x', supersedes: bad }),
+      /supersedes must be an order id/, `accepted ${JSON.stringify(bad)}`
+    );
+  }
+});
+
+test('recordVerdict writes verdict fields on a settled order, and only those', () => {
+  const root = tmpRoot();
+  const o = settledOrder(root);
+  const v = orders.recordVerdict(root, o.id, {
+    verdictState: 'judged', verdict: 'rejected', verdictReason: 'no test', verdictAt: 't',
+  });
+  assert.strictEqual(v.verdict, 'rejected');
+  assert.strictEqual(v.status, 'succeeded', 'a verdict is not a status');
+  assert.throws(() => orders.recordVerdict(root, o.id, { status: 'failed' }), /not verdict fields: status/);
+  assert.throws(() => orders.recordVerdict(root, o.id, { verdict: 'pass' }), /verdict must be/);
+  assert.throws(() => orders.recordVerdict(root, o.id, { verdictState: 'done' }), /verdictState must be/);
+});
+
+test('recordVerdict refuses an order that has not settled', () => {
+  // A verdict on live work judges work still being done.
+  const root = tmpRoot();
+  const o = orders.create(root, { projectId: 'p', prompt: 'x' });
+  assert.strictEqual(orders.recordVerdict(root, o.id, { verdictState: 'judging' }).verdictState, null);
+  assert.strictEqual(orders.recordVerdict(root, 'ord-nope', { verdictState: 'judging' }), null);
+});
+
+test('a judged verdict is permanent, and retryRefused is written once', () => {
+  const root = tmpRoot();
+  const o = settledOrder(root);
+  orders.recordVerdict(root, o.id, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'r' });
+  assert.strictEqual(orders.recordVerdict(root, o.id, { verdict: 'verified' }).verdict, 'rejected');
+  assert.strictEqual(orders.recordVerdict(root, o.id, { verdictState: 'error' }).verdictState, 'judged');
+  const first = 'no attempts left (3 of 3)';
+  assert.strictEqual(orders.recordVerdict(root, o.id, { retryRefused: first }).retryRefused, first);
+  assert.strictEqual(orders.recordVerdict(root, o.id, { retryRefused: 'second' }).retryRefused, first);
+  assert.throws(() => orders.recordVerdict(root, o.id, { retryRefused: 'x', verdictReason: 'y' }),
+    /retryRefused is written on its own/);
+});
+
+test('retryRefused belongs to a rejected verdict and nothing else', () => {
+  const root = tmpRoot();
+  const o = settledOrder(root);
+  assert.strictEqual(orders.recordVerdict(root, o.id, { retryRefused: 'x' }).retryRefused, null,
+    'refused a retry of an order nobody judged');
+  orders.recordVerdict(root, o.id, { verdictState: 'judged', verdict: 'verified', verdictReason: 'ok' });
+  assert.strictEqual(orders.recordVerdict(root, o.id, { retryRefused: 'x' }).retryRefused, null,
+    'refused a retry of a verified order');
+});
+
+test('a verdict write leaves every non-verdict field exactly as it was', () => {
+  // Spec 12: the rejected order keeps its status, log and verdict permanently.
+  // This is THE guard for "never mutated except for its verdict fields".
+  const root = tmpRoot();
+  const o = settledOrder(root, 3);
+  const before = orders.get(root, o.id);
+  orders.recordVerdict(root, o.id, { verdictState: 'judging', verdictRuns: 1, verdictAgent: 'fake' });
+  orders.recordVerdict(root, o.id, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'r', verdictAt: 't' });
+  orders.recordVerdict(root, o.id, { retryRefused: 'cap' });
+  const after = orders.get(root, o.id);
+  for (const k of Object.keys(before)) {
+    if (orders.VERDICT_FIELDS.has(k)) continue;
+    assert.deepStrictEqual(after[k], before[k], `${k} changed under a verdict write`);
+  }
+});
+
+test('reconcileVerdicts records an interrupted judgement and touches nothing else', () => {
+  const root = tmpRoot();
+  const a = settledOrder(root);
+  orders.recordVerdict(root, a.id, { verdictState: 'judging', verdictRuns: 1 });
+  const b = settledOrder(root);
+  orders.recordVerdict(root, b.id, { verdictState: 'judged', verdict: 'verified', verdictReason: 'ok' });
+  const c = orders.create(root, { projectId: 'p', prompt: 'x' });
+
+  assert.strictEqual(orders.reconcileVerdicts(root), 1);
+  const ra = orders.get(root, a.id);
+  assert.strictEqual(ra.verdictState, 'error');
+  assert.strictEqual(ra.verdictError, 'interrupted while judging');
+  assert.ok(ra.verdictAt, 'an error is a moment, not only a state');
+  assert.strictEqual(ra.verdict, null, 'an interrupted judgement is not a verdict');
+  assert.strictEqual(ra.verdictRuns, 1, 'reconcile must not invent a run');
+  assert.strictEqual(orders.get(root, b.id).verdictState, 'judged');
+  assert.strictEqual(orders.get(root, c.id).verdictState, null);
+});
+
+test('a record written before verdicts existed can still be judged', () => {
+  // Every store that ran 2a-2c holds orders with NONE of the verdict keys. They
+  // must read as unjudged, not as malformed.
+  const root = tmpRoot();
+  const id = orders.newId();
+  store.writeJson(root, `orders/${id}.json`, {
+    id, projectId: 'p', goalId: 'goal-x', seq: 0, title: '', prompt: 'old', acceptance: '',
+    agent: 'fake', cwd: '/w', status: 'succeeded', exitCode: 0, verdict: null, error: null,
+    supersedes: null, createdAt: new Date().toISOString(), startedAt: 't', finishedAt: 't',
+  });
+  const r = orders.recordVerdict(root, id, { verdictState: 'judging', verdictRuns: 1 });
+  assert.strictEqual(r.verdictState, 'judging');
 });
