@@ -181,3 +181,28 @@
   }
   .bd-dur { text-align: right; }
 }
+
+/* ---------- scheduler strip ---------- */
+.bd-sched {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  margin-top: 12px; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid var(--hair); background: var(--ground-2);
+  font-size: 12.5px; color: var(--ink);
+}
+.bd-sched[data-kind="erroring"], .bd-sched[data-kind="stalled"],
+.bd-sched[data-kind="paused"], .bd-sched[data-kind="blocked"] { border-color: var(--danger); }
+.bd-sched-text { font-family: var(--face-mono); font-size: 11.5px; letter-spacing: .04em; }
+.bd-sched-detail { color: var(--ink-2); }
+.bd-sched-err { flex-basis: 100%; color: var(--ink-2); font-family: var(--face-mono); font-size: 11px; word-break: break-word; }
+
+/* ---------- structural limits ---------- */
+.bd-budget { display: grid; gap: 12px; }
+.bd-limit { display: grid; grid-template-columns: auto 1fr; column-gap: 12px; row-gap: 2px; }
+.bd-limit dt { font-size: 12.5px; color: var(--ink-2); }
+.bd-limit-v { font-family: var(--face-mono); font-variant-numeric: tabular-nums; font-size: 12.5px; color: var(--ink); text-align: right; }
+.bd-limit-v.is-over { color: var(--danger-ink); }
+.bd-limit-note { grid-column: 1 / -1; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.bd-caveat {
+  margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--hair);
+  font-size: 12px; line-height: 1.6; color: var(--ink-2); max-width: 65ch;
+}

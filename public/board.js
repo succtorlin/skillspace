@@ -252,3 +252,34 @@ function boardTick() {
 }
 
 document.addEventListener('skillspace:project', (e) => boardSetProject(e.detail ? e.detail.project : null));
+
+function boardRenderSched() {
+  const el = boardEl('board-sched');
+  if (!el) return;
+  const now = Date.now();
+  const ownIds = new Set((board.orders || []).map((o) => o && o.id));
+  const v = schedulerView(board.prevSched, board.sched, now, board.project && board.project.id, ownIds);
+  el.dataset.kind = v.kind;
+  // The pair rule from routes/scheduler.js: a lastError is never shown
+  // without how long ago it was, or the panel stays red forever.
+  el.innerHTML =
+    `<span class="sdot" data-state="sched-${escAttr(v.kind)}" aria-hidden="true"></span>` +
+    `<span class="bd-sched-text">${esc(v.text)}</span>` +
+    (v.detail ? `<span class="bd-sched-detail">${esc(v.detail)}</span>` : '') +
+    (v.lastError && v.kind !== 'erroring'
+      ? `<span class="bd-sched-err">最近一次报错（${esc(v.lastError.ago)}）：${esc(v.lastError.message)}</span>`
+      : '');
+}
+
+function boardRenderBudget() {
+  const dl = boardEl('board-budget');
+  const cav = boardEl('board-caveat');
+  if (!dl || !cav) return;
+  if (!board.project) { dl.innerHTML = ''; cav.textContent = ''; return; }
+  const v = budgetView(board.project, board.orders || [], Date.now());
+  dl.innerHTML = v.rows.map((r) =>
+    `<div class="bd-limit"><dt>${esc(r.label)}</dt>` +
+    `<dd class="bd-limit-v${r.over ? ' is-over' : ''}">${esc(r.value)}</dd>` +
+    `<dd class="bd-limit-note">${esc(r.note)}</dd></div>`).join('');
+  cav.textContent = v.caveat;
+}

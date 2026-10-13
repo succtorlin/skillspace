@@ -437,3 +437,24 @@ test('orderRowStatus: a claimed queued order is starting, not waiting', () => {
   assert.deepStrictEqual(pure.orderRowStatus(order({ status: 'running', claimed: true }), null), { text: '运行中', dot: 'running' });
   assert.strictEqual(pure.orderRowStatus(order({ status: undefined }), null).dot, 'unknown');
 });
+
+test('schedulerView: a skip says whose order it was, and in the console\'s words', () => {
+  const at = '2026-10-12T10:00:10Z';
+  const s = (reason) => sched({ lastSkip: { reason, orderId: 'ord-mine', at } });
+  const mine = pure.schedulerView(null, s('daily order cap reached'), T, 'p1', new Set(['ord-mine']));
+  assert.strictEqual(mine.kind, 'blocked');
+  assert.match(mine.detail, /今日订单数已到上限/);
+  assert.match(mine.detail, /这个项目的订单/);
+  const theirs = pure.schedulerView(null, s('daily order cap reached'), T, 'p1', new Set(['ord-other']));
+  assert.strictEqual(theirs.kind, 'idle', 'another project\'s blocked order reddened this board');
+  assert.match(theirs.detail, /别的项目的订单被挡住/);
+  const busy = pure.schedulerView(null, sched({ inFlight: 2, lastSkip: { reason: 'daily order cap reached', orderId: 'x', at } }), T, 'p1', new Set());
+  assert.strictEqual(busy.kind, 'working', 'another project\'s skip masked this board\'s work');
+  // An unknown reason is shown raw rather than dropped.
+  assert.match(pure.schedulerView(null, s('something new'), T).detail, /something new/);
+  // A hold on ANOTHER project's goal does not turn this board into "waiting for you".
+  const heldElsewhere = pure.schedulerView(null, s('goal held for review'), T, 'p1', new Set(['ord-x']));
+  assert.strictEqual(heldElsewhere.kind, 'idle');
+  assert.match(heldElsewhere.detail, /别的项目/);
+  assert.strictEqual(pure.schedulerView(null, s('goal held for review'), T, 'p1', new Set(['ord-mine'])).kind, 'held');
+});

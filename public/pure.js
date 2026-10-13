@@ -267,7 +267,28 @@ function goalOrderIds(goals, goalId) {
 // `projectId` is the board's project: since plan 3 Task 0 the route names the
 // paused projects, so this board's own pause is said so and another
 // project's is not blamed on it.
-function schedulerView(prev, cur, now, projectId) {
+// `ownIds` (optional) is the set of this board's order ids: lastSkip is the
+// loop's LAST skipped candidate across every project, so without it the strip
+// can only say "maybe another project's".
+const SKIP_REASON_TEXT = {
+  'daily order cap reached': '今日订单数已到上限',
+  'per-goal budget reached': '目标的订单数已到上限',
+  'goal still being planned': '目标还在拆解',
+  'goal held for review': '目标在等你放行',
+  'goal unreadable': '目标记录读不了',
+  'goal orderIds malformed': '目标记录损坏',
+  'project unreadable': '项目记录读不了',
+  'project paused after repeated failures to start': '项目连续启动失败，暂停中',
+  'no agent available': '没有可用的 agent',
+  'threw while being considered': '调度时出错',
+};
+function skipReasonText(reason) {
+  const raw = String(reason || '');
+  if (Object.prototype.hasOwnProperty.call(SKIP_REASON_TEXT, raw)) return `${SKIP_REASON_TEXT[raw]}（${raw}）`;
+  const m = /^goal already (\w+)$/.exec(raw);
+  return m ? `目标已经${goalStatusText(m[1])}（${raw}）` : raw || '没有记录原因';
+}
+function schedulerView(prev, cur, now, projectId, ownIds) {
   const s = cur && cur.scheduler;
   if (!s || typeof s !== 'object') {
     return { kind: 'unknown', text: '读不到调度器状态', detail: '订单会不会自动开始，现在无法确定。', lastError: null };
@@ -318,21 +339,25 @@ function schedulerView(prev, cur, now, projectId) {
   const skipAt = s.lastSkip ? Date.parse(s.lastSkip.at || '') : NaN;
   const freshSkip = Number.isFinite(skipAt) && now - skipAt < interval * 3;
   // A hold is the human's own choice (Task 0), not a fault: no danger colour.
-  if (freshSkip && s.lastSkip.reason === 'goal held for review') {
+  const whose = !freshSkip || !(ownIds instanceof Set) ? 'unknown'
+    : ownIds.has(s.lastSkip.orderId) ? 'mine' : 'theirs';
+  const heldSkip = freshSkip && s.lastSkip.reason === 'goal held for review';
+  if (heldSkip && whose !== 'theirs') {
     return { kind: 'held', text: '调度器运行中 · 有目标等你放行', detail: '审阅它的计划后，点「开始运行」。', lastError };
   }
-  if (freshSkip) {
-    return {
-      kind: 'blocked', text: '有订单被挡住',
-      detail: `${String(s.lastSkip.reason || '')}（可能是别的项目的订单）`,
-      lastError,
-    };
+  // Another project's blocked order does not redden THIS board, and must not
+  // mask its own "working": it becomes a note below instead.
+  if (freshSkip && !heldSkip && whose !== 'theirs') {
+    const tag = whose === 'mine' ? '这个项目的订单' : '可能是别的项目的订单';
+    return { kind: 'blocked', text: '有订单被挡住', detail: `${skipReasonText(s.lastSkip.reason)} · ${tag}`, lastError };
   }
   // Plan 2d: `judging` false means no verdicts are being given at all, so an
   // exit 0 will stay "awaiting a verdict" forever. Said once, beside the rest.
   const notes = [];
   if (s.judging === false) notes.push('验收没有开启：退出 0 的订单不会被 PM 判定。');
   if (othersPaused) notes.push(`别的项目有 ${othersPaused} 个暂停中。`);
+  if (heldSkip) notes.push('别的项目有目标在等放行。');
+  else if (freshSkip) notes.push(`别的项目的订单被挡住：${skipReasonText(s.lastSkip.reason)}。`);
   const n = Number.isFinite(s.inFlight) ? s.inFlight : 0;
   if (n > 0) {
     return { kind: 'working', text: `调度器运行中 · 它派出的 ${n} 单在跑`, detail: ['手动派发的订单不计在内。', ...notes].join(' '), lastError };
@@ -544,6 +569,6 @@ if (typeof module !== 'undefined' && module.exports) {
     boardState, goalOrderIds,
     schedulerView, reviewMode, budgetView, orderTransitions, announcement, logStep, LOG_DOM_CAP,
     appendCapped, shouldStick, orderActionOutcome, goalSubmitOutcome, goalStatusText, oneOffNote,
-    orderRowStatus,
+    orderRowStatus, skipReasonText,
   };
 }
