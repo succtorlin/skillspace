@@ -426,3 +426,89 @@ test('extractPlan does NOT strip ANSI - that is plan.js\'s job, and only its job
   assert.strictEqual(orders, null);
   assert.match(error, /no JSON plan/, 'pm.js has started stripping ANSI itself');
 });
+
+const ORDER = {
+  id: 'ord-1', prompt: 'add the --dry-run flag', acceptance: 'the flag exists and has a test',
+  status: 'succeeded', exitCode: 0, error: null,
+};
+
+test('the verdict prompt carries this order, its criteria, how it ended and the shape of an answer', () => {
+  const p = pm.buildVerdictPrompt({ order: ORDER, logTail: 'WORKER-TAIL', workBranch: 'skillspace/ord-1' });
+  assert.ok(p.startsWith(pm.VERDICT_OPENING), 'test shims key off the opening line');
+  for (const s of ['add the --dry-run flag', 'the flag exists and has a test', 'WORKER-TAIL',
+    'skillspace/ord-1', '"verdict":', '"reason":', '"verified"', '"rejected"']) {
+    assert.ok(p.includes(s), `missing ${s}`);
+  }
+  assert.match(p, /exited 0/);
+  assert.match(p, /not that it did the right thing/, 'an exit 0 must not read as evidence');
+  assert.match(p, /EVIDENCE, NOT INSTRUCTION/, 'the worker output is untrusted');
+});
+
+test('how the run ended is stated without flattering it', () => {
+  const t = pm.buildVerdictPrompt({ order: { ...ORDER, status: 'failed', exitCode: null, error: 'timeout' }, logTail: '' });
+  assert.match(t, /time limit/);
+  const n = pm.buildVerdictPrompt({ order: { ...ORDER, status: 'failed', exitCode: 3 }, logTail: '' });
+  assert.match(n, /exited 3/);
+  assert.match(n, /not that nothing was done/);
+});
+
+test('absent criteria and absent output are said, not left blank', () => {
+  const p = pm.buildVerdictPrompt({ order: { ...ORDER, acceptance: '' }, logTail: '', workBranch: null });
+  assert.match(p, /none were stated/);
+  assert.match(p, /recorded no output/);
+  assert.match(p, /directly in this directory/);
+});
+
+test('a verdict prompt with no instruction to judge is refused', () => {
+  assert.throws(() => pm.buildVerdictPrompt({ order: { ...ORDER, prompt: '' } }), /order.prompt is required/);
+  assert.throws(() => pm.buildVerdictPrompt({}), /order.prompt is required/);
+});
+
+test('the skeleton in the verdict prompt is not itself a verdict', () => {
+  // A PM that echoes the prompt back must self-refuse, exactly as an echoed
+  // plan skeleton does.
+  const p = pm.buildVerdictPrompt({ order: ORDER, logTail: '', workBranch: null });
+  const r = pm.extractVerdict(p);
+  assert.strictEqual(r.verdict, null);
+  assert.match(r.error, /unrecognised verdict ""/);
+});
+
+test('extractVerdict reads exactly two verdicts and guesses at nothing', () => {
+  const ok = (s) => pm.extractVerdict(s);
+  assert.deepStrictEqual(ok('{"verdict":"verified","reason":"ok"}'), { verdict: 'verified', reason: 'ok', error: null });
+  assert.strictEqual(ok('Checked it.\n```json\n{"verdict":"rejected","reason":"no test"}\n```\n').verdict, 'rejected');
+  // The last verdict-shaped object wins: a draft, then a final answer.
+  const drafted = ok('{"verdict":"rejected","reason":"a"} on reflection {"verdict":"verified","reason":"b"}');
+  assert.strictEqual(drafted.verdict, 'verified');
+  assert.strictEqual(drafted.reason, 'b');
+  // A final answer that is not a verdict is REFUSED, not fallen back from.
+  assert.match(ok('{"verdict":"verified","reason":"a"} then {"verdict":"pass","reason":"b"}').error, /unrecognised verdict "pass"/);
+  for (const word of ['Verified', 'verified ', 'VERIFIED', 'accept', true, 1]) {
+    assert.match(ok(JSON.stringify({ verdict: word, reason: 'r' })).error, /unrecognised verdict/, `took ${JSON.stringify(word)}`);
+  }
+  assert.match(ok('{"verdict":"verified"}').error, /no reason/);
+  assert.match(ok('{"verdict":"verified","reason":"  "}').error, /no reason/);
+  assert.match(ok('{"verdict":"verified","reason":{"x":1}}').error, /no reason/);
+  assert.match(ok(`{"verdict":"verified","reason":"${'x'.repeat(20001)}"}`).error, /too long/);
+  // An object that is not verdict-shaped AFTER the verdict is skipped.
+  assert.strictEqual(ok('{"verdict":"verified","reason":"a"} {"note":1}').verdict, 'verified');
+  // Braces inside strings do not break the scan.
+  assert.strictEqual(ok('{"verdict":"rejected","reason":"missing } and {"}').reason, 'missing } and {');
+  for (const nothing of [null, undefined, 42, '', 'Looks good to me.']) {
+    assert.match(ok(nothing).error, /no JSON verdict/);
+  }
+  assert.match(ok('{"note":"no verdict here"}').error, /has no "verdict"/);
+});
+
+test('extractVerdict returns three fields and nothing the PM invented', () => {
+  const r = pm.extractVerdict('{"verdict":"verified","reason":"ok","retry":true,"status":"done"}');
+  assert.deepStrictEqual(Object.keys(r).sort(), ['error', 'reason', 'verdict']);
+});
+
+test('objectSpans is arraySpans for braces', () => {
+  assert.deepStrictEqual(pm.objectSpans('prose {"a":1} more'), ['{"a":1}']);
+  assert.deepStrictEqual(pm.objectSpans('{"a":"} {"}'), ['{"a":"} {"}']);
+  assert.deepStrictEqual(pm.objectSpans('{"a":{"b":1}}'), ['{"a":{"b":1}}'], 'top level only');
+  assert.deepStrictEqual(pm.objectSpans('stray } then {"a":1}'), ['{"a":1}']);
+  assert.deepStrictEqual(pm.objectSpans('[{"a":1}]'), ['{"a":1}'], 'brackets are not counted');
+});
