@@ -340,3 +340,55 @@ test('the log tail is the END of the worker log, bounded and ANSI-free', () => {
   assert.ok(Array.from(t).length <= 8000);
   assert.strictEqual(verdict.logTail(path.join(dir, 'absent.log')), '');
 });
+
+// ---------- the judge waits for the work to be committed ----------
+// runOrder settles the record (markFinished) BEFORE its finally commits the
+// worktree onto the order branch, so a judge admitted in that window reads a
+// branch without the work and judges nothing. These settle through runOrder
+// itself, not through a hand-written markFinished, because the window only
+// exists there.
+test('an order still being wrapped up is refused by judge() and skipped by pass(), and judged once committed', async () => {
+  const { root, project } = gitSetup();
+  const N = 1500;
+  // Enough files that cleanup's add/commit is a window a poll can land in.
+  const worker = shimAgent(`#!/bin/sh\ni=0; while [ $i -lt ${N} ]; do echo $i > w$i.txt; i=$((i+1)); done\nexit 0\n`);
+  const branchOf = (id) => `skillspace/${id}`;
+  // The judge counts the order's committed files on its branch.
+  const counter = shimAgent(`#!/bin/sh\nn=$(git -C "${project.path}" ls-tree -r --name-only "${'$'}BR" 2>/dev/null | grep -c '^w')\n` +
+    `printf '{"verdict":"verified","reason":"%s files on the branch"}\\n' "$n"\nexit 0\n`);
+  const goal = goals.create(root, { projectId: project.id, text: 'g' });
+  const o = orders.create(root, { projectId: project.id, prompt: 'write files', acceptance: 'files exist' });
+  orders.attachToGoal(root, o.id, goal.id, 0);
+  goals.planned(root, goal.id, { orderIds: [o.id], pmAgent: 'fake' });
+  const env = () => ({ ...testEnv(), BR: branchOf(o.id) });
+
+  const running = dispatch.runOrder(root, { order: orders.get(root, o.id), project, agent: worker, childEnv: testEnv });
+  // Wait for the window: settled on disk, still claimed by dispatch.
+  let sawWindow = false;
+  for (;;) {
+    const cur = orders.get(root, o.id);
+    if (cur.status !== 'queued' && cur.status !== 'running' && dispatch.isClaimed(o.id)) {
+      sawWindow = true;
+      const g = goals.get(root, goal.id);
+      const r = verdict.judge(root, { order: cur, goal: g, project, agent: counter, childEnv: env });
+      assert.strictEqual(r.kind, 'conflict');
+      assert.match(r.refused, /still being wrapped up/);
+      assert.strictEqual(orders.get(root, o.id).verdictState, null, 'a refusal writes nothing');
+      const counts = verdict.pass(root, {
+        all: orders.list(root), goalsById: new Map([[g.id, g]]),
+        judgeFor: () => counter, childEnv: env, onError: (e) => { throw e; },
+      });
+      assert.deepStrictEqual(counts, { offered: 0, refused: 0 }, 'pass() must skip a claimed order, not try it');
+      break;
+    }
+    if (!dispatch.isClaimed(o.id) && cur.status !== 'queued') break;
+    await new Promise((r) => setImmediate(r));
+  }
+  await running;
+  assert.ok(sawWindow, 'the poll never landed in the settle-to-commit window; raise N');
+
+  const done = await verdict.judge(root, {
+    order: orders.get(root, o.id), goal: goals.get(root, goal.id), project, agent: counter, childEnv: env,
+  }).done;
+  assert.strictEqual(done.verdictReason, `${N} files on the branch`, 'the judge saw a branch without the work');
+});
