@@ -12,6 +12,7 @@ const orders = require('../lib/orders');
 const goals = require('../lib/goals');
 const projects = require('../lib/projects');
 const store = require('../lib/store');
+const verdict = require('../lib/verdict');
 
 // Harness modelled on test/dispatch.test.js, helper for helper. They are
 // file-local there, so this is a copy rather than an import - but a copy that
@@ -96,7 +97,7 @@ function aliveCount(pids) {
 // message - the lesson test/dispatch.test.js records at its project-busy test.
 async function drain() {
   scheduler.stop();
-  await waitFor('dispatch to drain', () => {
+  await waitFor('dispatch and judges to drain', () => {
     // cancelAll() ON EVERY POLL, not once. It skips an order whose handle is
     // still null - one inside `git worktree add` - which lib/dispatch records
     // as a residual of its own: that order then passes its intent check, spawns
@@ -104,9 +105,34 @@ async function drain() {
     // single call left a 60s agent alive and timed the teardown out, which
     // surfaced as a failure in the test that had already passed its assertions.
     dispatch.cancelAll();
-    return dispatch.inFlightCount() === 0;
+    // Judges hold slots too, and a judge left running by a failed test would
+    // count against the next test's ceiling.
+    verdict.cancelAll();
+    return dispatch.inFlightCount() === 0 && verdict.inFlightCount() === 0;
   }, 30000);
   dispatch.setCapacity(null);
+}
+
+const says = (json) => `#!/bin/sh\nprintf '%s\\n' '${json}'\nexit 0\n`;
+const JUDGE_VERIFY = says('{"verdict":"verified","reason":"looks right"}');
+// Rejects attempt 1; verifies any attempt carrying feedback.
+const JUDGE_ONCE = `#!/bin/sh
+case "$2" in
+  *"REVIEWER FEEDBACK"*) printf '%s\\n' '{"verdict":"verified","reason":"fixed"}' ;;
+  *) printf '%s\\n' '{"verdict":"rejected","reason":"add the missing test"}' ;;
+esac
+exit 0
+`;
+const judgeTally = (tally, json, seconds = 0) =>
+  shimAgent(`#!/bin/sh\necho "$$" >> "${tally}"\nsleep ${seconds}\nprintf '%s\\n' '${json}'\nexit 0\n`);
+
+// A record the way dispatch leaves one: it RAN (startedAt set), then settled.
+function settle(root, id, exitCode = 0) {
+  orders.markRunning(root, id, { cwd: '/w', agent: 'fake' });
+  return orders.markFinished(root, id, { exitCode });
+}
+function verify(root, id) {
+  return orders.recordVerdict(root, id, { verdictState: 'judged', verdict: 'verified', verdictReason: 'ok' });
 }
 
 const OK = '#!/bin/sh\necho "did the work"\nexit 0\n';
@@ -143,9 +169,17 @@ test('a goal\'s queued orders run without anyone dispatching them', async () => 
       const b = orders.get(root, made[1].id);
       return orders.SETTLED.has(a.status) && orders.SETTLED.has(b.status) && { a, b };
     });
-    const { a, b } = await waitFor('the goal to be marked done',
-      () => goals.get(root, goal.id).status === 'done'
-        && { a: orders.get(root, made[0].id), b: orders.get(root, made[1].id) });
+    // NOT `done`: nothing here judges (no judgeFor), and since plan 2d a goal
+    // is done only when every order is VERIFIED. Exit 0 is not that claim.
+    // The records settle BEFORE runOrder releases its claim (after worktree
+    // cleanup), so the goal legitimately reads `running` until then - wait for
+    // the claims to go, then give the sweep ticks to be wrong in.
+    await waitFor('the agents to be released', () => dispatch.inFlightCount() === 0);
+    await ticksPass(3, 15);
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned',
+      'a goal was finished over orders nobody judged');
+    const a = orders.get(root, made[0].id);
+    const b = orders.get(root, made[1].id);
 
     assert.strictEqual(a.status, 'succeeded', `first order: ${a.status} ${a.error}`);
     assert.strictEqual(b.status, 'succeeded', `second order: ${b.status} ${b.error}`);
@@ -487,9 +521,8 @@ test('a goal whose orders all settled during boot is finished by the first tick'
   const root = tmpDir('skillspace-home-');
   const project = projects.create(root, { path: tmpDir('skillspace-work-') });
   const { goal, made } = plannedGoal(root, project, ['one', 'two']);
-  // What boot leaves behind: every order settled, the goal still `planned`.
-  orders.markFinished(root, made[0].id, { exitCode: 0 });
-  orders.markFinished(root, made[1].id, { error: 'interrupted' });
+  // What boot leaves behind: every order settled AND judged, the goal still planned.
+  settle(root, made[0].id); verify(root, made[0].id); settle(root, made[1].id); verify(root, made[1].id);
   assert.strictEqual(goals.get(root, goal.id).status, 'planned');
 
   try {
@@ -509,6 +542,25 @@ test('a goal whose orders all settled during boot is finished by the first tick'
   }
 });
 
+
+test('a goal whose orders all stopped during boot without a verdict is stalled by the first tick', async () => {
+  // The other half of the startup sweep. An interrupted order has no result
+  // and gets no verdict; only a human can move it, so the honest state is
+  // `stalled` - and it must be reached at startup, synchronously, for the same
+  // reason `done` is.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made } = plannedGoal(root, project, ['one', 'two']);
+  settle(root, made[0].id);
+  verify(root, made[0].id);
+  orders.markFailed(root, made[1].id, 'worktree: dirty tree'); // never ran
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => null });
+    assert.strictEqual(goals.get(root, goal.id).status, 'stalled');
+  } finally {
+    await drain();
+  }
+});
 test('an order attached to a goal still being planned is not dispatched', async () => {
   // Mutant: only goals.SETTLED is checked, and `planning` falls through.
   //
@@ -1155,6 +1207,8 @@ test('a dispatch-side fault does not cost the goal sweep', async () => {
   const { goal, made } = plannedGoal(root, project, ['one', 'two']);
   orders.markFinished(root, made[0].id, { exitCode: 0 });
   orders.markFinished(root, made[1].id, { exitCode: 0 });
+  // Since plan 2d `done` needs every order VERIFIED, not merely settled.
+  verify(root, made[0].id); verify(root, made[1].id);
   // A queued order so the candidate loop actually enters its body.
   orders.create(root, { projectId: project.id, prompt: 'never mind me' });
   assert.strictEqual(goals.get(root, goal.id).status, 'planned');
@@ -1627,6 +1681,253 @@ test('a store that cannot hold logs pauses the project too', async () => {
       assert.ok(rec.cwd, 'the order lost every trace of having reached markRunning');
     }
   } finally {
+    await drain();
+  }
+});
+
+test('a settled order is judged by the loop, and its goal is done only once verified', async () => {
+  // Mutant A: the judge pass removed - this times out at `planned`.
+  // Mutant B: goalOutcome reads `succeeded` as finished - the goal reaches
+  // `done` before the verdict, and the assertion on the verdict below fails.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK), judgeFor: () => shimAgent(JUDGE_VERIFY),
+    });
+    const g = await waitFor('the goal to be done', () => {
+      const x = goals.get(root, goal.id);
+      return x.status === 'done' && x;
+    });
+    const o = orders.get(root, a.id);
+    assert.strictEqual(o.verdict, 'verified', 'done was reached without a verdict');
+    assert.ok(Date.parse(g.finishedAt) >= Date.parse(o.verdictAt), 'the goal settled before its verdict');
+    assert.strictEqual(scheduler.stats().judging, true);
+    assert.ok(scheduler.stats().judgesOffered >= 1);
+  } finally {
+    await drain();
+  }
+});
+
+test('a rejected attempt is retried with the reason, and the retry is judged on its own', async () => {
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK), judgeFor: () => shimAgent(JUDGE_ONCE),
+    });
+    await waitFor('the goal to be done', () => goals.get(root, goal.id).status === 'done', 30000);
+    const ids = goals.get(root, goal.id).orderIds;
+    assert.strictEqual(ids.length, 2, 'exactly one retry');
+    const first = orders.get(root, a.id);
+    const second = orders.get(root, ids[1]);
+    assert.strictEqual(first.verdict, 'rejected');
+    assert.strictEqual(first.status, 'succeeded', 'the rejected attempt kept its own status');
+    assert.strictEqual(second.supersedes, a.id);
+    assert.strictEqual(second.verdict, 'verified');
+    assert.match(second.prompt, /add the missing test/);
+    assert.strictEqual(scheduler.stats().retriesCreated, 1);
+  } finally {
+    await drain();
+  }
+});
+
+test('a chain that runs out of attempts fails the goal, and spending stops', async () => {
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo(), budget: { maxAttemptsPerOrder: 2 } });
+  const { goal, made } = plannedGoal(root, project, ['one']);
+  // The PM's plan is evidence, and a rejected chain must not erase it. Pins
+  // markFailed over failPlanning, which would ALSO fail a planned goal - it
+  // goes through patch(), which refuses only settled goals - but writes
+  // rawPlan: null on the way.
+  goals.planned(root, goal.id, { orderIds: made.map((o) => o.id), pmAgent: 'fake', rawPlan: 'THE-PM-PLAN' });
+  const tally = path.join(tmpDir(), 'judges');
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK),
+      judgeFor: () => judgeTally(tally, '{"verdict":"rejected","reason":"still wrong"}'),
+    });
+    const g = await waitFor('the goal to fail', () => {
+      const x = goals.get(root, goal.id);
+      return x.status === 'failed' && x;
+    }, 30000);
+    assert.strictEqual(g.orderIds.length, 2);
+    const last = orders.get(root, g.orderIds[1]);
+    assert.match(last.retryRefused, /no attempts left \(2 of 2\)/);
+    assert.match(g.error, new RegExp(last.id));
+    assert.match(g.error, /still wrong/);
+    assert.strictEqual(g.rawPlan, 'THE-PM-PLAN', "the chain's failure erased the PM's plan");
+    await ticksPass(5, 15);
+    assert.strictEqual(pidsIn(tally).length, 2, 'one judgement per attempt, and no more');
+    assert.strictEqual(goals.get(root, goal.id).orderIds.length, 2, 'spending continued after failure');
+  } finally {
+    await drain();
+  }
+});
+
+test('an unreadable verdict stalls the goal, and the loop never asks again', async () => {
+  // Mutant: judge()'s default admission accepts `error` - the judge runs every
+  // tick forever. (Admitting `error` into lib/verdict's needsVerdict alone does
+  // NOT do it: judge() refuses an errored verdict unless a human asks, and that
+  // refusal is the rule this pins.)
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { goal } = plannedGoal(root, project, ['one']);
+  const tally = path.join(tmpDir(), 'judges');
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => shimAgent(OK),
+      judgeFor: () => shimAgent(`#!/bin/sh\necho "$$" >> "${tally}"\necho "seems fine"\nexit 0\n`),
+    });
+    await waitFor('the goal to stall', () => goals.get(root, goal.id).status === 'stalled', 30000);
+    await ticksPass(5, 15);
+    assert.strictEqual(pidsIn(tally).length, 1);
+  } finally {
+    await drain();
+  }
+});
+
+test('a verdict is judged before new work is dispatched', async () => {
+  // A finished order waiting on its verdict holds its goal open; a fresh order
+  // only adds to what is outstanding. With one slot, the verdict goes first.
+  // Mutant: the judge pass runs after the dispatch pass.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { made: [a] } = plannedGoal(root, project, ['finished']);
+  settle(root, a.id);
+  const { made: [b] } = plannedGoal(root, project, ['fresh']);
+  dispatch.setCapacity(() => dispatch.inFlightCount() + verdict.inFlightCount() >= 1);
+  try {
+    scheduler.start(root, {
+      intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK),
+      judgeFor: () => shimAgent(`#!/bin/sh\nsleep 1\n${JUDGE_VERIFY.split('\n').slice(1).join('\n')}`),
+    });
+    assert.strictEqual(verdict.isJudging(a.id), true, 'the verdict was not taken first');
+    assert.strictEqual(dispatch.isClaimed(b.id), false, 'the ceiling was exceeded or the order went first');
+  } finally {
+    await drain();
+  }
+});
+
+test('orders of a goal settled before verdicts existed are not judged', async () => {
+  // First boot on a 2c store must not judge its whole history.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { goal, made } = plannedGoal(root, project, ['old one', 'old two']);
+  settle(root, made[0].id);
+  settle(root, made[1].id);
+  goals.markDone(root, goal.id);
+  const tally = path.join(tmpDir(), 'judges');
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => null,
+      judgeFor: () => judgeTally(tally, '{"verdict":"verified","reason":"x"}'),
+    });
+    await ticksPass(3, 15);
+    assert.deepStrictEqual(pidsIn(tally), []);
+    assert.strictEqual(orders.get(root, made[0].id).verdictState, null);
+  } finally {
+    await drain();
+  }
+});
+
+test('without judgeFor nothing is judged, and the goal waits rather than finishing', async () => {
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  try {
+    scheduler.start(root, { intervalMs: 15, childEnv: testEnv, agentFor: () => null });
+    await ticksPass(3, 15);
+    assert.strictEqual(scheduler.stats().judging, false, 'a panel must be able to tell verdicts are off');
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned');
+    assert.strictEqual(orders.get(root, a.id).verdictState, null);
+  } finally {
+    await drain();
+  }
+});
+
+test('a rejection whose retry was never created is retried by the next tick', async () => {
+  // The crash shape: the verdict is on disk, the successor is not. Only the
+  // tick creates successors, so this is the same path as the ordinary one.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  orders.recordVerdict(root, a.id, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'needs a test' });
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => null });
+    const ids = goals.get(root, goal.id).orderIds;
+    assert.strictEqual(ids.length, 2);
+    const next = orders.get(root, ids[1]);
+    assert.strictEqual(next.supersedes, a.id);
+    assert.strictEqual(next.status, 'queued');
+    assert.match(next.prompt, /needs a test/);
+  } finally {
+    await drain();
+  }
+});
+
+test('a retry held back by the daily cap waits instead of failing the goal', async () => {
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-'), budget: { maxOrdersPerDay: 1 } });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  orders.recordVerdict(root, a.id, { verdictState: 'judged', verdict: 'rejected', verdictReason: 'r' });
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => null });
+    assert.strictEqual(goals.get(root, goal.id).orderIds.length, 1);
+    assert.strictEqual(orders.get(root, a.id).retryRefused, null, 'a deferral was recorded as final');
+    assert.strictEqual(goals.get(root, goal.id).status, 'planned');
+  } finally {
+    await drain();
+  }
+});
+
+test('a goal reads running while its judge is in flight', async () => {
+  // Mutant: the goal sweep's busy test ignores verdict.isJudging.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpGitRepo() });
+  const { goal, made: [a] } = plannedGoal(root, project, ['one']);
+  settle(root, a.id);
+  try {
+    scheduler.start(root, {
+      intervalMs: 15, childEnv: testEnv, agentFor: () => null,
+      judgeFor: () => judgeTally(path.join(tmpDir(), 't'), '{"verdict":"verified","reason":"x"}', 2),
+    });
+    await waitFor('the judge to start', () => verdict.isJudging(a.id));
+    await waitFor('the goal to read running', () => goals.get(root, goal.id).status === 'running');
+  } finally {
+    await drain();
+  }
+});
+
+test('judgeFor, when given, must be a function', () => {
+  const root = tmpDir('skillspace-home-');
+  assert.throws(
+    () => scheduler.start(root, { childEnv: testEnv, agentFor: () => null, judgeFor: 'claude' }),
+    /judgeFor must be a function/
+  );
+  scheduler.stop();
+});
+
+test('a goal store that cannot be listed does not cost the dispatch pass', async () => {
+  // Mutant: the goal list shares the tick's fate - goals.list throwing kills
+  // the whole tick, and queued work that needs no goal never dispatches. The
+  // inverse of 'a dispatch-side fault does not cost the goal sweep'.
+  const root = tmpDir('skillspace-home-');
+  const project = projects.create(root, { path: tmpDir('skillspace-work-') });
+  orders.create(root, { projectId: project.id, prompt: 'not part of any goal' });
+  const realList = goals.list;
+  goals.list = () => { throw new Error('goal store exploded'); };
+  try {
+    scheduler.start(root, { intervalMs: 60000, childEnv: testEnv, agentFor: () => shimAgent(OK) });
+    assert.strictEqual(scheduler.stats().offered, 1, 'the dispatch pass was lost to the goal list');
+    assert.match(scheduler.stats().lastError, /goal store exploded/);
+  } finally {
+    goals.list = realList;
     await drain();
   }
 });

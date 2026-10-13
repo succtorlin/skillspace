@@ -145,6 +145,29 @@ test('an order with no result to judge is refused, and nothing is spawned', () =
   assert.deepStrictEqual(pidsIn(tally), []);
 });
 
+test('an order its goal does not name, or whose goal has settled, is not judged', () => {
+  // judge() is the authority for both rules; lib/verdict.pass only shadows
+  // them. A settled goal is a 2c store's history, which first boot must not
+  // re-judge. An order its goal does not name is a rolled-back attempt that
+  // kept its goalId as a back-pointer.
+  const { root, project } = gitSetup();
+  const tally = path.join(tmpDir(), 'tally');
+  const agent = shimAgent(tallying(tally, 0, '{"verdict":"verified","reason":"x"}'));
+  const { goal, order } = finishedOrder(root, project);
+  const before = orders.get(root, order.id);
+
+  const orphanGoal = { ...goal, orderIds: ['ord-someone-else'] };
+  assert.match(verdict.judge(root, { order, goal: orphanGoal, project, agent, childEnv: testEnv }).refused,
+    /not part of its goal's plan/);
+
+  goals.markDone(root, goal.id);
+  const settled = goals.get(root, goal.id);
+  assert.match(verdict.judge(root, { order, goal: settled, project, agent, childEnv: testEnv }).refused,
+    /the goal is done/);
+  assert.deepStrictEqual(orders.get(root, order.id), before, 'a refusal wrote to the record');
+  assert.deepStrictEqual(pidsIn(tally), []);
+});
+
 test('unreadable output is recorded, not guessed at', async () => {
   const { root, project } = gitSetup();
   const { goal, order } = finishedOrder(root, project);

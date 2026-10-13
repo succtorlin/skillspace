@@ -585,8 +585,8 @@ test('the scheduler starts only after the boot reconciles', async () => {
   // start() call all happen before server.listen() - so by the time this test
   // can send a single request, the correct ordering has already produced its
   // final answer. At a 30 second interval there is no second tick to paper over
-  // a wrong first one, so `done` and `planned` are the two durable outcomes and
-  // the test reads one of them.
+  // a wrong first one, so `stalled` and `planned` are the two durable outcomes
+  // and the test reads one of them.
   const home = tmp('sched-boothome-');
   const o1 = seedOrder(home, 'running', { prompt: 'crashed one', startedAt: new Date().toISOString() });
   const o2 = seedOrder(home, 'running', { prompt: 'crashed two', startedAt: new Date().toISOString() });
@@ -605,17 +605,16 @@ test('the scheduler starts only after the boot reconciles', async () => {
   assert.strictEqual(boot.ticks, 1,
     `expected exactly the startup tick, got ${boot.ticks} - the interval is too short to prove ordering`);
 
-  // And the startup sweep saw settled orders, so the goal is finished. With
-  // start() moved above the reconciles this reads `planned`: the sweep saw two
-  // records still saying `running` that nothing had claimed, demoted the goal,
-  // and - the interval being 30s - never looks again.
-  //
-  // `done` over `interrupted` orders is deliberate and is lib/scheduler's
-  // documented meaning of the state: "nothing outstanding", not "it worked".
+  // And the startup sweep saw settled orders, so the goal has stopped.
+  // `stalled` over `interrupted` orders is plan 2d's meaning: nothing
+  // outstanding, nothing judged, a human needed. With start() above the
+  // reconciles this still reads `planned` - the sweep saw two records claiming
+  // `running` that nothing had claimed, and - the interval being 30s - never
+  // looks again.
   const g = await json('GET', '/api/goals/' + goalId, undefined, s.base);
-  assert.strictEqual(g.body.goal.status, 'done',
+  assert.strictEqual(g.body.goal.status, 'stalled',
     'the startup sweep ran against unreconciled records, so the goal stalled at planned');
-  assert.strictEqual(readGoal(home, goalId).status, 'done');
+  assert.strictEqual(readGoal(home, goalId).status, 'stalled');
   await stopServer(s.child);
 });
 
